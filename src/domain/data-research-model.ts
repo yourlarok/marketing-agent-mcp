@@ -5,10 +5,20 @@ export interface DataRequestPlan extends EntityRecord, Partial<DataRequestPlanDe
   objective?: string;
 }
 
+export const INGESTION_BATCH_STATES = ["completed", "partial", "blocked"] as const;
+export type IngestionBatchState = (typeof INGESTION_BATCH_STATES)[number];
+
+export interface IngestionFileFailure {
+  path: string;
+  message: string;
+}
+
 export interface IngestionBatch extends EntityRecord {
+  state: IngestionBatchState;
   sourceIds: string[];
   datasetIds: string[];
   evidenceIds: string[];
+  failures: IngestionFileFailure[];
 }
 
 export interface ResearchSession extends EntityRecord {

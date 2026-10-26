@@ -43,6 +43,23 @@ export interface ToolHealthEvidence {
   toolVersion: string;
 }
 
+export const ARTIFACT_KINDS = [
+  "original",
+  "normalized_jsonl",
+  "quality_report",
+  "page_text",
+  "screenshot",
+  "api_response",
+] as const;
+export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
+
+export interface EvidenceAsset {
+  id: string;
+  kind: ArtifactKind;
+  contentHash: string;
+  byteLength: number;
+}
+
 export interface Evidence extends EntityRecord {
   sourceId: string;
   sourceLocator: string;
@@ -50,6 +67,7 @@ export interface Evidence extends EntityRecord {
   summary: string;
   contentHash: string;
   classification: EvidenceClassification;
+  assets?: EvidenceAsset[];
   toolHealth?: ToolHealthEvidence;
 }
 

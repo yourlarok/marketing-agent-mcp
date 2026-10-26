@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { copyFile, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MarketingService } from "../../src/application/marketing-service.js";
@@ -745,5 +746,262 @@ describe("DataResearchService guided data rounds", () => {
       context: commandContext("stale"),
     })).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
     await expectNoUpdateResidue("guided-plan", ["command-cross-workspace", "command-stale"]);
+  });
+});
+
+describe("DataResearchService atomic imports and evidence assets", () => {
+  let tempDir: string;
+  let importRoot: string;
+  let artifactRoot: string;
+  let store: Store;
+  let service: DataResearchService;
+  let sequence: number;
+  let originalImportRoot: string | undefined;
+  let originalArtifactRoot: string | undefined;
+
+  const commandContext = (suffix: string): CommandContext => ({
+    actor: "agent-1",
+    requestId: `request-${suffix}`,
+    idempotencyKey: `command-${suffix}`,
+  });
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    importRoot = await createTempDir();
+    artifactRoot = await createTempDir();
+    originalImportRoot = process.env.MARKETING_IMPORT_ROOT;
+    originalArtifactRoot = process.env.MARKETING_ARTIFACT_DIR;
+    process.env.MARKETING_IMPORT_ROOT = importRoot;
+    process.env.MARKETING_ARTIFACT_DIR = artifactRoot;
+    await Promise.all([
+      copyFile(resolve("tests/fixtures/csv/marketing.csv"), join(importRoot, "marketing.csv")),
+      copyFile(resolve("tests/fixtures/xlsx/marketing.xlsx"), join(importRoot, "marketing.xlsx")),
+      writeFile(join(importRoot, "broken.csv"), Buffer.from([0xff, 0xfe, 0xfd])),
+    ]);
+    store = openStore(join(tempDir, "store.db"));
+    sequence = 0;
+    service = new DataResearchService(
+      store,
+      { now: () => now },
+      { next: () => `generated-${++sequence}` },
+    );
+    await store.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("workspace-1"));
+      await repos.workspaces.insert(entity("workspace-2", "workspace-2"));
+    });
+  });
+
+  afterEach(async () => {
+    store.close();
+    if (originalImportRoot === undefined) {
+      delete process.env.MARKETING_IMPORT_ROOT;
+    } else {
+      process.env.MARKETING_IMPORT_ROOT = originalImportRoot;
+    }
+    if (originalArtifactRoot === undefined) {
+      delete process.env.MARKETING_ARTIFACT_DIR;
+    } else {
+      process.env.MARKETING_ARTIFACT_DIR = originalArtifactRoot;
+    }
+    await Promise.all([removeTempDir(tempDir), removeTempDir(importRoot), removeTempDir(artifactRoot)]);
+  });
+
+  function importCommand(id: string, paths: string[], extra: Record<string, unknown> = {}) {
+    return {
+      input: { id, workspaceId: "workspace-1", paths, ...extra },
+      context: commandContext(id),
+    };
+  }
+
+  it("creates one Source per file and Dataset/Evidence/assets per sheet with exact replay", async () => {
+    const plan = await service.planDataRequests({
+      input: {
+        id: "import-plan",
+        workspaceId: "workspace-1",
+        objective: "Understand imported performance",
+        questionTypes: ["content_performance"],
+        availableFields: [],
+      },
+      context: commandContext("import-plan"),
+    });
+    const command = importCommand("import-complete", ["marketing.csv", "marketing.xlsx"], {
+      planId: plan.id,
+      expectedPlanVersion: 1,
+    });
+
+    const batch = await service.importFiles(command);
+    expect(batch).toMatchObject({ state: "completed", failures: [] });
+    expect(batch.sourceIds).toHaveLength(2);
+    expect(batch.datasetIds).toHaveLength(3);
+    expect(batch.evidenceIds).toHaveLength(3);
+
+    const graph = await store.transaction(async (repos) => ({
+      sources: await Promise.all(batch.sourceIds.map((id) => repos.sources.get(id, "workspace-1"))),
+      datasets: await Promise.all(batch.datasetIds.map((id) => repos.datasets.get(id, "workspace-1"))),
+      evidence: await Promise.all(batch.evidenceIds.map((id) => repos.evidence.get(id, "workspace-1"))),
+      updatedPlan: await repos.dataRequestPlans.get(plan.id, "workspace-1"),
+    }));
+    expect(graph.datasets.map((dataset) => dataset?.sourceId)).toEqual([
+      batch.sourceIds[0], batch.sourceIds[1], batch.sourceIds[1],
+    ]);
+    expect(graph.datasets.map((dataset) => dataset?.name)).toEqual([
+      "marketing.csv", "marketing.xlsx#Leads", "marketing.xlsx#Spend",
+    ]);
+    for (const evidence of graph.evidence) {
+      const assets = evidence?.assets as { kind: string; byteLength: number; contentHash: string }[];
+      expect(assets.map((asset) => asset.kind)).toEqual(["original", "normalized_jsonl", "quality_report"]);
+      expect(assets.every((asset) => asset.byteLength > 0 && /^[0-9a-f]{64}$/.test(asset.contentHash))).toBe(true);
+    }
+    expect(graph.updatedPlan).toMatchObject({ version: 2, round: 2 });
+    expect(graph.updatedPlan?.availableFields).toEqual(expect.arrayContaining(["name", "channel", "amount"]));
+
+    await expect(service.importFiles(command)).resolves.toEqual(batch);
+    const raw = new DatabaseSync(join(tempDir, "store.db"));
+    try {
+      for (const table of ["sources", "datasets", "evidence", "ingestion_batches"]) {
+        expect(raw.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: table === "sources" ? 2 : table === "datasets" || table === "evidence" ? 3 : 1 });
+      }
+    } finally {
+      raw.close();
+    }
+
+    const original = (graph.evidence[0]!.assets as { id: string; kind: string }[])
+      .find((asset) => asset.kind === "original")!;
+    const content = await service.getEvidenceAsset({
+      workspaceId: "workspace-1",
+      evidenceId: batch.evidenceIds[0]!,
+      assetId: original.id,
+    });
+    expect(content.content).toEqual(readFileSync(join(importRoot, "marketing.csv")));
+    expect(content.kind).toBe("original");
+    await expect(service.getEvidenceAsset({
+      workspaceId: "workspace-2",
+      evidenceId: batch.evidenceIds[0]!,
+      assetId: original.id,
+    })).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    await expect(service.getEvidenceAsset({
+      workspaceId: "workspace-1",
+      evidenceId: batch.evidenceIds[0]!,
+      assetId: "../../marketing.csv",
+    })).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+  });
+
+  it("persists successful files as partial and records a blocked batch when every file fails", async () => {
+    const partial = await service.importFiles(importCommand("import-partial", ["marketing.csv", "broken.csv"]));
+    expect(partial).toMatchObject({ state: "partial" });
+    expect(partial.sourceIds).toHaveLength(1);
+    expect(partial.datasetIds).toHaveLength(1);
+    expect(partial.evidenceIds).toHaveLength(1);
+    expect(partial.failures).toEqual([{ path: "broken.csv", message: expect.stringMatching(/UTF-8/) }]);
+
+    const blocked = await service.importFiles(importCommand("import-blocked", ["broken.csv"]));
+    expect(blocked).toMatchObject({
+      state: "blocked",
+      sourceIds: [],
+      datasetIds: [],
+      evidenceIds: [],
+    });
+    expect(blocked.failures).toHaveLength(1);
+  });
+
+  it("enforces batch-wide ingestion limits while isolating per-file failures", async () => {
+    await writeFile(join(importRoot, "extra.csv"), "name\nExtra\n");
+    const partial = await service.importFiles(importCommand(
+      "import-row-limit",
+      ["marketing.csv", "extra.csv"],
+      { limits: { maxRows: 2 } },
+    ));
+    expect(partial.state).toBe("partial");
+    expect(partial.sourceIds).toHaveLength(1);
+    expect(partial.failures).toEqual([{ path: "extra.csv", message: expect.stringMatching(/row limit/) }]);
+
+    await expect(service.importFiles(importCommand(
+      "import-file-limit",
+      ["marketing.csv", "extra.csv"],
+      { limits: { maxFiles: 1 } },
+    ))).rejects.toThrow("file limit");
+    await expect(
+      store.transaction((repos) => repos.ingestionBatches.get("import-file-limit", "workspace-1")),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rolls back the whole graph, plan, audit, and idempotency record on an injected database failure", async () => {
+    const plan = await service.planDataRequests({
+      input: {
+        id: "rollback-plan",
+        workspaceId: "workspace-1",
+        objective: "Measure conversion",
+        questionTypes: ["conversion"],
+        availableFields: [],
+      },
+      context: commandContext("rollback-plan"),
+    });
+    const failingStore: Store = {
+      close: () => store.close(),
+      transaction: (work) => store.transaction(async (repos) => work({
+        ...repos,
+        ingestionBatches: {
+          ...repos.ingestionBatches,
+          insert: () => Promise.reject(new Error("injected batch insert failure")),
+        },
+      })),
+    };
+    const failing = new DataResearchService(
+      failingStore,
+      { now: () => now },
+      { next: () => `failure-${++sequence}` },
+    );
+
+    await expect(failing.importFiles(importCommand("import-rollback", ["marketing.csv"], {
+      planId: plan.id,
+      expectedPlanVersion: 1,
+    }))).rejects.toThrow("injected batch insert failure");
+    const residue = await store.transaction(async (repos) => ({
+      batch: await repos.ingestionBatches.get("import-rollback", "workspace-1"),
+      plan: await repos.dataRequestPlans.get(plan.id, "workspace-1"),
+      audits: await repos.audit.listForEntity("workspace-1", "ingestion_batch", "import-rollback"),
+      idempotency: await repos.idempotency.get("workspace-1", "command-import-rollback"),
+    }));
+    expect(residue).toEqual({ batch: undefined, plan, audits: [], idempotency: undefined });
+    const raw = new DatabaseSync(join(tempDir, "store.db"));
+    try {
+      for (const table of ["sources", "datasets", "evidence"]) {
+        expect(raw.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
+      }
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("rejects assets supplied through the public evidence_record command", async () => {
+    const marketing = new MarketingService(store, { now: () => now }, { next: () => `public-${++sequence}` });
+    await marketing.registerSource({
+      input: {
+        id: "public-source",
+        workspaceId: "workspace-1",
+        name: "Public source",
+        type: "manual",
+        ownership: "owned",
+      },
+      context: commandContext("public-source"),
+    });
+
+    await expect(marketing.recordEvidence({
+      input: {
+        id: "forged-evidence",
+        workspaceId: "workspace-1",
+        sourceId: "public-source",
+        sourceLocator: "manual",
+        observedAt: now,
+        summary: "Forged assets must not be accepted",
+        contentHash: "a".repeat(64),
+        classification: "owned_operating",
+        assets: [{ id: "forged", kind: "original", contentHash: "a".repeat(64), byteLength: 1 }],
+      },
+      context: commandContext("forged-evidence"),
+    } as never)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    await expect(
+      store.transaction((repos) => repos.evidence.get("forged-evidence", "workspace-1")),
+    ).resolves.toBeUndefined();
   });
 });

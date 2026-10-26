@@ -2,7 +2,8 @@ import type {
   FreshnessAssessment,
   QuestionType,
 } from "../domain/data-preparation.js";
-import type { ParsedFileBatch } from "../infrastructure/file-ingestor.js";
+import type { EvidenceAsset } from "../domain/model.js";
+import type { IngestLimits, ParsedFileBatch } from "../infrastructure/file-ingestor.js";
 
 export interface CreateDataRequestPlan {
   id: string;
@@ -29,4 +30,24 @@ export interface DeclineDataRound {
   expectedPlanVersion: number;
   questionType: QuestionType;
   reason: string;
+}
+
+export interface ImportFiles {
+  id: string;
+  workspaceId: string;
+  paths: string[];
+  limits?: IngestLimits;
+  planId?: string;
+  expectedPlanVersion?: number;
+  freshness?: FreshnessAssessment;
+}
+
+export interface EvidenceAssetQuery {
+  workspaceId: string;
+  evidenceId: string;
+  assetId: string;
+}
+
+export interface EvidenceAssetContent extends EvidenceAsset {
+  content: Buffer;
 }
