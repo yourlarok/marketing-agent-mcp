@@ -8,32 +8,64 @@ export const QUESTION_TYPES = [
 ] as const;
 
 export const PLAN_STATES = ["awaiting_data", "ready", "partial", "blocked"] as const;
+export const DATASET_FIELD_TYPES = ["empty", "string", "number", "boolean", "mixed"] as const;
+export const PARSED_ISSUE_CODES = [
+  "DUPLICATE_HEADER",
+  "EMPTY_HEADER",
+  "INCONSISTENT_COLUMNS",
+  "DUPLICATE_ROW",
+  "TYPE_INCONSISTENCY",
+  "MISSING_CACHED_FORMULA_RESULT",
+] as const;
 
 export type QuestionType = (typeof QUESTION_TYPES)[number];
 export type PlanState = (typeof PLAN_STATES)[number];
 export type DataQualityCategory = "missing" | "duplicate" | "type" | "format" | "freshness";
 
+export interface DataSourceLayer {
+  id: string;
+  acceptedFields: readonly string[];
+}
+
 export interface DataQuestionDefinition {
   prompt: string;
   acceptedFields: readonly string[];
+  sourceLayers: readonly DataSourceLayer[];
 }
 
 export const DATA_QUESTION_CATALOG: Readonly<Record<QuestionType, DataQuestionDefinition>> = {
   content_performance: {
     prompt: "Provide content identifiers, publication dates, reach, and click metrics.",
     acceptedFields: ["content_id", "published_at", "impressions", "clicks"],
+    sourceLayers: [
+      { id: "content_identity", acceptedFields: ["content_id", "published_at"] },
+      { id: "content_metrics", acceptedFields: ["impressions", "clicks"] },
+    ],
   },
   lead_funnel: {
     prompt: "Provide lead identifiers, funnel stages, and stage transition dates.",
     acceptedFields: ["lead_id", "stage", "stage_changed_at"],
+    sourceLayers: [
+      { id: "lead_identity", acceptedFields: ["lead_id"] },
+      { id: "funnel_stages", acceptedFields: ["stage", "stage_changed_at"] },
+    ],
   },
   conversion: {
     prompt: "Provide conversion identifiers, conversion dates, and conversion values.",
     acceptedFields: ["conversion_id", "converted_at", "conversion_value"],
+    sourceLayers: [
+      { id: "conversion_events", acceptedFields: ["conversion_id", "converted_at"] },
+      { id: "conversion_values", acceptedFields: ["conversion_value"] },
+    ],
   },
   competitor_content: {
     prompt: "Provide competitor names, public content URLs, publication dates, and public engagement metrics.",
     acceptedFields: ["competitor", "content_url", "published_at", "engagement"],
+    sourceLayers: [
+      { id: "competitor_identity", acceptedFields: ["competitor", "content_url"] },
+      { id: "competitor_publication", acceptedFields: ["published_at"] },
+      { id: "competitor_engagement", acceptedFields: ["engagement"] },
+    ],
   },
 };
 
@@ -90,6 +122,7 @@ export interface DataQualityReport {
 
 export interface DataRequestQuestion {
   questionType: QuestionType;
+  sourceLayer: string;
   prompt: string;
   acceptedFields: readonly string[];
   missingFields: string[];
@@ -153,16 +186,20 @@ function timestamp(value: string, field: string): number {
 }
 
 function qualityCategory(code: string): DataQualityCategory {
-  if (code === "DUPLICATE_ROW" || code === "DUPLICATE_HEADER") {
-    return "duplicate";
+  switch (code) {
+    case "DUPLICATE_ROW":
+    case "DUPLICATE_HEADER":
+      return "duplicate";
+    case "TYPE_INCONSISTENCY":
+      return "type";
+    case "MISSING_CACHED_FORMULA_RESULT":
+      return "missing";
+    case "EMPTY_HEADER":
+    case "INCONSISTENT_COLUMNS":
+      return "format";
+    default:
+      return invalid(`Unsupported parsed dataset issue code: ${code}`);
   }
-  if (code === "TYPE_INCONSISTENCY") {
-    return "type";
-  }
-  if (code === "MISSING_CACHED_FORMULA_RESULT") {
-    return "missing";
-  }
-  return "format";
 }
 
 export function createDataQualityReports(
@@ -254,16 +291,26 @@ export function planDataRequestRound(
   const available = new Set(availableFields);
   const declined = new Set(declinedQuestionTypes);
   const active = questionTypes.filter((questionType) => !declined.has(questionType));
-  const questions = active.flatMap((questionType) => {
+  const questions: DataRequestQuestion[] = [];
+  for (const questionType of active) {
     const definition = DATA_QUESTION_CATALOG[questionType];
-    const missingFields = definition.acceptedFields.filter((field) => !available.has(field));
-    return missingFields.length === 0 ? [] : [{
-      questionType,
-      prompt: definition.prompt,
-      acceptedFields: definition.acceptedFields,
-      missingFields,
-    }];
-  });
+    for (const layer of definition.sourceLayers) {
+      const missingFields = layer.acceptedFields.filter((field) => !available.has(field));
+      if (missingFields.length > 0) {
+        questions.push({
+          questionType,
+          sourceLayer: layer.id,
+          prompt: definition.prompt,
+          acceptedFields: layer.acceptedFields,
+          missingFields,
+        });
+        break;
+      }
+    }
+    if (questions.length > 0) {
+      break;
+    }
+  }
   const answerableQuestionTypes = active.filter((questionType) =>
     DATA_QUESTION_CATALOG[questionType].acceptedFields.every((field) => available.has(field))
   );

@@ -14,6 +14,15 @@ export interface CreateDataRequestPlan {
   freshness?: FreshnessAssessment;
 }
 
+export interface ReconcileDataRequestPlan {
+  planId: string;
+  workspaceId: string;
+  expectedPlanVersion: number;
+  availableFields: string[];
+  batch?: ParsedFileBatch;
+  freshness?: FreshnessAssessment;
+}
+
 export interface DeclineDataRound {
   planId: string;
   workspaceId: string;

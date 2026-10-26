@@ -1,4 +1,6 @@
 import {
+  DATASET_FIELD_TYPES,
+  PARSED_ISSUE_CODES,
   QUESTION_TYPES,
   createDataQualityReports,
   planDataRequestRound,
@@ -15,6 +17,7 @@ import {
 import type {
   CreateDataRequestPlan,
   DeclineDataRound,
+  ReconcileDataRequestPlan,
 } from "./data-research-commands.js";
 import type {
   Clock,
@@ -79,7 +82,12 @@ function assertBatch(value: unknown): void {
       }
       const definition = field as Record<string, unknown>;
       assertNonEmptyString(definition.name, "dataset field name");
-      assertNonEmptyString(definition.inferredType, "dataset field inferredType");
+      if (
+        typeof definition.inferredType !== "string" ||
+        !(DATASET_FIELD_TYPES as readonly string[]).includes(definition.inferredType)
+      ) {
+        invalid("dataset field inferredType is not supported");
+      }
       if (!Number.isSafeInteger(definition.index) || (definition.index as number) < 0) {
         invalid("dataset field index must be a non-negative integer");
       }
@@ -97,8 +105,19 @@ function assertBatch(value: unknown): void {
       if (issue === null || typeof issue !== "object" || Array.isArray(issue)) {
         invalid("dataset issues must be objects");
       }
-      assertNonEmptyString((issue as Record<string, unknown>).code, "dataset issue code");
-      assertNonEmptyString((issue as Record<string, unknown>).message, "dataset issue message");
+      const detail = issue as Record<string, unknown>;
+      if (typeof detail.code !== "string" || !(PARSED_ISSUE_CODES as readonly string[]).includes(detail.code)) {
+        invalid("dataset issue code is not supported");
+      }
+      assertNonEmptyString(detail.message, "dataset issue message");
+      for (const field of ["rowNumber", "columnNumber"]) {
+        if (
+          detail[field] !== undefined &&
+          (!Number.isSafeInteger(detail[field]) || (detail[field] as number) <= 0)
+        ) {
+          invalid(`dataset issue ${field} must be a positive integer or undefined`);
+        }
+      }
     }
   }
 }
@@ -178,6 +197,63 @@ export class DataResearchService {
     });
   }
 
+  reconcileDataRequests(command: Command<ReconcileDataRequestPlan>): Promise<DataRequestPlan> {
+    return this.commands.execute({
+      workspaceId: command.input.workspaceId,
+      action: "data_request_plan.reconcile",
+      entityType: "data_request_plan",
+      input: { ...command.input, id: command.input.planId },
+      context: command.context,
+      write: async (repos, rawInput, timestamp) => {
+        const input = rawInput as ReconcileDataRequestPlan & { id: string };
+        if (!Number.isInteger(input.expectedPlanVersion) || input.expectedPlanVersion < 1) {
+          invalid("expectedPlanVersion must be a positive integer");
+        }
+        assertBatch(input.batch);
+        if (
+          input.freshness !== undefined &&
+          (input.freshness === null || typeof input.freshness !== "object" || Array.isArray(input.freshness))
+        ) {
+          invalid("freshness must be an object");
+        }
+        await requireWorkspace(repos, input.workspaceId);
+        const stored = await repos.dataRequestPlans.get(input.planId, input.workspaceId);
+        if (!stored) {
+          throw new DomainError("NOT_FOUND", "Data request plan not found in workspace", false, {
+            planId: input.planId,
+            workspaceId: input.workspaceId,
+          });
+        }
+        const current = requirePlanDetails(stored);
+        if (current.version !== input.expectedPlanVersion) {
+          throw new DomainError("CONFLICT", "Data request plan version does not match", false, {
+            planId: input.planId,
+          });
+        }
+        const availableFields = [...new Set([...current.availableFields, ...input.availableFields])];
+        const planned = planDataRequestRound(
+          current.questionTypes,
+          availableFields,
+          current.declinedQuestionTypes,
+        );
+        const qualityReports = input.batch
+          ? [...current.qualityReports, ...createDataQualityReports(input.batch, input.freshness)]
+          : current.qualityReports;
+        const round = current.round + 1;
+        const updated: DataRequestPlan = {
+          ...current,
+          ...planned,
+          availableFields,
+          qualityReports,
+          round,
+          updatedAt: timestamp,
+          rounds: [...current.rounds, { round, ...planned }],
+        };
+        return repos.dataRequestPlans.update(updated, input.expectedPlanVersion) as Promise<DataRequestPlan>;
+      },
+    });
+  }
+
   declineDataRound(command: Command<DeclineDataRound>): Promise<DataRequestPlan> {
     return this.commands.execute({
       workspaceId: command.input.workspaceId,
@@ -206,8 +282,11 @@ export class DataResearchService {
             planId: input.planId,
           });
         }
-        if (!current.answerableQuestionTypes.includes(input.questionType)) {
-          throw new DomainError("CONFLICT", "Declining a round must reduce answerable scope", false, {
+        if (
+          !current.questionTypes.includes(input.questionType) ||
+          current.declinedQuestionTypes.includes(input.questionType)
+        ) {
+          throw new DomainError("CONFLICT", "Only an active plan question can be declined", false, {
             planId: input.planId,
           });
         }

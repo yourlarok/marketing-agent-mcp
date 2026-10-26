@@ -450,6 +450,39 @@ describe("DataResearchService guided data rounds", () => {
     idempotencyKey: `command-${suffix}`,
   });
 
+  function parsedBatch() {
+    return {
+      datasets: [{
+        source: { path: "/imports/data.csv", fileName: "data.csv", format: "csv" as const, sizeBytes: 10 },
+        fields: [{ name: "content_id", index: 0, inferredType: "string" as const }],
+        rowsJsonl: "",
+        quality: { rowCount: 0, columnCount: 1, duplicateRowCount: 0, emptyRowCount: 0, typeInconsistencyCount: 0 },
+        issues: [],
+      }],
+    };
+  }
+
+  async function expectNoCreateResidue(planId: string, key: string): Promise<void> {
+    const residue = await store.transaction(async (repos) => ({
+      plan: await repos.dataRequestPlans.get(planId, "workspace-1"),
+      batch: await repos.ingestionBatches.get(planId, "workspace-1"),
+      audits: await repos.audit.listForEntity("workspace-1", "data_request_plan", planId),
+      idempotency: await repos.idempotency.get("workspace-1", key),
+    }));
+    expect(residue).toEqual({ plan: undefined, batch: undefined, audits: [], idempotency: undefined });
+  }
+
+  async function expectNoUpdateResidue(planId: string, keys: string[]): Promise<void> {
+    const residue = await store.transaction(async (repos) => ({
+      plan: await repos.dataRequestPlans.get(planId, "workspace-1"),
+      audits: await repos.audit.listForEntity("workspace-1", "data_request_plan", planId),
+      idempotency: await Promise.all(keys.map((key) => repos.idempotency.get("workspace-1", key))),
+    }));
+    expect(residue.plan?.version).toBe(1);
+    expect(residue.audits).toHaveLength(1);
+    expect(residue.idempotency).toEqual(keys.map(() => undefined));
+  }
+
   beforeEach(async () => {
     store = openStore(":memory:");
     auditSequence = 0;
@@ -507,6 +540,100 @@ describe("DataResearchService guided data rounds", () => {
     });
   });
 
+  it("reconciles imported fields into later source layers and questions without a decline", async () => {
+    const created = await service.planDataRequests({
+      input: {
+        id: "guided-plan",
+        workspaceId: "workspace-1",
+        objective: "Understand content and conversion",
+        questionTypes: ["content_performance", "conversion"],
+        availableFields: [],
+      },
+      context: commandContext("plan"),
+    });
+    expect(created.questions[0]).toMatchObject({ sourceLayer: "content_identity" });
+
+    const metrics = await service.reconcileDataRequests({
+      input: {
+        planId: created.id,
+        workspaceId: "workspace-1",
+        expectedPlanVersion: 1,
+        availableFields: ["content_id", "published_at"],
+      },
+      context: commandContext("reconcile-metrics"),
+    });
+    expect(metrics).toMatchObject({ version: 2, round: 2 });
+    expect(metrics.questions).toHaveLength(1);
+    expect(metrics.questions[0]).toMatchObject({
+      questionType: "content_performance",
+      sourceLayer: "content_metrics",
+      missingFields: ["impressions", "clicks"],
+    });
+
+    const conversion = await service.reconcileDataRequests({
+      input: {
+        planId: created.id,
+        workspaceId: "workspace-1",
+        expectedPlanVersion: 2,
+        availableFields: ["impressions", "clicks"],
+      },
+      context: commandContext("reconcile-conversion"),
+    });
+    expect(conversion).toMatchObject({
+      version: 3,
+      round: 3,
+      answerableQuestionTypes: ["content_performance"],
+    });
+    expect(conversion.questions).toHaveLength(1);
+    expect(conversion.questions[0]).toMatchObject({
+      questionType: "conversion",
+      sourceLayer: "conversion_events",
+      missingFields: ["conversion_id", "converted_at"],
+    });
+    expect(conversion.rounds.map((round) => round.questions[0]?.sourceLayer)).toEqual([
+      "content_identity",
+      "content_metrics",
+      "conversion_events",
+    ]);
+  });
+
+  it("allows declining an active question during the initial awaiting-data round", async () => {
+    const created = await service.planDataRequests({
+      input: {
+        id: "guided-plan",
+        workspaceId: "workspace-1",
+        objective: "Understand content and conversion",
+        questionTypes: ["content_performance", "conversion"],
+        availableFields: [],
+      },
+      context: commandContext("plan"),
+    });
+    expect(created.state).toBe("awaiting_data");
+
+    const declined = await service.declineDataRound({
+      input: {
+        planId: created.id,
+        workspaceId: "workspace-1",
+        expectedPlanVersion: 1,
+        questionType: "content_performance",
+        reason: "No content export is available",
+      },
+      context: commandContext("decline-awaiting"),
+    });
+
+    expect(declined).toMatchObject({
+      state: "awaiting_data",
+      answerableQuestionTypes: [],
+      declinedQuestionTypes: ["content_performance"],
+      limitations: ["content_performance: No content export is available"],
+    });
+    expect(declined.questions).toHaveLength(1);
+    expect(declined.questions[0]).toMatchObject({
+      questionType: "conversion",
+      sourceLayer: "conversion_events",
+    });
+  });
+
   it("reduces answerable scope and records an explicit limitation when a round is declined", async () => {
     const created = await service.planDataRequests({
       input: {
@@ -543,7 +670,7 @@ describe("DataResearchService guided data rounds", () => {
     ).resolves.toMatchObject({ action: "data_request_plan.decline" });
   });
 
-  it("rejects malformed runtime input before writing a plan", async () => {
+  it("rejects direct untrusted JavaScript input without plan, batch, audit, or idempotency residue", async () => {
     await expect(service.planDataRequests({
       input: {
         id: "bad-plan",
@@ -554,29 +681,31 @@ describe("DataResearchService guided data rounds", () => {
       },
       context: commandContext("bad"),
     } as never)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
-    await expect(service.planDataRequests({
-      input: {
-        id: "bad-batch-plan",
-        workspaceId: "workspace-1",
-        objective: "Bad batch",
-        questionTypes: ["conversion"],
-        availableFields: [],
-        batch: {
-          datasets: [{
-            source: { fileName: 42 },
-            fields: [],
-            rowsJsonl: "",
-            quality: { rowCount: 0, columnCount: 0, duplicateRowCount: 0, emptyRowCount: 0, typeInconsistencyCount: 0 },
-            issues: [],
-          }],
-        },
-      },
-      context: commandContext("bad-batch"),
-    } as never)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    await expectNoCreateResidue("bad-plan", "command-bad");
 
-    await expect(
-      store.transaction((repos) => repos.dataRequestPlans.get("bad-plan", "workspace-1")),
-    ).resolves.toBeUndefined();
+    const cases: [string, (batch: ReturnType<typeof parsedBatch>) => void][] = [
+      ["bad-batch-plan", (batch) => { batch.datasets[0]!.source = { fileName: 42 } as never; }],
+      ["bad-inferred-type", (batch) => { batch.datasets[0]!.fields[0]!.inferredType = "date" as never; }],
+      ["bad-issue-code", (batch) => { batch.datasets[0]!.issues = [{ code: "UNTRUSTED_CODE", message: "Unknown" }] as never; }],
+      ["bad-row-number", (batch) => { batch.datasets[0]!.issues = [{ code: "DUPLICATE_ROW", message: "Duplicate", rowNumber: 0 }] as never; }],
+      ["bad-column-number", (batch) => { batch.datasets[0]!.issues = [{ code: "DUPLICATE_ROW", message: "Duplicate", columnNumber: -1 }] as never; }],
+    ];
+    for (const [id, corrupt] of cases) {
+      const batch = parsedBatch();
+      corrupt(batch);
+      await expect(service.planDataRequests({
+        input: {
+          id,
+          workspaceId: "workspace-1",
+          objective: "Bad batch",
+          questionTypes: ["conversion"],
+          availableFields: [],
+          batch,
+        },
+        context: commandContext(id),
+      } as never)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+      await expectNoCreateResidue(id, `command-${id}`);
+    }
   });
 
   it("loads declines only from the same workspace and enforces the expected plan version", async () => {
@@ -590,6 +719,7 @@ describe("DataResearchService guided data rounds", () => {
       },
       context: commandContext("plan"),
     });
+    await store.transaction((repos) => repos.workspaces.insert(entity("workspace-2", "workspace-2")));
 
     await expect(service.declineDataRound({
       input: {
@@ -600,7 +730,10 @@ describe("DataResearchService guided data rounds", () => {
         reason: "Wrong workspace",
       },
       context: commandContext("cross-workspace"),
-    })).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    })).rejects.toMatchObject<DomainError>({
+      code: "NOT_FOUND",
+      details: { planId: "guided-plan", workspaceId: "workspace-2" },
+    });
     await expect(service.declineDataRound({
       input: {
         planId: "guided-plan",
@@ -611,5 +744,6 @@ describe("DataResearchService guided data rounds", () => {
       },
       context: commandContext("stale"),
     })).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    await expectNoUpdateResidue("guided-plan", ["command-cross-workspace", "command-stale"]);
   });
 });

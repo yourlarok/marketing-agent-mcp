@@ -45,28 +45,52 @@ describe("deterministic data preparation", () => {
     }
   });
 
-  it("requests only currently missing fields in a stable first round", () => {
+  it("requests only one question and one source layer in a stable first round", () => {
     const round = planDataRequestRound(
       ["content_performance", "conversion"],
       ["content_id", "published_at", "conversion_id"],
     );
 
-    expect(round.questions).toEqual([
-      {
-        questionType: "content_performance",
-        prompt: DATA_QUESTION_CATALOG.content_performance.prompt,
-        acceptedFields: DATA_QUESTION_CATALOG.content_performance.acceptedFields,
-        missingFields: ["impressions", "clicks"],
-      },
-      {
-        questionType: "conversion",
-        prompt: DATA_QUESTION_CATALOG.conversion.prompt,
-        acceptedFields: DATA_QUESTION_CATALOG.conversion.acceptedFields,
-        missingFields: ["converted_at", "conversion_value"],
-      },
-    ]);
+    expect(round.questions).toEqual([{
+      questionType: "content_performance",
+      sourceLayer: "content_metrics",
+      prompt: DATA_QUESTION_CATALOG.content_performance.prompt,
+      acceptedFields: ["impressions", "clicks"],
+      missingFields: ["impressions", "clicks"],
+    }]);
     expect(round.state).toBe("partial");
     expect(round.answerableQuestionTypes).toEqual([]);
+  });
+
+  it("advances through source layers and then to the next question as fields arrive", () => {
+    const identity = planDataRequestRound(["content_performance", "conversion"], []);
+    expect(identity.questions).toHaveLength(1);
+    expect(identity.questions[0]).toMatchObject({
+      questionType: "content_performance",
+      sourceLayer: "content_identity",
+      missingFields: ["content_id", "published_at"],
+    });
+
+    const metrics = planDataRequestRound(
+      ["content_performance", "conversion"],
+      ["content_id", "published_at"],
+    );
+    expect(metrics.questions[0]).toMatchObject({
+      questionType: "content_performance",
+      sourceLayer: "content_metrics",
+    });
+
+    const conversion = planDataRequestRound(
+      ["content_performance", "conversion"],
+      ["content_id", "published_at", "impressions", "clicks"],
+    );
+    expect(conversion.questions).toHaveLength(1);
+    expect(conversion.questions[0]).toMatchObject({
+      questionType: "conversion",
+      sourceLayer: "conversion_events",
+      missingFields: ["conversion_id", "converted_at"],
+    });
+    expect(conversion.answerableQuestionTypes).toEqual(["content_performance"]);
   });
 
   it("reports missing, duplicate, type, format, and freshness issues", () => {
@@ -95,6 +119,13 @@ describe("deterministic data preparation", () => {
     expect(reports[0]!.issues.map((issue) => issue.category)).toEqual(
       expect.arrayContaining(["missing", "duplicate", "type"]),
     );
+  });
+
+  it("rejects unknown parser issue codes instead of relabeling them as format issues", () => {
+    const batch = qualityBatch();
+    batch.datasets[0]!.issues = [{ code: "UNTRUSTED_CODE", message: "Unknown" }];
+
+    expect(() => createDataQualityReports(batch)).toThrow(/issue code/i);
   });
 
   it("marks a fully supplied question ready without inventing another request", () => {
