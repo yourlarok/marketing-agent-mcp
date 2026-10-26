@@ -1,0 +1,369 @@
+import { readFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { join, resolve } from "node:path";
+import { chromium, type Browser } from "playwright";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import type { CommandContext } from "../../src/application/commands.js";
+import { DataResearchService } from "../../src/application/data-research-service.js";
+import type { Store } from "../../src/application/ports.js";
+import { loadConfig } from "../../src/config.js";
+import type { Evidence } from "../../src/domain/model.js";
+import { AcquisitionRouter } from "../../src/infrastructure/acquisition-router.js";
+import { ArtifactStore } from "../../src/infrastructure/artifact-store.js";
+import { McpAcquisitionProvider } from "../../src/infrastructure/mcp-acquisition.js";
+import { PlaywrightAcquisitionProvider } from "../../src/infrastructure/playwright-acquisition.js";
+import { openStore } from "../../src/infrastructure/sqlite-store.js";
+import { createTempDir, removeTempDir } from "../helpers.js";
+
+const fixtureRoot = resolve("tests/fixtures/http-site");
+const fixtureCommand = resolve("tests/fixtures/http-site/mcp-fixture.mjs");
+const now = "2026-10-26T12:30:00.000Z";
+
+async function serve(server: Server): Promise<string> {
+  await new Promise<void>((resolveListen) => server.listen(0, resolveListen));
+  const { port } = server.address() as AddressInfo;
+  return `http://127.0.0.1:${port}`;
+}
+
+describe("content acquisition", () => {
+  let browser: Browser;
+  let server: Server;
+  let baseUrl: string;
+  let documentHits: number;
+  let privateHits: number;
+  let cookies: (string | undefined)[];
+
+  beforeAll(async () => {
+    browser = await chromium.launch({ headless: true });
+  });
+
+  afterAll(async () => {
+    await browser.close();
+  });
+
+  beforeEach(async () => {
+    documentHits = 0;
+    privateHits = 0;
+    cookies = [];
+    server = createServer((request, response) => {
+      const path = new URL(request.url ?? "/", "http://fixture.local").pathname;
+      if (path === "/private.js") {
+        privateHits += 1;
+      }
+      if (["/dynamic", "/subrequest", "/download"].includes(path)) {
+        documentHits += 1;
+        cookies.push(request.headers.cookie);
+        response.setHeader("set-cookie", "fixture_session=persisted; Path=/; HttpOnly");
+      }
+      if (["/401", "/403", "/429"].includes(path)) {
+        response.writeHead(Number(path.slice(1)), { "content-type": "text/html" });
+        response.end("<html><body>Access denied</body></html>");
+        return;
+      }
+      if (path === "/login") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end("<html><body><h1>Please log in to continue</h1></body></html>");
+        return;
+      }
+      if (path === "/captcha") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end("<html><body><h1>CAPTCHA verification required</h1></body></html>");
+        return;
+      }
+      if (path === "/dynamic") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end("<!doctype html><html><head><title>Initial title</title></head><body><h1 id=\"headline\">Loading</h1><p class=\"price\"></p><div id=\"client-content\"></div><script src=\"/app.js\"></script></body></html>");
+        return;
+      }
+      if (path === "/subrequest" || path === "/download") {
+        const file = path === "/subrequest" ? "subrequest.html" : "download.html";
+        void readFile(join(fixtureRoot, file), "utf8").then((html) => {
+          response.writeHead(200, { "content-type": "text/html" });
+          response.end(html.replace("PORT", String((server.address() as AddressInfo).port)));
+        });
+        return;
+      }
+      const file = path === "/app.js" ? "app.js" : path === "/private.js" ? "private.js" : "download.txt";
+      void readFile(join(fixtureRoot, file)).then((content) => {
+        response.writeHead(200, { "content-type": file.endsWith(".js") ? "text/javascript" : "text/plain" });
+        response.end(content);
+      });
+    });
+    baseUrl = await serve(server);
+  });
+
+  afterEach(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  });
+
+  function playwright(extra: { allowlist?: string[] } = {}): PlaywrightAcquisitionProvider {
+    return new PlaywrightAcquisitionProvider({
+      browser,
+      allowlist: extra.allowlist ?? ["127.0.0.1"],
+    });
+  }
+
+  it("renders a dynamic page in real Chromium and returns CSS fields and PNG bytes", async () => {
+    const page = await playwright().acquire({
+      url: `${baseUrl}/dynamic`,
+      fields: { headline: "#headline", price: ".price" },
+    });
+
+    expect(page).toMatchObject({
+      provider: "playwright",
+      finalUrl: `${baseUrl}/dynamic`,
+      title: "Rendered campaign",
+      fields: { headline: "Rendered by Chromium", price: "USD 42" },
+    });
+    expect(page.text).toContain("Client-only campaign detail");
+    expect(page.text).not.toContain("Loading");
+    expect(page.screenshot.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    expect(page.screenshot.length).toBeGreaterThan(1_000);
+    expect(page.toolVersion).not.toBe("");
+  }, 20_000);
+
+  it("uses a fresh context with no persisted cookies between acquisitions", async () => {
+    const provider = playwright();
+    await provider.acquire({ url: `${baseUrl}/dynamic` });
+    await provider.acquire({ url: `${baseUrl}/dynamic` });
+
+    expect(cookies).toEqual([undefined, undefined]);
+  }, 20_000);
+
+  it("marks startup MCP configuration verified only after a real fixture acquisition and prefers it", async () => {
+    const markerRoot = await createTempDir();
+    const marker = join(markerRoot, "acquisitions.log");
+    const closedBrowser = await chromium.launch({ headless: true });
+    await closedBrowser.close();
+    const mcp = new McpAcquisitionProvider({
+      command: process.execPath,
+      args: [fixtureCommand],
+      env: { ...process.env, MCP_FIXTURE_MARKER: marker },
+    });
+    const router = new AcquisitionRouter({
+      mcp,
+      playwright: new PlaywrightAcquisitionProvider({ browser: closedBrowser }),
+    });
+    try {
+      expect(mcp.state).toBe("configured");
+      const page = await router.acquire({
+        url: `${baseUrl}/dynamic`,
+        fields: { headline: "#headline" },
+      });
+      expect(mcp.state).toBe("verified");
+      expect(page).toMatchObject({
+        provider: "mcp",
+        text: "Acquired through the real MCP fixture",
+        fields: { headline: "fixture:headline" },
+        toolVersion: "1.0.0",
+      });
+      expect(page.screenshot.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+      expect(await readFile(marker, "utf8")).toBe(`${baseUrl}/dynamic\n`);
+    } finally {
+      await removeTempDir(markerRoot);
+    }
+  }, 20_000);
+
+  it("falls back from an unhealthy configured MCP provider to Playwright", async () => {
+    const mcp = new McpAcquisitionProvider({ command: join(fixtureRoot, "missing-provider"), args: [] });
+    const router = new AcquisitionRouter({ mcp, playwright: playwright() });
+
+    const page = await router.acquire({ url: `${baseUrl}/dynamic` });
+    expect(page.provider).toBe("playwright");
+    expect(page.text).toContain("Rendered by Chromium");
+    expect(mcp.state).toBe("unavailable");
+  }, 20_000);
+
+  it("fails explicitly when neither professional MCP nor Chromium can acquire", async () => {
+    const closedBrowser = await chromium.launch({ headless: true });
+    await closedBrowser.close();
+    const router = new AcquisitionRouter({
+      mcp: new McpAcquisitionProvider({ command: join(fixtureRoot, "missing-provider"), args: [] }),
+      playwright: new PlaywrightAcquisitionProvider({ browser: closedBrowser }),
+    });
+
+    await expect(router.acquire({ url: `${baseUrl}/dynamic` })).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+    });
+  }, 20_000);
+
+  it.each([401, 403, 429])("reports HTTP %i as an acquisition gap", async (status) => {
+    await expect(playwright().acquire({ url: `${baseUrl}/${status}` })).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+      details: { reason: `http_${status}` },
+    });
+  }, 20_000);
+
+  it.each(["login", "captcha"])("reports %s gates without bypassing them", async (gate) => {
+    await expect(playwright().acquire({ url: `${baseUrl}/${gate}` })).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+      details: { reason: "access_gate" },
+    });
+  }, 20_000);
+
+  it("reports a real Chromium crash as unavailable", async () => {
+    const crashedBrowser = await chromium.launch({ headless: true });
+    const session = await crashedBrowser.newBrowserCDPSession();
+    const disconnected = new Promise<void>((resolveDisconnected) => crashedBrowser.once("disconnected", resolveDisconnected));
+    void session.send("Browser.crash").catch(() => undefined);
+    await disconnected;
+    const provider = new PlaywrightAcquisitionProvider({ browser: crashedBrowser, allowlist: ["127.0.0.1"] });
+
+    await expect(provider.acquire({ url: `${baseUrl}/dynamic` })).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+      details: { reason: "browser_unavailable" },
+    });
+  }, 20_000);
+
+  it("reports screenshot failure without returning partial page evidence", async () => {
+    const provider = new PlaywrightAcquisitionProvider({
+      browser,
+      allowlist: ["127.0.0.1"],
+      captureScreenshot: async () => { throw new Error("injected screenshot failure"); },
+    });
+
+    await expect(provider.acquire({ url: `${baseUrl}/dynamic` })).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+      details: { reason: "screenshot_failed" },
+    });
+  }, 20_000);
+
+  it("denies page-triggered downloads", async () => {
+    await expect(playwright().acquire({ url: `${baseUrl}/download` })).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+      details: { reason: "download_denied" },
+    });
+  }, 20_000);
+
+  it("validates subrequest destinations and blocks a private target omitted from the allowlist", async () => {
+    const url = baseUrl.replace("127.0.0.1", "localhost");
+    const page = await playwright({ allowlist: ["localhost"] }).acquire({ url: `${url}/subrequest` });
+
+    expect(page.fields).toEqual({});
+    expect(page.text).toContain("Allowed main page");
+    expect(page.text).not.toContain("Private subrequest executed");
+    expect(privateHits).toBe(0);
+  }, 20_000);
+
+  it("rejects caller scripts and non-CSS selector input before navigation", async () => {
+    const before = documentHits;
+    await expect(playwright().acquire({
+      url: `${baseUrl}/dynamic`,
+      fields: { bad: "body >> text=Rendered" },
+    })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(playwright().acquire({
+      url: `${baseUrl}/dynamic`,
+      script: "process.exit(1)",
+    } as never)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(documentHits).toBe(before);
+  }, 20_000);
+
+  it("loads professional MCP startup configuration as command arguments, not caller input", async () => {
+    const root = await createTempDir();
+    try {
+      expect(loadConfig({
+        MARKETING_DATA_DIR: root,
+        MARKETING_CONTENT_MCP_COMMAND: process.execPath,
+        MARKETING_CONTENT_MCP_ARGS: JSON.stringify([fixtureCommand]),
+      })).toMatchObject({
+        contentMcp: { command: process.execPath, args: [fixtureCommand] },
+      });
+      expect(() => loadConfig({
+        MARKETING_DATA_DIR: root,
+        MARKETING_CONTENT_MCP_COMMAND: process.execPath,
+        MARKETING_CONTENT_MCP_ARGS: "not-json",
+      })).toThrow(/MARKETING_CONTENT_MCP_ARGS/);
+    } finally {
+      await removeTempDir(root);
+    }
+  });
+
+  it("persists successful link evidence and screenshot bytes in a partial atomic batch", async () => {
+    const store: Store = openStore(":memory:");
+    const artifactRoot = await createTempDir();
+    let sequence = 0;
+    const service = new DataResearchService(
+      store,
+      { now: () => now },
+      { next: () => `generated-${++sequence}` },
+      new ArtifactStore(artifactRoot),
+      undefined,
+      new AcquisitionRouter({ playwright: playwright() }),
+    );
+    const context: CommandContext = {
+      actor: "agent-1",
+      requestId: "request-links",
+      idempotencyKey: "command-links",
+    };
+    try {
+      await store.transaction((repos) => repos.workspaces.insert({
+        id: "workspace-1",
+        workspaceId: "workspace-1",
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+        name: "Workspace",
+      }));
+      const command = {
+        input: {
+          id: "batch-links",
+          workspaceId: "workspace-1",
+          links: [
+            { url: `${baseUrl}/dynamic`, fields: { headline: "#headline" } },
+            { url: `${baseUrl}/403` },
+          ],
+        },
+        context,
+      };
+      const batch = await service.ingestContentLinks(command);
+      expect(batch).toMatchObject({ state: "partial", datasetIds: [] });
+      expect(batch.sourceIds).toHaveLength(1);
+      expect(batch.evidenceIds).toHaveLength(1);
+      expect(batch.failures).toEqual([{ path: `${baseUrl}/403`, message: expect.stringMatching(/403/) }]);
+
+      const graph = await store.transaction(async (repos) => ({
+        source: await repos.sources.get(batch.sourceIds[0]!, "workspace-1"),
+        evidence: await repos.evidence.get(batch.evidenceIds[0]!, "workspace-1") as Evidence,
+        audit: await repos.audit.listForEntity("workspace-1", "ingestion_batch", batch.id),
+      }));
+      expect(graph.source).toMatchObject({
+        type: "link",
+        ownership: "external_public",
+        metadata: { provider: "playwright", finalUrl: `${baseUrl}/dynamic` },
+      });
+      expect(graph.evidence).toMatchObject({
+        sourceLocator: `${baseUrl}/dynamic`,
+        classification: "external_observation",
+        toolHealth: { purpose: "tool_health", capabilityId: "playwright", healthy: true },
+      });
+      expect(graph.audit).toHaveLength(1);
+      const assets = graph.evidence.assets!;
+      expect(assets.map((asset) => asset.kind)).toEqual(["page_text", "screenshot"]);
+      const textAsset = await service.getEvidenceAsset({
+        workspaceId: "workspace-1",
+        evidenceId: batch.evidenceIds[0]!,
+        assetId: assets[0]!.id,
+      });
+      expect(JSON.parse(textAsset.content.toString("utf8"))).toMatchObject({
+        text: expect.stringContaining("Client-only campaign detail"),
+        fields: { headline: "Rendered by Chromium" },
+      });
+      const imageAsset = await service.getEvidenceAsset({
+        workspaceId: "workspace-1",
+        evidenceId: batch.evidenceIds[0]!,
+        assetId: assets[1]!.id,
+      });
+      expect(imageAsset.content.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+      expect(imageAsset.content.length).toBe(assets[1]!.byteLength);
+
+      const hits = documentHits;
+      await expect(service.ingestContentLinks(command)).resolves.toEqual(batch);
+      expect(documentHits).toBe(hits);
+    } finally {
+      store.close();
+      await removeTempDir(artifactRoot);
+    }
+  }, 20_000);
+});

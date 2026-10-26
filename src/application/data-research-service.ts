@@ -16,6 +16,7 @@ import type {
 } from "../domain/data-research-model.js";
 import { DomainError } from "../domain/errors.js";
 import type { Dataset, Evidence, Source } from "../domain/model.js";
+import { AcquisitionRouter, type AcquisitionProvider, type AcquiredPage } from "../infrastructure/acquisition-router.js";
 import { ArtifactStore, type StoredArtifact } from "../infrastructure/artifact-store.js";
 import {
   DEFAULT_INGEST_LIMITS,
@@ -37,6 +38,7 @@ import type {
   EvidenceAssetContent,
   EvidenceAssetQuery,
   ImportFiles,
+  IngestContentLinks,
   IngestTemporaryApi,
   ReconcileDataRequestPlan,
 } from "./data-research-commands.js";
@@ -181,6 +183,12 @@ interface PreparedFile {
   responseFormat?: "json" | "csv";
 }
 
+interface PreparedLink {
+  page: AcquiredPage;
+  text: StoredArtifact;
+  screenshot: StoredArtifact;
+}
+
 function csvCell(value: unknown): string {
   if (value !== null && typeof value !== "string" && typeof value !== "boolean" &&
     (typeof value !== "number" || !Number.isFinite(value))) {
@@ -218,6 +226,7 @@ export class DataResearchService {
     private readonly ids: IdGenerator,
     private readonly artifacts: ArtifactStore = new ArtifactStore(),
     private readonly http: Pick<SafeHttpClient, "get"> = new SafeHttpClient(),
+    private readonly acquisition: AcquisitionProvider = AcquisitionRouter.fromEnvironment(),
   ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
@@ -412,6 +421,129 @@ export class DataResearchService {
       write: (repos, _input, timestamp) =>
         this.writeIngestionBatch(repos, input, files, [], timestamp),
     }, prepare);
+  }
+
+  async ingestContentLinks(command: Command<IngestContentLinks>): Promise<IngestionBatch> {
+    const input = command.input;
+    if (!Array.isArray(input.links) || input.links.length === 0) {
+      invalid("links must be a non-empty array");
+    }
+    if (input.links.length > 100) {
+      invalid("Content link import exceeds 100 links");
+    }
+    let pages: PreparedLink[] = [];
+    let failures: IngestionFileFailure[] = [];
+    const prepare = async (): Promise<void> => {
+      pages = [];
+      failures = [];
+      for (const link of input.links) {
+        try {
+          const page = await this.acquisition.acquire(link);
+          const serialized = Buffer.from(JSON.stringify({
+            url: page.url,
+            finalUrl: page.finalUrl,
+            title: page.title,
+            text: page.text,
+            fields: page.fields,
+            provider: page.provider,
+          }));
+          const [text, screenshot] = await Promise.all([
+            this.artifacts.put(serialized),
+            this.artifacts.put(page.screenshot),
+          ]);
+          pages.push({ page, text, screenshot });
+        } catch (error) {
+          failures.push({
+            path: typeof link?.url === "string" ? link.url : "invalid link",
+            message: error instanceof Error ? error.message : "Content acquisition failed",
+          });
+        }
+      }
+    };
+
+    return this.commands.executeBatch({
+      workspaceId: input.workspaceId,
+      action: "ingestion_batch.content_links",
+      entityType: "ingestion_batch",
+      input,
+      context: command.context,
+      write: (repos, _input, timestamp) =>
+        this.writeContentLinkBatch(repos, input, pages, failures, timestamp),
+    }, prepare);
+  }
+
+  private async writeContentLinkBatch(
+    repos: Repositories,
+    input: IngestContentLinks,
+    pages: PreparedLink[],
+    failures: IngestionFileFailure[],
+    timestamp: string,
+  ): Promise<IngestionBatch> {
+    await requireWorkspace(repos, input.workspaceId);
+    const sourceIds: string[] = [];
+    const evidenceIds: string[] = [];
+    for (const prepared of pages) {
+      const { page } = prepared;
+      const source: Source = {
+        id: this.ids.next(),
+        workspaceId: input.workspaceId,
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        name: page.title || page.finalUrl,
+        type: "link",
+        ownership: "external_public",
+        metadata: {
+          url: page.url,
+          finalUrl: page.finalUrl,
+          title: page.title,
+          fields: page.fields,
+          provider: page.provider,
+          toolVersion: page.toolVersion,
+        },
+      };
+      await repos.sources.insert(source);
+      sourceIds.push(source.id);
+      const evidence: Evidence = {
+        id: this.ids.next(),
+        workspaceId: input.workspaceId,
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        sourceId: source.id,
+        sourceLocator: page.url,
+        observedAt: timestamp,
+        summary: `Acquired content from ${page.finalUrl}`,
+        contentHash: prepared.text.contentHash,
+        classification: "external_observation",
+        assets: [
+          { id: this.ids.next(), kind: "page_text", ...prepared.text },
+          { id: this.ids.next(), kind: "screenshot", ...prepared.screenshot },
+        ],
+        toolHealth: {
+          purpose: "tool_health",
+          capabilityId: page.provider,
+          healthy: true,
+          checkedAt: timestamp,
+          toolVersion: page.toolVersion,
+        },
+      };
+      await repos.evidence.insert(evidence);
+      evidenceIds.push(evidence.id);
+    }
+    const batch: IngestionBatch = {
+      id: input.id,
+      workspaceId: input.workspaceId,
+      version: 1,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      state: failures.length === 0 ? "completed" : pages.length === 0 ? "blocked" : "partial",
+      sourceIds,
+      datasetIds: [],
+      evidenceIds,
+      failures,
+    };
+    return repos.ingestionBatches.insert(batch) as Promise<IngestionBatch>;
   }
 
   private async writeIngestionBatch(

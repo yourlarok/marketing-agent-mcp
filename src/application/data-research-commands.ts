@@ -55,6 +55,15 @@ export interface IngestTemporaryApi {
   freshness?: FreshnessAssessment;
 }
 
+export interface IngestContentLinks {
+  id: string;
+  workspaceId: string;
+  links: {
+    url: string;
+    fields?: Record<string, string>;
+  }[];
+}
+
 export interface EvidenceAssetQuery {
   workspaceId: string;
   evidenceId: string;
