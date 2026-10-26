@@ -36,9 +36,43 @@ export interface AuditRecord {
   createdAt: Instant;
 }
 
+export type LineageEntityType =
+  | "source"
+  | "dataset"
+  | "evidence"
+  | "finding"
+  | "recommendation"
+  | "task";
+
+export interface EntityRef {
+  entityType: LineageEntityType;
+  id: Id;
+}
+
+export interface LineageNode extends EntityRef {
+  version: number;
+  auditRequestIds: Id[];
+}
+
+export interface LineageEdge {
+  from: EntityRef;
+  to: EntityRef;
+}
+
+export interface Lineage {
+  workspaceId: Id;
+  nodes: LineageNode[];
+  edges: LineageEdge[];
+}
+
 export interface AuditRepository {
   append(record: AuditRecord): Promise<AuditRecord>;
   get(id: Id, workspaceId: Id): Promise<AuditRecord | undefined>;
+  listForEntity(
+    workspaceId: Id,
+    entityType: string,
+    entityId: Id,
+  ): Promise<AuditRecord[]>;
 }
 
 export interface IdempotencyRecord {

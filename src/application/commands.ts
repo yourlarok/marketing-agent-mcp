@@ -101,6 +101,7 @@ export interface TransitionTask {
   id: string;
   workspaceId: string;
   next: TaskState;
+  expectedVersion: number;
 }
 
 interface WriteOperation<T, R extends EntityRecord> {

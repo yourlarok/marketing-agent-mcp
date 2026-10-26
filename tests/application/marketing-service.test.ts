@@ -1270,35 +1270,35 @@ describe("MarketingService recommendations and tasks", () => {
 
     await expect(
       service.transitionTask({
-        input: { id: task.id, workspaceId: task.workspaceId, next: "ready" },
+        input: { id: task.id, workspaceId: task.workspaceId, next: "ready", expectedVersion: 1 },
         context: nextContext(),
       }),
     ).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
 
-    for (const next of ["ready", "in_progress", "completed"] as const) {
+    for (const [index, next] of (["ready", "in_progress", "completed"] as const).entries()) {
       await service.transitionTask({
-        input: { id: "dependency-1", workspaceId: "workspace-1", next },
+        input: { id: "dependency-1", workspaceId: "workspace-1", next, expectedVersion: index + 1 },
         context: nextContext(),
       });
     }
     await service.transitionTask({
-      input: { id: task.id, workspaceId: task.workspaceId, next: "ready" },
+      input: { id: task.id, workspaceId: task.workspaceId, next: "ready", expectedVersion: 1 },
       context: nextContext(),
     });
     const started = await service.transitionTask({
-      input: { id: task.id, workspaceId: task.workspaceId, next: "in_progress" },
+      input: { id: task.id, workspaceId: task.workspaceId, next: "in_progress", expectedVersion: 2 },
       context: nextContext(),
     });
     expect(started).toMatchObject({ state: "in_progress", version: 3 });
   });
 
-  it("updates task state and version through the command pipeline", async () => {
+  it("updates task state with the caller expected version through the command pipeline", async () => {
     await createRecommendation();
     await createTask("task-1");
     clock.set(secondNow);
 
     const ready = await service.transitionTask({
-      input: { id: "task-1", workspaceId: "workspace-1", next: "ready" },
+      input: { id: "task-1", workspaceId: "workspace-1", next: "ready", expectedVersion: 1 },
       context: nextContext(),
     });
 
@@ -1313,6 +1313,129 @@ describe("MarketingService recommendations and tasks", () => {
         repos.audit.get("audit-7", "workspace-1"),
       ),
     ).toMatchObject({ action: "task.transition", entityId: "task-1" });
+  });
+
+  it("rejects a task transition with a stale expected version", async () => {
+    await createRecommendation();
+    await createTask("task-1");
+    await service.transitionTask({
+      input: { id: "task-1", workspaceId: "workspace-1", next: "ready", expectedVersion: 1 },
+      context: nextContext(),
+    });
+
+    await expect(
+      service.transitionTask({
+        input: { id: "task-1", workspaceId: "workspace-1", next: "in_progress", expectedVersion: 1 },
+        context: nextContext(),
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    expect(
+      await store.transaction((repos) => repos.tasks.get("task-1", "workspace-1")),
+    ).toMatchObject({ state: "ready", version: 2 });
+  });
+
+  it("returns ordered lineage nodes, directed edges, and audit request IDs", async () => {
+    await createRecommendation();
+    await createTask("task-1");
+    await service.transitionTask({
+      input: { id: "task-1", workspaceId: "workspace-1", next: "ready", expectedVersion: 1 },
+      context: nextContext(),
+    });
+    await service.registerDataset({
+      input: datasetInput(),
+      context: nextContext(),
+    });
+
+    const lineage = await service.getLineage({
+      entityType: "task",
+      id: "task-1",
+      workspaceId: "workspace-1",
+    });
+
+    expect(lineage).toEqual({
+      workspaceId: "workspace-1",
+      nodes: [
+        { entityType: "source", id: "source-1", version: 1, auditRequestIds: ["task-request-2"] },
+        { entityType: "evidence", id: "evidence-1", version: 1, auditRequestIds: ["task-request-3"] },
+        { entityType: "finding", id: "finding-1", version: 1, auditRequestIds: ["task-request-4"] },
+        { entityType: "recommendation", id: "recommendation-1", version: 1, auditRequestIds: ["task-request-5"] },
+        { entityType: "task", id: "task-1", version: 2, auditRequestIds: ["task-request-6", "task-request-7"] },
+      ],
+      edges: [
+        { from: { entityType: "source", id: "source-1" }, to: { entityType: "evidence", id: "evidence-1" } },
+        { from: { entityType: "evidence", id: "evidence-1" }, to: { entityType: "finding", id: "finding-1" } },
+        { from: { entityType: "finding", id: "finding-1" }, to: { entityType: "recommendation", id: "recommendation-1" } },
+        { from: { entityType: "recommendation", id: "recommendation-1" }, to: { entityType: "task", id: "task-1" } },
+      ],
+    });
+    await expect(
+      service.getLineage({ entityType: "dataset", id: "dataset-1", workspaceId: "workspace-1" }),
+    ).resolves.toMatchObject({
+      nodes: [
+        { entityType: "source", id: "source-1" },
+        { entityType: "dataset", id: "dataset-1", auditRequestIds: ["task-request-8"] },
+      ],
+      edges: [
+        { from: { entityType: "source", id: "source-1" }, to: { entityType: "dataset", id: "dataset-1" } },
+      ],
+    });
+  });
+
+  it("returns not found for a broken lineage reference", async () => {
+    await createRecommendation();
+    await createTask("task-1");
+    const brokenStore: Store = {
+      transaction: (work) => store.transaction((repos) => work({
+        ...repos,
+        sources: { ...repos.sources, get: async () => undefined },
+      })),
+      close: () => undefined,
+    };
+    const brokenService = new MarketingService(brokenStore, clock, ids);
+
+    await expect(
+      brokenService.getLineage({ entityType: "task", id: "task-1", workspaceId: "workspace-1" }),
+    ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+  });
+
+  it("does not leak lineage across workspaces", async () => {
+    await createRecommendation();
+    await createTask("task-1");
+    await service.createWorkspace({
+      input: { id: "workspace-2", name: "Contoso" },
+      context: nextContext(),
+    });
+
+    await expect(
+      service.getLineage({ entityType: "task", id: "task-1", workspaceId: "workspace-2" }),
+    ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+  });
+
+  it("bounds lineage traversal by entity count", async () => {
+    await store.transaction(async (repos) => {
+      for (let index = 0; index < 1_001; index += 1) {
+        await repos.evidence.insert({
+          id: `bounded-evidence-${index}`,
+          workspaceId: "workspace-1",
+          version: 1,
+          createdAt: firstNow,
+          updatedAt: firstNow,
+          sourceId: "source-1",
+        });
+      }
+      await repos.findings.insert({
+        id: "bounded-finding",
+        workspaceId: "workspace-1",
+        version: 1,
+        createdAt: firstNow,
+        updatedAt: firstNow,
+        evidenceIds: Array.from({ length: 1_001 }, (_, index) => `bounded-evidence-${index}`),
+      });
+    });
+
+    await expect(
+      service.getLineage({ entityType: "finding", id: "bounded-finding", workspaceId: "workspace-1" }),
+    ).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
   });
 
   it.each([

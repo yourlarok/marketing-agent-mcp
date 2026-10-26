@@ -208,5 +208,19 @@ export const transitionTaskInputSchema = z.strictObject({
   id: idSchema,
   workspaceId: idSchema,
   next: z.enum(["draft", "ready", "in_progress", "blocked", "completed"]),
+  expectedVersion: z.number().int().positive(),
   ...commandContextInput,
+});
+
+export const lineageGetInputSchema = z.strictObject({
+  entityType: z.enum([
+    "source",
+    "dataset",
+    "evidence",
+    "finding",
+    "recommendation",
+    "task",
+  ]),
+  id: idSchema,
+  workspaceId: idSchema,
 });

@@ -6,6 +6,7 @@ import {
   createRecommendationInputSchema,
   createTaskInputSchema,
   createWorkspaceInputSchema,
+  lineageGetInputSchema,
   recordEvidenceInputSchema,
   recordFindingInputSchema,
   registerDatasetInputSchema,
@@ -168,6 +169,25 @@ export function registerTools(server: McpServer, service: MarketingService): voi
         });
         return {
           content: [{ type: "text" as const, text: canonicalJson(task) }],
+        };
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "lineage_get",
+    {
+      description: "Read bounded workspace-scoped lineage and audit provenance",
+      inputSchema: lineageGetInputSchema.shape,
+    },
+    async (arguments_) => {
+      try {
+        const query = lineageGetInputSchema.parse(arguments_);
+        const lineage = await service.getLineage(query);
+        return {
+          content: [{ type: "text" as const, text: canonicalJson(lineage) }],
         };
       } catch (error) {
         throw toMcpError(error);

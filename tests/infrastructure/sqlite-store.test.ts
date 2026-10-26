@@ -230,6 +230,36 @@ describe("transactional SQLite storage", () => {
     }
   });
 
+  it("lists lineage audit request IDs in append order within the workspace", async () => {
+    const store = open();
+    await store.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("ws-1"));
+      await repos.workspaces.insert(entity("ws-2"));
+      for (const record of [
+        { id: "audit-2", workspaceId: "ws-1", requestId: "request-2", entityId: "task-1" },
+        { id: "audit-1", workspaceId: "ws-1", requestId: "request-1", entityId: "task-1" },
+        { id: "audit-3", workspaceId: "ws-1", requestId: "request-other", entityId: "task-other" },
+        { id: "audit-4", workspaceId: "ws-2", requestId: "request-private", entityId: "task-1" },
+      ]) {
+        await repos.audit.append({
+          ...record,
+          actor: "actor-1",
+          action: "task.transition",
+          entityType: "task",
+          details: {},
+          createdAt: now,
+        });
+      }
+    });
+
+    await expect(
+      store.transaction((repos) => repos.audit.listForEntity("ws-1", "task", "task-1")),
+    ).resolves.toEqual([
+      expect.objectContaining({ requestId: "request-2" }),
+      expect.objectContaining({ requestId: "request-1" }),
+    ]);
+  });
+
   it("enforces workspace-scoped idempotency keys", async () => {
     const store = open();
     await store.transaction(async (repos) => {

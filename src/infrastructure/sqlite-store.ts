@@ -281,6 +281,18 @@ class SqliteTaskRepository extends SqliteEntityRepository {
   }
 }
 
+interface AuditRow {
+  id: string;
+  workspace_id: string;
+  request_id: string;
+  actor: string;
+  action: string;
+  entity_type: string;
+  entity_id: string;
+  details: string;
+  created_at: string;
+}
+
 class SqliteAuditRepository implements AuditRepository {
   constructor(private readonly database: DatabaseSync) {}
 
@@ -310,22 +322,24 @@ class SqliteAuditRepository implements AuditRepository {
   async get(id: string, workspaceId: string): Promise<AuditRecord | undefined> {
     const row = this.database
       .prepare("SELECT * FROM audit_records WHERE id = ? AND workspace_id = ?")
-      .get(id, workspaceId) as
-      | {
-          id: string;
-          workspace_id: string;
-          request_id: string;
-          actor: string;
-          action: string;
-          entity_type: string;
-          entity_id: string;
-          details: string;
-          created_at: string;
-        }
-      | undefined;
-    if (!row) {
-      return undefined;
-    }
+      .get(id, workspaceId) as AuditRow | undefined;
+    return row ? this.toRecord(row) : undefined;
+  }
+
+  async listForEntity(
+    workspaceId: string,
+    entityType: string,
+    entityId: string,
+  ): Promise<AuditRecord[]> {
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM audit_records WHERE workspace_id = ? AND entity_type = ? AND entity_id = ? ORDER BY rowid",
+      )
+      .all(workspaceId, entityType, entityId) as unknown as AuditRow[];
+    return rows.map((row) => this.toRecord(row));
+  }
+
+  private toRecord(row: AuditRow): AuditRecord {
     return {
       id: row.id,
       workspaceId: row.workspace_id,

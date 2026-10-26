@@ -31,10 +31,53 @@ import {
 } from "./commands.js";
 import type {
   Clock,
+  EntityRecord,
+  EntityRef,
+  EntityRepository,
   IdGenerator,
+  Lineage,
+  LineageEdge,
+  LineageEntityType,
+  LineageNode,
   Repositories,
   Store,
 } from "./ports.js";
+
+const MAX_LINEAGE_ENTITIES = 1_000;
+
+const lineageEntityTypes: Record<LineageEntityType, keyof Repositories> = {
+  source: "sources",
+  dataset: "datasets",
+  evidence: "evidence",
+  finding: "findings",
+  recommendation: "recommendations",
+  task: "tasks",
+};
+
+function lineageReferences(record: EntityRecord, entityType: LineageEntityType): EntityRef[] {
+  if (entityType === "dataset" || entityType === "evidence") {
+    return typeof record.sourceId === "string"
+      ? [{ entityType: "source", id: record.sourceId }]
+      : [];
+  }
+  const reference = {
+    finding: ["evidenceIds", "evidence"],
+    recommendation: ["findingIds", "finding"],
+    task: ["recommendationIds", "recommendation"],
+  } as const;
+  if (entityType === "source") {
+    return [];
+  }
+  const [key, referencedType] = reference[entityType];
+  const ids = record[key];
+  if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
+    throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {
+      entityType,
+      id: record.id,
+    });
+  }
+  return ids.map((id) => ({ entityType: referencedType, id }));
+}
 
 async function requireSource(
   repos: Repositories,
@@ -137,7 +180,11 @@ async function assertWorkspaceDependencyGraph(
 export class MarketingService {
   private readonly commands: CommandPipeline;
 
-  constructor(store: Store, clock: Clock, ids: IdGenerator) {
+  constructor(
+    private readonly store: Store,
+    clock: Clock,
+    ids: IdGenerator,
+  ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
 
@@ -483,6 +530,71 @@ export class MarketingService {
     });
   }
 
+  getLineage(query: EntityRef & { workspaceId: string }): Promise<Lineage> {
+    return this.store.transaction(async (repos) => {
+      if (!Object.hasOwn(lineageEntityTypes, query.entityType)) {
+        throw new DomainError("INVALID_INPUT", "entityType must be a lineage entity type");
+      }
+      const nodes: LineageNode[] = [];
+      const edges: LineageEdge[] = [];
+      const visited = new Set<string>();
+      const visiting = new Set<string>();
+      const visit = async (ref: EntityRef): Promise<void> => {
+        const key = `${ref.entityType}:${ref.id}`;
+        if (visited.has(key)) {
+          return;
+        }
+        if (visiting.has(key)) {
+          throw new DomainError("CONFLICT", "Lineage contains a reference cycle");
+        }
+        if (visited.size >= MAX_LINEAGE_ENTITIES) {
+          throw new DomainError("CONFLICT", "Lineage entity limit exceeded", false, {
+            limit: MAX_LINEAGE_ENTITIES,
+          });
+        }
+        visiting.add(key);
+        const repositoryName = lineageEntityTypes[ref.entityType];
+        const repository = repos[repositoryName] as EntityRepository;
+        const record = await repository.get(ref.id, query.workspaceId);
+        if (!record) {
+          throw new DomainError("NOT_FOUND", "Lineage entity not found in workspace", false, {
+            entityType: ref.entityType,
+            id: ref.id,
+            workspaceId: query.workspaceId,
+          });
+        }
+        for (const parent of lineageReferences(record, ref.entityType)) {
+          await visit(parent);
+          edges.push({ from: parent, to: ref });
+        }
+        const audits = await repos.audit.listForEntity(
+          query.workspaceId,
+          ref.entityType,
+          ref.id,
+        );
+        nodes.push({
+          ...ref,
+          version: record.version,
+          auditRequestIds: audits.map((audit) => audit.requestId),
+        });
+        visiting.delete(key);
+        visited.add(key);
+      };
+
+      await visit({ entityType: query.entityType, id: query.id });
+      const order = new Map(
+        nodes.map((node, index) => [`${node.entityType}:${node.id}`, index]),
+      );
+      const position = (ref: EntityRef): number =>
+        order.get(`${ref.entityType}:${ref.id}`)!;
+      edges.sort((left, right) =>
+        (position(left.from) - position(right.from)) ||
+        (position(left.to) - position(right.to)),
+      );
+      return { workspaceId: query.workspaceId, nodes, edges };
+    });
+  }
+
   transitionTask(command: Command<TransitionTask>): Promise<Task> {
     return this.commands.execute({
       workspaceId: command.input.workspaceId,
@@ -493,6 +605,9 @@ export class MarketingService {
       write: async (repos, input, timestamp) => {
         if (!(TASK_STATES as readonly string[]).includes(input.next)) {
           throw new DomainError("INVALID_INPUT", "next must be a supported task state");
+        }
+        if (!Number.isInteger(input.expectedVersion) || input.expectedVersion < 1) {
+          throw new DomainError("INVALID_INPUT", "expectedVersion must be a positive integer");
         }
         const task = await requireTask(repos, input.workspaceId, input.id);
         assertTaskTransition(task.state, input.next);
@@ -515,7 +630,7 @@ export class MarketingService {
         }
         return repos.tasks.update(
           { ...task, state: input.next, updatedAt: timestamp },
-          task.version,
+          input.expectedVersion,
         ) as Promise<Task>;
       },
     });

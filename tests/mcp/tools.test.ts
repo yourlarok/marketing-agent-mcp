@@ -99,6 +99,7 @@ describe("MCP server", () => {
         "dataset_register",
         "evidence_record",
         "finding_record",
+        "lineage_get",
         "recommendation_create",
         "source_register",
         "task_create",
@@ -265,6 +266,7 @@ describe("MCP server", () => {
           id: "task-1",
           workspaceId: "workspace-1",
           next: "ready",
+          expectedVersion: 1,
           actor: "agent-1",
           requestId: "request-8",
           idempotencyKey: "command-8",
@@ -273,6 +275,25 @@ describe("MCP server", () => {
       expect(
         JSON.parse((transitioned.content[0] as { text: string }).text),
       ).toMatchObject({ id: "task-1", state: "ready", version: 2 });
+
+      const lineage = await client.callTool({
+        name: "lineage_get",
+        arguments: {
+          entityType: "task",
+          id: "task-1",
+          workspaceId: "workspace-1",
+        },
+      });
+      expect(JSON.parse((lineage.content[0] as { text: string }).text)).toMatchObject({
+        workspaceId: "workspace-1",
+        nodes: [
+          { entityType: "source", id: "source-1", auditRequestIds: ["request-2"] },
+          { entityType: "evidence", id: "evidence-1", auditRequestIds: ["request-4"] },
+          { entityType: "finding", id: "finding-1", auditRequestIds: ["request-5"] },
+          { entityType: "recommendation", id: "recommendation-1", auditRequestIds: ["request-6"] },
+          { entityType: "task", id: "task-1", auditRequestIds: ["request-7", "request-8"] },
+        ],
+      });
 
       const raw = new DatabaseSync(databasePath);
       try {
