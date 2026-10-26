@@ -3,8 +3,14 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { MarketingService } from "../../src/application/marketing-service.js";
 import { loadConfig } from "../../src/config.js";
 import { DomainError } from "../../src/domain/errors.js";
+import { openStore } from "../../src/infrastructure/sqlite-store.js";
+import {
+  SystemClock,
+  SystemIdGenerator,
+} from "../../src/infrastructure/system.js";
 import { toMcpError } from "../../src/mcp/error-mapper.js";
 import {
   MAX_SERIALIZED_INPUT_BYTES,
@@ -63,6 +69,77 @@ describe("MCP server", () => {
       expect(await client.listTools()).toEqual({ tools: [] });
     } finally {
       await Promise.all([client.close(), server.close()]);
+    }
+  });
+
+  it("creates and replays workspace and source commands through registered tools", async () => {
+    const store = openStore(":memory:");
+    const service = new MarketingService(
+      store,
+      new SystemClock(),
+      new SystemIdGenerator(),
+    );
+    const server = createMcpServer(service);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([
+        client.connect(clientTransport),
+        server.connect(serverTransport),
+      ]);
+      expect(
+        (await client.listTools()).tools.map((tool) => tool.name).sort(),
+      ).toEqual(["source_register", "workspace_create"]);
+
+      const workspaceArguments = {
+        id: "workspace-1",
+        name: "Northwind",
+        actor: "agent-1",
+        requestId: "request-1",
+        idempotencyKey: "command-1",
+      };
+      const first = await client.callTool({
+        name: "workspace_create",
+        arguments: workspaceArguments,
+      });
+      const replay = await client.callTool({
+        name: "workspace_create",
+        arguments: workspaceArguments,
+      });
+      expect(replay).toEqual(first);
+      expect(first.content[0]).toMatchObject({ type: "text" });
+      expect(
+        JSON.parse((first.content[0] as { text: string }).text),
+      ).toMatchObject({
+        id: "workspace-1",
+        workspaceId: "workspace-1",
+        name: "Northwind",
+      });
+
+      const source = await client.callTool({
+        name: "source_register",
+        arguments: {
+          id: "source-1",
+          workspaceId: "workspace-1",
+          name: "Research",
+          type: "manual",
+          ownership: "owned",
+          actor: "agent-1",
+          requestId: "request-2",
+          idempotencyKey: "command-2",
+        },
+      });
+      expect(JSON.parse((source.content[0] as { text: string }).text)).toMatchObject({
+        id: "source-1",
+        workspaceId: "workspace-1",
+        type: "manual",
+        ownership: "owned",
+      });
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+      store.close();
     }
   });
 });

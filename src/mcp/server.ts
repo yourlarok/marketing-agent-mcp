@@ -1,4 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { MarketingService } from "../application/marketing-service.js";
+import { registerTools } from "./register-tools.js";
 
 export { toMcpError } from "./error-mapper.js";
 export {
@@ -10,12 +12,16 @@ export {
   utcTimestampSchema,
 } from "./schemas.js";
 
-export function createMcpServer(): McpServer {
-  return new McpServer(
+export function createMcpServer(service?: MarketingService): McpServer {
+  const server = new McpServer(
     {
       name: "marketing-agent-mcp",
       version: "1.0.0",
     },
     { capabilities: { tools: {} } },
   );
+  if (service) {
+    registerTools(server, service);
+  }
+  return server;
 }

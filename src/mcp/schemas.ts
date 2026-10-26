@@ -127,3 +127,26 @@ export const resourceIdInputSchema = z.strictObject({
 export const timestampInputSchema = z.strictObject({
   timestamp: utcTimestampSchema,
 });
+
+const commandContextInput = {
+  actor: idSchema,
+  requestId: idSchema,
+  idempotencyKey: idSchema,
+};
+
+export const createWorkspaceInputSchema = z.strictObject({
+  id: idSchema,
+  name: z.string().trim().min(1).max(1_024),
+  metadata: jsonValueSchema.optional(),
+  ...commandContextInput,
+});
+
+export const registerSourceInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  name: z.string().trim().min(1).max(1_024),
+  type: z.enum(["file", "link", "api", "manual", "database"]),
+  ownership: z.enum(["owned", "authorized", "external_public"]),
+  metadata: jsonValueSchema.optional(),
+  ...commandContextInput,
+});
