@@ -1025,6 +1025,17 @@ export class DataResearchService {
       };
       await repos.evidence.insert(evidence);
       evidenceIds.push(evidence.id);
+      const competitor: Competitor = {
+        id: `competitor-${evidence.id}`,
+        workspaceId: input.workspaceId,
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        name: page.title || page.finalUrl,
+        status: "excluded",
+        evidenceIds: [evidence.id],
+      };
+      await repos.competitors.insert(competitor);
     }
     const batch: IngestionBatch = {
       id: input.id,
