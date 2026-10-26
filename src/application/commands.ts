@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { DomainError } from "../domain/errors.js";
 import type {
   EvidenceClassification,
+  FindingKind,
   SourceOwnership,
   SourceType,
 } from "../domain/model.js";
@@ -63,6 +64,16 @@ export interface RecordEvidence {
   summary: string;
   contentHash: string;
   classification: EvidenceClassification;
+}
+
+export interface RecordFinding {
+  id: string;
+  workspaceId: string;
+  kind: FindingKind;
+  statement: string;
+  evidenceIds: string[];
+  limitations?: string;
+  unknownReason?: string;
 }
 
 interface WriteOperation<T, R extends EntityRecord> {

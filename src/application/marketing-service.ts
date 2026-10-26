@@ -1,8 +1,10 @@
 import { DomainError } from "../domain/errors.js";
 import {
   EVIDENCE_CLASSIFICATIONS,
+  FINDING_KINDS,
   type Dataset,
   type Evidence,
+  type Finding,
   type Source,
   type Workspace,
 } from "../domain/model.js";
@@ -13,6 +15,7 @@ import {
   type CommandPipeline,
   type CreateWorkspace,
   type RecordEvidence,
+  type RecordFinding,
   type RegisterDataset,
   type RegisterSource,
 } from "./commands.js";
@@ -199,6 +202,78 @@ export class MarketingService {
           classification: input.classification,
         };
         return repos.evidence.insert(evidence) as Promise<Evidence>;
+      },
+    });
+  }
+
+  recordFinding(command: Command<RecordFinding>): Promise<Finding> {
+    return this.commands.execute({
+      workspaceId: command.input.workspaceId,
+      action: "finding.record",
+      entityType: "finding",
+      input: command.input,
+      context: command.context,
+      write: async (repos, input, timestamp) => {
+        if (!(FINDING_KINDS as readonly string[]).includes(input.kind)) {
+          throw new DomainError("INVALID_INPUT", "kind must be a supported finding kind");
+        }
+        if (
+          (input.kind === "fact" || input.kind === "inference") &&
+          input.evidenceIds.length === 0
+        ) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "Facts and inferences require supporting evidence",
+          );
+        }
+        if (
+          input.kind === "inference" &&
+          (typeof input.limitations !== "string" ||
+            input.limitations.trim().length === 0)
+        ) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "Inferences require explicit limitations",
+          );
+        }
+        if (
+          input.kind === "unknown" &&
+          (typeof input.unknownReason !== "string" ||
+            input.unknownReason.trim().length === 0)
+        ) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "Unknown findings require an explicit reason",
+          );
+        }
+        for (const evidenceId of input.evidenceIds) {
+          const evidence = await repos.evidence.get(evidenceId, input.workspaceId);
+          if (!evidence) {
+            throw new DomainError(
+              "NOT_FOUND",
+              "Evidence not found in workspace",
+              false,
+              { evidenceId, workspaceId: input.workspaceId },
+            );
+          }
+        }
+        const finding: Finding = {
+          id: input.id,
+          workspaceId: input.workspaceId,
+          version: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          kind: input.kind,
+          statement: input.statement,
+          evidenceIds: input.evidenceIds,
+          ...(input.limitations === undefined
+            ? {}
+            : { limitations: input.limitations }),
+          ...(input.unknownReason === undefined
+            ? {}
+            : { unknownReason: input.unknownReason }),
+        };
+        return repos.findings.insert(finding) as Promise<Finding>;
       },
     });
   }

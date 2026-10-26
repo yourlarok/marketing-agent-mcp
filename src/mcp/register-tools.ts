@@ -5,6 +5,7 @@ import { toMcpError } from "./error-mapper.js";
 import {
   createWorkspaceInputSchema,
   recordEvidenceInputSchema,
+  recordFindingInputSchema,
   registerDatasetInputSchema,
   registerSourceInputSchema,
 } from "./schemas.js";
@@ -95,6 +96,29 @@ export function registerTools(server: McpServer, service: MarketingService): voi
         });
         return {
           content: [{ type: "text" as const, text: canonicalJson(evidence) }],
+        };
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "finding_record",
+    {
+      description: "Record a fact, inference, or unknown with explicit truth boundaries",
+      inputSchema: recordFindingInputSchema.shape,
+    },
+    async (arguments_) => {
+      try {
+        const { actor, requestId, idempotencyKey, ...input } =
+          recordFindingInputSchema.parse(arguments_);
+        const finding = await service.recordFinding({
+          input,
+          context: { actor, requestId, idempotencyKey },
+        });
+        return {
+          content: [{ type: "text" as const, text: canonicalJson(finding) }],
         };
       } catch (error) {
         throw toMcpError(error);

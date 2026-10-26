@@ -43,3 +43,14 @@ export interface Evidence extends EntityRecord {
   contentHash: string;
   classification: EvidenceClassification;
 }
+
+export const FINDING_KINDS = ["fact", "inference", "unknown"] as const;
+export type FindingKind = (typeof FINDING_KINDS)[number];
+
+export interface Finding extends EntityRecord {
+  kind: FindingKind;
+  statement: string;
+  evidenceIds: string[];
+  limitations?: string;
+  unknownReason?: string;
+}

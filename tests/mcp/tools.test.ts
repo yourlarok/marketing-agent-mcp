@@ -97,6 +97,7 @@ describe("MCP server", () => {
       ).toEqual([
         "dataset_register",
         "evidence_record",
+        "finding_record",
         "source_register",
         "workspace_create",
       ]);
@@ -196,6 +197,25 @@ describe("MCP server", () => {
         classification: "owned_operating",
       });
 
+      const finding = await client.callTool({
+        name: "finding_record",
+        arguments: {
+          id: "finding-1",
+          workspaceId: "workspace-1",
+          kind: "fact",
+          statement: "The research notes contain an operating observation",
+          evidenceIds: ["evidence-1"],
+          actor: "agent-1",
+          requestId: "request-5",
+          idempotencyKey: "command-5",
+        },
+      });
+      expect(JSON.parse((finding.content[0] as { text: string }).text)).toMatchObject({
+        id: "finding-1",
+        kind: "fact",
+        evidenceIds: ["evidence-1"],
+      });
+
       const raw = new DatabaseSync(databasePath);
       try {
         expect(
@@ -206,6 +226,7 @@ describe("MCP server", () => {
                 (SELECT COUNT(*) FROM sources) AS sources,
                 (SELECT COUNT(*) FROM datasets) AS datasets,
                 (SELECT COUNT(*) FROM evidence) AS evidence,
+                (SELECT COUNT(*) FROM findings) AS findings,
                 (SELECT COUNT(*) FROM audit_records) AS audits,
                 (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
             )
@@ -215,8 +236,9 @@ describe("MCP server", () => {
           sources: 1,
           datasets: 1,
           evidence: 1,
-          audits: 4,
-          idempotency: 4,
+          findings: 1,
+          audits: 5,
+          idempotency: 5,
         });
       } finally {
         raw.close();

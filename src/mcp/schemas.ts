@@ -155,3 +155,14 @@ export const recordEvidenceInputSchema = z.strictObject({
   ]),
   ...commandContextInput,
 });
+
+export const recordFindingInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  kind: z.enum(["fact", "inference", "unknown"]),
+  statement: z.string().trim().min(1).max(8_192),
+  evidenceIds: z.array(idSchema).max(MAX_COLLECTION_ENTRIES),
+  limitations: z.string().trim().min(1).max(8_192).optional(),
+  unknownReason: z.string().trim().min(1).max(8_192).optional(),
+  ...commandContextInput,
+});
