@@ -1,6 +1,7 @@
 import type { EntityRecord } from "../application/ports.js";
+import type { DataRequestPlanDetails } from "./data-preparation.js";
 
-export interface DataRequestPlan extends EntityRecord {
+export interface DataRequestPlan extends EntityRecord, Partial<DataRequestPlanDetails> {
   objective?: string;
 }
 
