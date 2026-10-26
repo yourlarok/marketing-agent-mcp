@@ -1381,6 +1381,44 @@ describe("MarketingService recommendations and tasks", () => {
     });
   });
 
+  it.each([
+    ["dataset", "missing", undefined],
+    ["dataset", "null", null],
+    ["dataset", "numeric", 42],
+    ["evidence", "missing", undefined],
+    ["evidence", "null", null],
+    ["evidence", "numeric", 42],
+  ] as const)(
+    "returns not found for %s lineage with a %s scalar source reference",
+    async (entityType, _label, sourceId) => {
+      const brokenRecord = {
+        id: `${entityType}-broken`,
+        workspaceId: "workspace-1",
+        version: 1,
+        createdAt: firstNow,
+        updatedAt: firstNow,
+        sourceId,
+      };
+      const brokenStore: Store = {
+        transaction: (work) => store.transaction((repos) => work({
+          ...repos,
+          datasets: { ...repos.datasets, get: async () => brokenRecord },
+          evidence: { ...repos.evidence, get: async () => brokenRecord },
+        })),
+        close: () => undefined,
+      };
+      const brokenService = new MarketingService(brokenStore, clock, ids);
+
+      await expect(
+        brokenService.getLineage({
+          entityType,
+          id: brokenRecord.id,
+          workspaceId: "workspace-1",
+        }),
+      ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    },
+  );
+
   it("returns not found for a broken lineage reference", async () => {
     await createRecommendation();
     await createTask("task-1");

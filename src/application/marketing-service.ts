@@ -56,9 +56,13 @@ const lineageEntityTypes: Record<LineageEntityType, keyof Repositories> = {
 
 function lineageReferences(record: EntityRecord, entityType: LineageEntityType): EntityRef[] {
   if (entityType === "dataset" || entityType === "evidence") {
-    return typeof record.sourceId === "string"
-      ? [{ entityType: "source", id: record.sourceId }]
-      : [];
+    if (typeof record.sourceId !== "string") {
+      throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {
+        entityType,
+        id: record.id,
+      });
+    }
+    return [{ entityType: "source", id: record.sourceId }];
   }
   const reference = {
     finding: ["evidenceIds", "evidence"],
