@@ -17,3 +17,29 @@ export interface Source extends EntityRecord {
   ownership: SourceOwnership;
   metadata?: JsonValue;
 }
+
+export interface Dataset extends EntityRecord {
+  sourceId: string;
+  name: string;
+  coverageStart: string;
+  coverageEnd: string;
+  fieldDefinitions: JsonValue;
+  metricDefinitions: JsonValue;
+  limitations: JsonValue;
+}
+
+export const EVIDENCE_CLASSIFICATIONS = [
+  "owned_operating",
+  "owned_conversion",
+  "external_observation",
+] as const;
+export type EvidenceClassification = (typeof EVIDENCE_CLASSIFICATIONS)[number];
+
+export interface Evidence extends EntityRecord {
+  sourceId: string;
+  sourceLocator: string;
+  observedAt: string;
+  summary: string;
+  contentHash: string;
+  classification: EvidenceClassification;
+}

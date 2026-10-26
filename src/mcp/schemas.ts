@@ -126,3 +126,32 @@ export const registerSourceInputSchema = z.strictObject({
   metadata: jsonValueSchema.optional(),
   ...commandContextInput,
 });
+
+export const registerDatasetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  sourceId: idSchema,
+  name: z.string().trim().min(1).max(1_024),
+  coverageStart: utcTimestampSchema,
+  coverageEnd: utcTimestampSchema,
+  fieldDefinitions: jsonValueSchema,
+  metricDefinitions: jsonValueSchema,
+  limitations: jsonValueSchema,
+  ...commandContextInput,
+});
+
+export const recordEvidenceInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  sourceId: idSchema,
+  sourceLocator: z.string().trim().min(1).max(4_096),
+  observedAt: utcTimestampSchema,
+  summary: z.string().trim().min(1).max(8_192),
+  contentHash: z.string().regex(/^[0-9a-f]{64}$/i),
+  classification: z.enum([
+    "owned_operating",
+    "owned_conversion",
+    "external_observation",
+  ]),
+  ...commandContextInput,
+});

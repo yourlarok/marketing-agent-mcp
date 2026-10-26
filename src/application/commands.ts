@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { DomainError } from "../domain/errors.js";
-import type { SourceOwnership, SourceType } from "../domain/model.js";
+import type {
+  EvidenceClassification,
+  SourceOwnership,
+  SourceType,
+} from "../domain/model.js";
 import { isSecretLikeKey } from "../domain/secrets.js";
 import { canonicalJson } from "../infrastructure/sqlite.js";
 import type {
@@ -36,6 +40,29 @@ export interface RegisterSource {
   type: SourceType;
   ownership: SourceOwnership;
   metadata?: JsonValue;
+}
+
+export interface RegisterDataset {
+  id: string;
+  workspaceId: string;
+  sourceId: string;
+  name: string;
+  coverageStart: string;
+  coverageEnd: string;
+  fieldDefinitions: JsonValue;
+  metricDefinitions: JsonValue;
+  limitations: JsonValue;
+}
+
+export interface RecordEvidence {
+  id: string;
+  workspaceId: string;
+  sourceId: string;
+  sourceLocator: string;
+  observedAt: string;
+  summary: string;
+  contentHash: string;
+  classification: EvidenceClassification;
 }
 
 interface WriteOperation<T, R extends EntityRecord> {

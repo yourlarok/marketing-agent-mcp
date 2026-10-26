@@ -94,7 +94,12 @@ describe("MCP server", () => {
       ]);
       expect(
         (await client.listTools()).tools.map((tool) => tool.name).sort(),
-      ).toEqual(["source_register", "workspace_create"]);
+      ).toEqual([
+        "dataset_register",
+        "evidence_record",
+        "source_register",
+        "workspace_create",
+      ]);
 
       const first = await client.callTool({
         name: "workspace_create",
@@ -146,6 +151,51 @@ describe("MCP server", () => {
         ownership: "owned",
       });
 
+      const dataset = await client.callTool({
+        name: "dataset_register",
+        arguments: {
+          id: "dataset-1",
+          workspaceId: "workspace-1",
+          sourceId: "source-1",
+          name: "Research observations",
+          coverageStart: "2026-01-01T00:00:00.000Z",
+          coverageEnd: "2026-01-31T23:59:59.999Z",
+          fieldDefinitions: [{ name: "observation", type: "string" }],
+          metricDefinitions: [{ name: "mentions", aggregation: "count" }],
+          limitations: ["Manual sample"],
+          actor: "agent-1",
+          requestId: "request-3",
+          idempotencyKey: "command-3",
+        },
+      });
+      expect(JSON.parse((dataset.content[0] as { text: string }).text)).toMatchObject({
+        id: "dataset-1",
+        sourceId: "source-1",
+        limitations: ["Manual sample"],
+      });
+
+      const evidence = await client.callTool({
+        name: "evidence_record",
+        arguments: {
+          id: "evidence-1",
+          workspaceId: "workspace-1",
+          sourceId: "source-1",
+          sourceLocator: "research/note-1",
+          observedAt: "2026-02-01T00:00:00.000Z",
+          summary: "A recorded operating observation",
+          contentHash: "a".repeat(64),
+          classification: "owned_operating",
+          actor: "agent-1",
+          requestId: "request-4",
+          idempotencyKey: "command-4",
+        },
+      });
+      expect(JSON.parse((evidence.content[0] as { text: string }).text)).toMatchObject({
+        id: "evidence-1",
+        sourceId: "source-1",
+        classification: "owned_operating",
+      });
+
       const raw = new DatabaseSync(databasePath);
       try {
         expect(
@@ -154,11 +204,20 @@ describe("MCP server", () => {
               `SELECT
                 (SELECT COUNT(*) FROM workspaces) AS workspaces,
                 (SELECT COUNT(*) FROM sources) AS sources,
+                (SELECT COUNT(*) FROM datasets) AS datasets,
+                (SELECT COUNT(*) FROM evidence) AS evidence,
                 (SELECT COUNT(*) FROM audit_records) AS audits,
                 (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
             )
             .get(),
-        ).toEqual({ workspaces: 1, sources: 1, audits: 2, idempotency: 2 });
+        ).toEqual({
+          workspaces: 1,
+          sources: 1,
+          datasets: 1,
+          evidence: 1,
+          audits: 4,
+          idempotency: 4,
+        });
       } finally {
         raw.close();
       }
