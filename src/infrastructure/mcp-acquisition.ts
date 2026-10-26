@@ -5,7 +5,15 @@ import { z } from "zod";
 import { DomainError } from "../domain/errors.js";
 import type { CapabilityState } from "../domain/model.js";
 import {
+  acquisitionPayloadBytes,
+  assertAcquisitionPayloadBudget,
+  assertAcquisitionUrlInScope,
+  canonicalAcquisitionUrl,
+  raceWithAcquisitionAbort,
+} from "./acquisition-policy.js";
+import {
   validateAcquireRequest,
+  remainingAcquisitionTimeout,
   type AcquiredPage,
   type AcquireRequest,
   type AcquisitionProvider,
@@ -49,6 +57,10 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
 
   async acquire(request: AcquireRequest): Promise<AcquiredPage> {
     validateAcquireRequest(request);
+    return raceWithAcquisitionAbort(this.perform(request), request.signal);
+  }
+
+  private async perform(request: AcquireRequest): Promise<AcquiredPage> {
     const client = new Client({ name: "marketing-content-acquisition", version: "1.0.0" });
     const sourceEnvironment = this.options.env ?? process.env;
     const environment = getDefaultEnvironment();
@@ -66,11 +78,18 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
       stderr: "ignore",
     });
     try {
-      await client.connect(transport);
+      await raceWithAcquisitionAbort(client.connect(transport), request.signal);
+      const timeout = Math.min(this.options.timeoutMs ?? 15_000, remainingAcquisitionTimeout(request));
       const result = await client.callTool({
         name: "acquire_content",
-        arguments: { url: request.url, fields: request.fields ?? {} },
-      }, undefined, { timeout: this.options.timeoutMs ?? 15_000 });
+        arguments: {
+          url: request.url,
+          fields: request.fields ?? {},
+          ...(request.scope ? { scope: request.scope } : {}),
+          ...(request.maxBytes !== undefined ? { maxBytes: request.maxBytes } : {}),
+          timeoutMs: timeout,
+        },
+      }, undefined, { timeout, ...(request.signal ? { signal: request.signal } : {}) });
       if (result.isError) {
         const gap = accessGapSchema.safeParse(result.structuredContent);
         if (gap.success) {
@@ -94,7 +113,8 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
         throw error;
       }
       this.state = "unavailable";
-      if (error instanceof DomainError && error.details?.reason === "mcp_invalid_response") {
+      if (error instanceof DomainError &&
+        ["mcp_invalid_response", "scope_denied", "max_bytes", "max_duration"].includes(String(error.details?.reason))) {
         throw error;
       }
       throw new DomainError(
@@ -110,22 +130,28 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
 }
 
 function parseSuccess(content: unknown, request: AcquireRequest): Omit<AcquiredPage, "provider" | "toolVersion"> {
+  const candidatePayload = { text: "", fields: {} as Record<string, string>, screenshot: Buffer.alloc(0) };
   try {
     const parsed = acquiredPageSchema.parse(content);
-    const requestUrl = new URL(request.url);
-    const responseUrl = new URL(parsed.url);
-    const finalUrl = new URL(parsed.finalUrl);
-    if (responseUrl.href !== requestUrl.href || finalUrl.origin !== requestUrl.origin ||
-      (finalUrl.protocol !== "http:" && finalUrl.protocol !== "https:")) {
+    candidatePayload.text = parsed.text;
+    candidatePayload.fields = parsed.fields;
+    const requestUrl = new URL(canonicalAcquisitionUrl(request.url));
+    const responseUrl = new URL(canonicalAcquisitionUrl(parsed.url));
+    const finalUrl = new URL(canonicalAcquisitionUrl(parsed.finalUrl));
+    if (responseUrl.href !== requestUrl.href || finalUrl.origin !== requestUrl.origin) {
       throw new Error("Professional MCP response URL does not match the request origin");
     }
+    assertAcquisitionUrlInScope(finalUrl.href, request.scope);
     const requestedFields = Object.keys(request.fields ?? {}).sort();
     const returnedFields = Object.keys(parsed.fields).sort();
     if (requestedFields.length !== returnedFields.length ||
       requestedFields.some((name, index) => name !== returnedFields[index])) {
       throw new Error("Professional MCP response fields do not match the request");
     }
+    assertAcquisitionPayloadBudget({ text: parsed.text, fields: parsed.fields, screenshot: Buffer.alloc(0) }, request.maxBytes);
     const screenshot = Buffer.from(parsed.screenshotBase64, "base64");
+    candidatePayload.screenshot = screenshot;
+    assertAcquisitionPayloadBudget({ text: parsed.text, fields: parsed.fields, screenshot }, request.maxBytes);
     if (screenshot.length < 24 || screenshot.length > 10 * 1024 * 1024) {
       throw new Error("Professional MCP screenshot size is invalid");
     }
@@ -149,11 +175,19 @@ function parseSuccess(content: unknown, request: AcquireRequest): Omit<AcquiredP
       screenshot,
     };
   } catch (error) {
+    const payloadBytes = acquisitionPayloadBytes(candidatePayload);
+    const details = {
+      ...(error instanceof DomainError ? error.details : {}),
+      ...(payloadBytes > 0 ? { payloadBytes } : {}),
+    };
+    if (error instanceof DomainError && ["scope_denied", "max_bytes"].includes(String(error.details?.reason))) {
+      throw new DomainError(error.code, error.message, error.retryable, details);
+    }
     throw new DomainError(
       "CAPABILITY_UNAVAILABLE",
       `Professional MCP returned an invalid acquisition response: ${error instanceof Error ? error.message : "unknown error"}`,
       false,
-      { reason: "mcp_invalid_response" },
+      { ...details, reason: "mcp_invalid_response" },
     );
   }
 }

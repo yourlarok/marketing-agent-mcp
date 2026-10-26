@@ -10,6 +10,7 @@ import { DataResearchService } from "../../src/application/data-research-service
 import type { Store } from "../../src/application/ports.js";
 import { loadConfig } from "../../src/config.js";
 import type { Evidence } from "../../src/domain/model.js";
+import { DomainError } from "../../src/domain/errors.js";
 import { AcquisitionRouter } from "../../src/infrastructure/acquisition-router.js";
 import { ArtifactStore } from "../../src/infrastructure/artifact-store.js";
 import { McpAcquisitionProvider } from "../../src/infrastructure/mcp-acquisition.js";
@@ -277,6 +278,12 @@ describe("content acquisition", () => {
     await expect(playwright().acquire({ url: `${baseUrl}/${gate}` })).rejects.toMatchObject({
       code: "CAPABILITY_UNAVAILABLE",
       details: { reason: "access_gate" },
+    });
+  }, 20_000);
+
+  it("reports candidate payload bytes when a page fails after reading text", async () => {
+    await expect(playwright().acquire({ url: `${baseUrl}/login`, maxBytes: 100_000 })).rejects.toMatchObject({
+      details: { reason: "access_gate", payloadBytes: expect.any(Number) },
     });
   }, 20_000);
 
@@ -564,6 +571,7 @@ describe("content acquisition", () => {
         context: { actor: "agent-1", requestId: "request-bounded-run", idempotencyKey: "command-bounded-run" },
       });
 
+      expect(result.gaps).toEqual([]);
       expect(result).toMatchObject({ state: "partial", stopReason: "max_pages" });
       expect(result.evidenceIds).toHaveLength(2);
       expect(hits).toEqual(["/research/start", "/research/child"]);
@@ -572,6 +580,135 @@ describe("content acquisition", () => {
       researchServer.closeAllConnections();
       await new Promise<void>((resolveClose) => researchServer.close(() => resolveClose()));
       await removeTempDir(artifactRoot);
+    }
+  }, 20_000);
+
+  it("blocks out-of-scope redirects, subresources, and encoded paths before either real host is requested", async () => {
+    const primaryHits: string[] = [];
+    const otherHits: string[] = [];
+    const otherServer = createServer((request, response) => {
+      otherHits.push(request.url ?? "");
+      response.writeHead(200, { "content-type": "text/javascript" });
+      response.end("globalThis.outOfScopeExecuted = true");
+    });
+    const otherBase = await serve(otherServer);
+    const primaryServer = createServer((request, response) => {
+      const path = new URL(request.url ?? "/", "http://fixture.local").pathname;
+      primaryHits.push(request.url ?? "");
+      if (path === "/research/redirect-host") {
+        response.writeHead(302, { location: `${otherBase.replace("127.0.0.1", "localhost")}/research/redirected` });
+        response.end();
+        return;
+      }
+      if (path === "/research/redirect-path") {
+        response.writeHead(302, { location: "/outside-redirect" });
+        response.end();
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end(`<html><body>Scoped start<script src="${otherBase.replace("127.0.0.1", "localhost")}/research/off-host.js"></script><img src="/outside-subresource"><img src="/research/%2foutside-encoded"><img src="/research/%2e%2e/outside-dot"></body></html>`);
+    });
+    const primaryBase = await serve(primaryServer);
+    const provider = new PlaywrightAcquisitionProvider({ allowlist: ["127.0.0.1", "localhost"] });
+    const scope = { hosts: ["127.0.0.1"], pathPrefixes: ["/research"] };
+    try {
+      const page = await provider.acquire({ url: `${primaryBase}/research/start`, scope } as never);
+      expect(page.text).toContain("Scoped start");
+      expect(otherHits).toEqual([]);
+      expect(primaryHits).toEqual(["/research/start"]);
+
+      await expect(provider.acquire({ url: `${primaryBase}/research/redirect-host`, scope } as never))
+        .rejects.toMatchObject({ details: { reason: "scope_denied" } });
+      await expect(provider.acquire({ url: `${primaryBase}/research/redirect-path`, scope } as never))
+        .rejects.toMatchObject({ details: { reason: "scope_denied" } });
+      await expect(provider.acquire({ url: `${primaryBase}/research/%2foutside`, scope } as never))
+        .rejects.toMatchObject({ code: "INVALID_INPUT" });
+      expect(otherHits).toEqual([]);
+      expect(primaryHits).toEqual(["/research/start", "/research/redirect-host", "/research/redirect-path"]);
+    } finally {
+      primaryServer.closeAllConnections();
+      otherServer.closeAllConnections();
+      await Promise.all([
+        new Promise<void>((resolveClose) => primaryServer.close(() => resolveClose())),
+        new Promise<void>((resolveClose) => otherServer.close(() => resolveClose())),
+      ]);
+    }
+  }, 20_000);
+
+  it("rejects an over-budget text candidate before fields or screenshot processing", async () => {
+    let screenshotCalls = 0;
+    const provider = new PlaywrightAcquisitionProvider({
+      allowlist: ["127.0.0.1"],
+      captureScreenshot: async () => {
+        screenshotCalls += 1;
+        return new Uint8Array();
+      },
+    });
+
+    await expect(provider.acquire({
+      url: `${baseUrl}/dynamic`, fields: { headline: "#headline" }, maxBytes: 1,
+    } as never)).rejects.toMatchObject({ details: { reason: "max_bytes" } });
+    expect(screenshotCalls).toBe(0);
+  }, 20_000);
+
+  it("applies one hard deadline across MCP and Playwright fallback", async () => {
+    const delayedPage = {
+      url: `${baseUrl}/dynamic`, finalUrl: `${baseUrl}/dynamic`, title: "late", text: "late",
+      fields: {}, screenshot: Buffer.from("late"), provider: "playwright" as const, toolVersion: "fake",
+    };
+    const mcp = {
+      acquire: async () => {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+        throw new DomainError("CAPABILITY_UNAVAILABLE", "MCP unavailable");
+      },
+    };
+    const fallback = {
+      acquire: async (request: { signal?: AbortSignal }) => {
+        await new Promise<void>((resolveWait, rejectWait) => {
+          const timer = setTimeout(resolveWait, 50);
+          request.signal?.addEventListener("abort", () => {
+            clearTimeout(timer);
+            rejectWait(new DOMException("Aborted", "AbortError"));
+          }, { once: true });
+        });
+        return delayedPage;
+      },
+    };
+    const router = new AcquisitionRouter({ mcp, playwright: fallback });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30);
+    const started = Date.now();
+    try {
+      await expect(router.acquire({
+        url: `${baseUrl}/dynamic`, timeoutMs: 30, deadlineMs: started + 30, signal: controller.signal,
+      } as never)).rejects.toMatchObject({ details: { reason: "max_duration" } });
+      expect(Date.now() - started).toBeLessThan(100);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  it("aborts an active Playwright navigation at the remaining session deadline", async () => {
+    const slowServer = createServer((_request, response) => {
+      setTimeout(() => {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end("<html><body>Too late</body></html>");
+      }, 200);
+    });
+    const slowBase = await serve(slowServer);
+    const provider = new PlaywrightAcquisitionProvider({ allowlist: ["127.0.0.1"] });
+    const controller = new AbortController();
+    const started = Date.now();
+    const timer = setTimeout(() => controller.abort(), 30);
+    try {
+      await expect(provider.acquire({
+        url: slowBase, timeoutMs: 30, deadlineMs: started + 30, signal: controller.signal,
+      } as never)).rejects.toMatchObject({ details: { reason: "max_duration" } });
+      expect(Date.now() - started).toBeLessThan(150);
+    } finally {
+      clearTimeout(timer);
+      slowServer.closeAllConnections();
+      await new Promise<void>((resolveClose) => slowServer.close(() => resolveClose()));
     }
   }, 20_000);
 });

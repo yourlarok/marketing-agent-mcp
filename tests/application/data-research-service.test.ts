@@ -78,6 +78,11 @@ function researchSession(id = "session-1"): ResearchSession {
     stopReason: null,
     gaps: [],
     evidenceIds: ["evidence-2", "evidence-1"],
+    frontier: [],
+    visitedUrls: [],
+    attemptCount: 0,
+    candidateBytes: 0,
+    elapsedMs: 0,
   };
 }
 
@@ -1459,7 +1464,7 @@ describe("DataResearchService permission-bounded research", () => {
     const denied = await service.setResearchPermission(permissionCommand(deniedSession.id, 1, "denied"));
     expect(denied).toMatchObject({ expansion: "denied", state: "ready" });
     const result = await service.runResearch(runCommand(deniedSession.id, 2));
-    expect(result).toMatchObject({ expansion: "denied", stopReason: "permission_denied" });
+    expect(result).toMatchObject({ expansion: "denied", state: "completed", stopReason: "permission_denied" });
     expect(result.evidenceIds).toHaveLength(1);
     expect(provider.hits).toEqual([seed, seed]);
   });
@@ -1534,6 +1539,106 @@ describe("DataResearchService permission-bounded research", () => {
     expect(provider.hits).toHaveLength(hits);
   });
 
+  it("continues an awaiting session from retained seeds after permission and rejects stale versions", async () => {
+    const created = await create("continuation-research");
+    const seeds = await service.runResearch(runCommand(created.id, 1));
+    expect(seeds).toMatchObject({ expansion: "awaiting_permission", stopReason: "permission_required" });
+    expect(seeds.evidenceIds).toHaveLength(1);
+    expect(provider.hits).toEqual([seed]);
+
+    await expect(service.setResearchPermission(permissionCommand(created.id, 1, "allowed")))
+      .rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    const allowed = await service.setResearchPermission(permissionCommand(created.id, 2, "allowed"));
+    expect(allowed).toMatchObject({ version: 3, state: "ready", evidenceIds: seeds.evidenceIds });
+    const continued = await service.runResearch({
+      ...runCommand(created.id, 3),
+      context: context("continuation-research-expand"),
+    });
+    expect(continued).toMatchObject({ expansion: "allowed", state: "partial", stopReason: "max_depth" });
+    expect(continued.evidenceIds).toHaveLength(3);
+    expect(continued.evidenceIds.slice(0, 1)).toEqual(seeds.evidenceIds);
+    expect(provider.hits).toEqual([
+      seed,
+      "https://example.com/research/child?b=2&a=1",
+      "https://example.com/research/grand",
+    ]);
+  });
+
+  it("keeps an awaiting seed run seed-only when permission is subsequently denied", async () => {
+    const created = await create("denied-continuation");
+    const seeds = await service.runResearch(runCommand(created.id, 1));
+    expect(seeds.evidenceIds).toHaveLength(1);
+    await service.setResearchPermission(permissionCommand(created.id, 2, "denied"));
+
+    const result = await service.runResearch({
+      ...runCommand(created.id, 3),
+      context: context("denied-continuation-final"),
+    });
+    expect(result).toMatchObject({ state: "completed", stopReason: "permission_denied" });
+    expect(result.evidenceIds).toEqual(seeds.evidenceIds);
+    expect(provider.hits).toEqual([seed]);
+  });
+
+  it("turns per-page artifact failures into gaps without rolling back other pages", async () => {
+    const failed = "https://example.com/research/artifact-failure";
+    provider.add(failed);
+    const failingArtifacts = new ArtifactStore(artifactRoot);
+    const put = failingArtifacts.put.bind(failingArtifacts);
+    vi.spyOn(failingArtifacts, "put").mockImplementation(async (content) => {
+      if (Buffer.from(content).includes(Buffer.from("artifact-failure"))) {
+        throw new Error("injected artifact failure");
+      }
+      return put(content);
+    });
+    service = new DataResearchService(
+      store, { now: () => now }, { next: () => `artifact-${++sequence}` },
+      failingArtifacts, undefined, provider,
+    );
+    const created = await create("artifact-partial", { seeds: [seed, failed], expansion: false });
+
+    const result = await service.runResearch(runCommand(created.id, 1));
+    expect(result).toMatchObject({ state: "partial" });
+    expect(result.evidenceIds).toHaveLength(1);
+    expect(result.gaps).toEqual([{
+      url: failed,
+      reason: "artifact_failed",
+      message: "injected artifact failure",
+    }]);
+  });
+
+  it("charges candidate payload bytes across multiple pages before retaining evidence", async () => {
+    const second = "https://example.com/research/grand";
+    provider.add(seed, [], "x".repeat(100));
+    provider.add(second, [], "y".repeat(100));
+    const created = await create("multi-page-bytes", {
+      seeds: [seed, second], expansion: false,
+      scope: {
+        hosts: ["example.com"], pathPrefixes: ["/research"], maxDepth: 2,
+        maxPages: 10, maxDurationMs: 1_000, maxBytes: 200,
+      },
+    });
+
+    const result = await service.runResearch(runCommand(created.id, 1));
+    expect(result).toMatchObject({ state: "partial", stopReason: "max_bytes" });
+    expect(result.evidenceIds).toHaveLength(1);
+    expect(result.gaps[0]).toMatchObject({ url: second, reason: "max_bytes" });
+    expect(provider.hits).toEqual([seed, second]);
+  });
+
+  it("rejects encoded separators and decoded dot segments in scope and seed paths", async () => {
+    for (const [index, path] of ["/research/%2foutside", "/research/%5coutside", "/research/%2e%2e/outside"].entries()) {
+      await expect(create(`unsafe-path-${index}`, { seeds: [`https://example.com${path}`] }))
+        .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    }
+    await expect(create("unsafe-scope", {
+      scope: {
+        hosts: ["example.com"], pathPrefixes: ["/research/%2e%2e"], maxDepth: 2,
+        maxPages: 10, maxDurationMs: 1_000, maxBytes: 100_000,
+      },
+    })).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    expect(provider.hits).toEqual([]);
+  });
+
   it("enforces cumulative byte and elapsed-time ceilings and records the stop reason", async () => {
     const byteSession = await create("byte-research");
     await service.setResearchPermission(permissionCommand(byteSession.id, 1, "allowed"));
@@ -1547,7 +1652,8 @@ describe("DataResearchService permission-bounded research", () => {
     provider.delayMs = 5;
     const timeLimited = await service.runResearch(runCommand(timeSession.id, 2, { maxDurationMs: 1 }));
     expect(timeLimited.stopReason).toBe("max_duration");
-    expect(timeLimited.evidenceIds).toHaveLength(1);
+    expect(timeLimited.evidenceIds).toEqual([]);
+    expect(timeLimited.gaps[0]).toMatchObject({ url: seed, reason: "max_duration" });
   });
 
   it("preserves successful evidence and an explicit gap when one seed fails", async () => {

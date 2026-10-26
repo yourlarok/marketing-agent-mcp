@@ -3,6 +3,7 @@ import { isIPv4, isIPv6 } from "node:net";
 import { createServer, connect, type Server, type Socket } from "node:net";
 import type { AddressInfo } from "node:net";
 import { DomainError } from "../domain/errors.js";
+import { assertAcquisitionUrlInScope, type AcquisitionScope } from "./acquisition-policy.js";
 import { isBlockedAddress } from "./safe-http.js";
 
 export interface DestinationValidatorOptions {
@@ -32,7 +33,8 @@ export class DestinationValidator {
     });
   }
 
-  async validate(raw: string): Promise<ValidatedDestination> {
+  async validate(raw: string, scope?: AcquisitionScope): Promise<ValidatedDestination> {
+    assertAcquisitionUrlInScope(raw, scope);
     let url: URL;
     try {
       url = new URL(raw);
@@ -77,6 +79,7 @@ export class DestinationPinningProxy {
   private constructor(
     private readonly validator: DestinationValidator,
     private readonly timeoutMs: number,
+    private readonly scope?: AcquisitionScope,
   ) {
     this.server = createServer((socket) => {
       this.sockets.add(socket);
@@ -86,8 +89,8 @@ export class DestinationPinningProxy {
     });
   }
 
-  static async start(validator: DestinationValidator, timeoutMs: number): Promise<DestinationPinningProxy> {
-    const proxy = new DestinationPinningProxy(validator, timeoutMs);
+  static async start(validator: DestinationValidator, timeoutMs: number, scope?: AcquisitionScope): Promise<DestinationPinningProxy> {
+    const proxy = new DestinationPinningProxy(validator, timeoutMs, scope);
     await new Promise<void>((resolveListen, rejectListen) => {
       const listening = (): void => {
         proxy.server.off("error", rejectListen);
@@ -158,7 +161,10 @@ export class DestinationPinningProxy {
       rejectSocket(client, 403);
       return;
     }
-    const destination = await this.validator.validate(rawUrl);
+    const requestScope = connectRequest && this.scope
+      ? { hosts: this.scope.hosts, pathPrefixes: ["/"] }
+      : this.scope;
+    const destination = await this.validator.validate(rawUrl, requestScope);
     if (connectRequest && destination.url.pathname !== "/" && destination.url.pathname !== "") {
       rejectSocket(client, 403);
       return;

@@ -22,6 +22,12 @@ import {
 import { DomainError } from "../domain/errors.js";
 import type { Dataset, Evidence, Source } from "../domain/model.js";
 import { AcquisitionRouter, type AcquisitionProvider, type AcquiredPage } from "../infrastructure/acquisition-router.js";
+import {
+  acquisitionPayloadBytes,
+  canonicalAcquisitionUrl,
+  isAcquisitionUrlInScope,
+  normalizeAcquisitionPathPrefix,
+} from "../infrastructure/acquisition-policy.js";
 import { ArtifactStore, type StoredArtifact } from "../infrastructure/artifact-store.js";
 import {
   DEFAULT_INGEST_LIMITS,
@@ -202,21 +208,15 @@ interface PreparedResearch {
   gaps: ResearchGap[];
   stopReason: string;
   limits: ResearchLimits;
+  frontier: { url: string; depth: number }[];
+  visitedUrls: string[];
+  attemptCount: number;
+  candidateBytes: number;
+  elapsedMs: number;
 }
 
-function canonicalResearchUrl(value: unknown, field = "url"): string {
-  assertNonEmptyString(value, field);
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    invalid(`${field} must be a valid URL`);
-  }
-  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) {
-    invalid(`${field} must be HTTP or HTTPS without userinfo`);
-  }
-  url.hash = "";
-  return url.href;
+function canonicalResearchUrl(value: unknown, _field = "url", base?: string): string {
+  return canonicalAcquisitionUrl(value, base);
 }
 
 function researchLimit(value: unknown, field: keyof ResearchLimits, ceiling: number): number {
@@ -257,24 +257,12 @@ function normalizeResearchScope(value: unknown): ResearchScope {
   if (!Array.isArray(scope.pathPrefixes) || scope.pathPrefixes.length === 0 || scope.pathPrefixes.length > 100) {
     invalid("scope.pathPrefixes must be a non-empty array with at most 100 paths");
   }
-  const pathPrefixes = scope.pathPrefixes.map((path) => {
-    assertNonEmptyString(path, "scope.pathPrefixes");
-    if (!path.startsWith("/")) {
-      invalid("scope.pathPrefixes must start with /");
-    }
-    return path;
-  });
+  const pathPrefixes = scope.pathPrefixes.map((path) => normalizeAcquisitionPathPrefix(path));
   return { hosts: [...new Set(hosts)], pathPrefixes: [...new Set(pathPrefixes)], ...normalizeResearchLimits(scope) };
 }
 
 function inResearchScope(value: string, scope: ResearchScope): boolean {
-  try {
-    const url = new URL(value);
-    return scope.hosts.includes(url.hostname.toLowerCase()) &&
-      scope.pathPrefixes.some((prefix) => url.pathname.startsWith(prefix));
-  } catch {
-    return false;
-  }
+  return isAcquisitionUrlInScope(value, scope);
 }
 
 function csvCell(value: unknown): string {
@@ -365,6 +353,11 @@ export class DataResearchService {
           stopReason: null,
           gaps: [],
           evidenceIds: [],
+          frontier: [],
+          visitedUrls: [],
+          attemptCount: 0,
+          candidateBytes: 0,
+          elapsedMs: 0,
         };
         return repos.researchSessions.insert(session) as Promise<ResearchSession>;
       },
@@ -387,7 +380,9 @@ export class DataResearchService {
       context: command.context,
       write: async (repos, current, timestamp) => {
         const session = await this.loadResearchSession(repos, current.id, current.workspaceId, current.expectedVersion);
-        if (session.expansion !== "awaiting_permission" || session.state !== "awaiting_permission") {
+        const canContinue = session.state === "awaiting_permission" ||
+          (session.state === "partial" && session.stopReason === "permission_required");
+        if (session.expansion !== "awaiting_permission" || !canContinue) {
           throw new DomainError("CONFLICT", "Research expansion is not awaiting permission", false, { id: session.id });
         }
         return repos.researchSessions.update({
@@ -465,106 +460,187 @@ export class DataResearchService {
   }
 
   private async crawlResearch(session: ResearchSession, limits: ResearchLimits): Promise<PreparedResearch> {
-    const queue = session.seeds.map((url) => ({ url, depth: 0 }));
-    const visited = new Set(queue.map((item) => item.url));
+    const previousAttempts = session.attemptCount ?? 0;
+    const queue = previousAttempts > 0
+      ? session.expansion === "allowed" ? [...session.frontier] : []
+      : session.seeds.map((url) => ({ url, depth: 0 }));
+    const visited = new Set(previousAttempts > 0 ? session.visitedUrls : session.seeds);
     const pages: PreparedLink[] = [];
     const gaps: ResearchGap[] = [];
     const startedAt = Date.now();
-    let attempts = 0;
-    let bytes = 0;
+    const remainingMs = Math.max(0, limits.maxDurationMs - (session.elapsedMs ?? 0));
+    const deadlineMs = startedAt + remainingMs;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remainingMs);
+    let attempts = previousAttempts;
+    let candidateBytes = session.candidateBytes ?? 0;
     let stopReason = "completed";
     let depthLimited = false;
-
-    while (queue.length > 0) {
-      if (attempts >= limits.maxPages) {
-        stopReason = "max_pages";
-        break;
-      }
-      if (Date.now() - startedAt >= limits.maxDurationMs) {
+    const expired = (): boolean => controller.signal.aborted || Date.now() >= deadlineMs;
+    const continueIfActive = (): boolean => {
+      if (expired()) {
         stopReason = "max_duration";
-        break;
+        return false;
       }
-      const current = queue.shift()!;
-      attempts += 1;
-      let page: AcquiredPage;
-      try {
-        page = await this.acquisition.acquire({ url: current.url });
-      } catch (error) {
-        gaps.push({
+      return true;
+    };
+
+    try {
+      while (queue.length > 0) {
+        if (session.expansion === "awaiting_permission" && queue[0]!.depth > 0) {
+          break;
+        }
+        if (attempts >= limits.maxPages) {
+          stopReason = "max_pages";
+          break;
+        }
+        if (!continueIfActive()) {
+          break;
+        }
+        const current = queue.shift()!;
+        attempts += 1;
+        let page: AcquiredPage;
+        try {
+          page = await this.acquisition.acquire({
+            url: current.url,
+            scope: { hosts: session.scope.hosts, pathPrefixes: session.scope.pathPrefixes },
+            maxBytes: Math.max(0, limits.maxBytes - candidateBytes),
+            timeoutMs: Math.max(1, deadlineMs - Date.now()),
+            deadlineMs,
+            signal: controller.signal,
+          });
+        } catch (error) {
+          if (error instanceof DomainError && typeof error.details?.payloadBytes === "number") {
+            candidateBytes += error.details.payloadBytes;
+          }
+          const reason = error instanceof DomainError && ["max_duration", "max_bytes"].includes(String(error.details?.reason))
+            ? String(error.details!.reason)
+            : "acquisition_failed";
+          gaps.push({
+            url: current.url,
+            reason,
+            message: error instanceof Error ? error.message : "Content acquisition failed",
+          });
+          if (reason === "max_duration" || reason === "max_bytes") {
+            stopReason = reason;
+            break;
+          }
+          if (continueIfActive()) {
+            continue;
+          }
+          break;
+        }
+
+        candidateBytes += acquisitionPayloadBytes(page);
+        if (expired()) {
+          gaps.push({ url: current.url, reason: "max_duration", message: "Research acquisition deadline reached" });
+          stopReason = "max_duration";
+          break;
+        }
+        if (candidateBytes > limits.maxBytes) {
+          gaps.push({ url: current.url, reason: "max_bytes", message: "Research byte limit reached" });
+          stopReason = "max_bytes";
+          break;
+        }
+
+        let finalUrl: string;
+        try {
+          finalUrl = canonicalResearchUrl(page.finalUrl, "finalUrl");
+        } catch {
+          gaps.push({ url: current.url, reason: "invalid_final_url", message: "Acquisition returned an invalid final URL" });
+          if (continueIfActive()) {
+            continue;
+          }
+          break;
+        }
+        if (!inResearchScope(finalUrl, session.scope)) {
+          gaps.push({ url: current.url, reason: "out_of_scope", message: "Acquisition finished outside the approved scope" });
+          if (continueIfActive()) {
+            continue;
+          }
+          break;
+        }
+        const serialized = Buffer.from(JSON.stringify({
           url: current.url,
-          reason: "acquisition_failed",
-          message: error instanceof Error ? error.message : "Content acquisition failed",
-        });
-        continue;
-      }
+          finalUrl,
+          title: page.title,
+          text: page.text,
+          fields: page.fields,
+          provider: page.provider,
+        }));
+        try {
+          const [text, screenshot] = await Promise.all([
+            this.artifacts.put(serialized),
+            this.artifacts.put(page.screenshot),
+          ]);
+          if (expired()) {
+            gaps.push({ url: current.url, reason: "max_duration", message: "Research acquisition deadline reached" });
+            stopReason = "max_duration";
+            break;
+          }
+          pages.push({ page: { ...page, url: current.url, finalUrl }, text, screenshot });
+        } catch (error) {
+          gaps.push({
+            url: current.url,
+            reason: "artifact_failed",
+            message: error instanceof Error ? error.message : "Research artifact persistence failed",
+          });
+          if (continueIfActive()) {
+            continue;
+          }
+          break;
+        }
 
-      let finalUrl: string;
-      try {
-        finalUrl = canonicalResearchUrl(page.finalUrl, "finalUrl");
-      } catch {
-        gaps.push({ url: current.url, reason: "invalid_final_url", message: "Acquisition returned an invalid final URL" });
-        continue;
-      }
-      if (!inResearchScope(finalUrl, session.scope)) {
-        gaps.push({ url: current.url, reason: "out_of_scope", message: "Acquisition finished outside the approved scope" });
-        continue;
-      }
-      const serialized = Buffer.from(JSON.stringify({
-        url: current.url,
-        finalUrl,
-        title: page.title,
-        text: page.text,
-        fields: page.fields,
-        provider: page.provider,
-      }));
-      const pageBytes = serialized.length + page.screenshot.length;
-      if (bytes + pageBytes > limits.maxBytes) {
-        gaps.push({ url: current.url, reason: "max_bytes", message: "Research byte limit reached" });
-        stopReason = "max_bytes";
-        break;
-      }
-      const [text, screenshot] = await Promise.all([
-        this.artifacts.put(serialized),
-        this.artifacts.put(page.screenshot),
-      ]);
-      pages.push({ page: { ...page, url: current.url, finalUrl }, text, screenshot });
-      bytes += pageBytes;
-
-      if (session.expansion === "allowed") {
-        for (const link of page.links ?? []) {
-          let candidate: string;
-          try {
-            candidate = canonicalResearchUrl(new URL(link, finalUrl).href, "link");
-          } catch {
-            continue;
+        if (session.expansion === "allowed" || session.expansion === "awaiting_permission") {
+          for (const link of page.links ?? []) {
+            if (!continueIfActive()) {
+              break;
+            }
+            let candidate: string;
+            try {
+              candidate = canonicalResearchUrl(link, "link", finalUrl);
+            } catch {
+              continue;
+            }
+            if (!inResearchScope(candidate, session.scope) || visited.has(candidate)) {
+              continue;
+            }
+            if (current.depth >= limits.maxDepth) {
+              depthLimited = true;
+              continue;
+            }
+            visited.add(candidate);
+            queue.push({ url: candidate, depth: current.depth + 1 });
           }
-          if (!inResearchScope(candidate, session.scope) || visited.has(candidate)) {
-            continue;
-          }
-          if (current.depth >= limits.maxDepth) {
-            depthLimited = true;
-            continue;
-          }
-          visited.add(candidate);
-          queue.push({ url: candidate, depth: current.depth + 1 });
+        }
+        if (!continueIfActive()) {
+          break;
         }
       }
-      if (Date.now() - startedAt >= limits.maxDurationMs) {
-        stopReason = "max_duration";
-        break;
-      }
-    }
 
-    if (stopReason === "completed") {
-      if (depthLimited) {
-        stopReason = "max_depth";
-      } else if (session.expansion === "awaiting_permission") {
-        stopReason = "permission_required";
-      } else if (session.expansion === "denied") {
-        stopReason = "permission_denied";
+      if (stopReason === "completed") {
+        if (session.expansion === "awaiting_permission") {
+          stopReason = "permission_required";
+        } else if (session.expansion === "denied") {
+          stopReason = "permission_denied";
+        } else if (depthLimited) {
+          stopReason = "max_depth";
+        }
       }
+      return {
+        pages,
+        gaps,
+        stopReason,
+        limits,
+        frontier: queue,
+        visitedUrls: [...visited],
+        attemptCount: attempts,
+        candidateBytes,
+        elapsedMs: (session.elapsedMs ?? 0) + (Date.now() - startedAt),
+      };
+    } finally {
+      clearTimeout(timer);
     }
-    return { pages, gaps, stopReason, limits };
   }
 
   private async writeResearchResult(
@@ -622,16 +698,22 @@ export class DataResearchService {
       await repos.evidence.insert(evidence);
       evidenceIds.push(evidence.id);
     }
-    const state = prepared.stopReason === "completed" && prepared.gaps.length === 0
-      ? "completed"
-      : prepared.pages.length === 0 ? "blocked" : "partial";
+    const allEvidenceIds = [...session.evidenceIds, ...evidenceIds];
+    const allGaps = [...session.gaps, ...prepared.gaps];
+    const normallyCompleted = ["completed", "permission_denied"].includes(prepared.stopReason) && allGaps.length === 0;
+    const state = normallyCompleted ? "completed" : allEvidenceIds.length === 0 ? "blocked" : "partial";
     return repos.researchSessions.update({
       ...session,
       limits: prepared.limits,
       state,
       stopReason: prepared.stopReason,
-      gaps: prepared.gaps,
-      evidenceIds,
+      gaps: allGaps,
+      evidenceIds: allEvidenceIds,
+      frontier: prepared.frontier,
+      visitedUrls: prepared.visitedUrls,
+      attemptCount: prepared.attemptCount,
+      candidateBytes: prepared.candidateBytes,
+      elapsedMs: prepared.elapsedMs,
       updatedAt: timestamp,
     }, session.version) as Promise<ResearchSession>;
   }

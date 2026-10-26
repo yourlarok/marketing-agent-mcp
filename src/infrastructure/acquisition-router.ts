@@ -1,8 +1,10 @@
 import { parseCommaSeparatedList, parseContentMcpArguments } from "../config.js";
 import { DomainError } from "../domain/errors.js";
+import { acquisitionDeadlineError, raceWithAcquisitionAbort } from "./acquisition-policy.js";
 import { McpAcquisitionProvider } from "./mcp-acquisition.js";
 import {
   PlaywrightAcquisitionProvider,
+  remainingAcquisitionTimeout,
   type AcquiredPage,
   type AcquireRequest,
   type AcquisitionProvider,
@@ -42,19 +44,29 @@ export class AcquisitionRouter implements AcquisitionProvider {
 
   async acquire(request: AcquireRequest): Promise<AcquiredPage> {
     let lastError: unknown;
+    const acquire = (provider: AcquisitionProvider): Promise<AcquiredPage> => {
+      const timeoutMs = remainingAcquisitionTimeout(request);
+      return raceWithAcquisitionAbort(provider.acquire({ ...request, timeoutMs }), request.signal);
+    };
     if (this.mcp) {
       try {
-        return await this.mcp.acquire(request);
+        return await acquire(this.mcp);
       } catch (error) {
-        if (isAccessGap(error)) {
+        if (request.signal?.aborted || (error instanceof DomainError && error.details?.reason === "max_duration")) {
+          throw acquisitionDeadlineError();
+        }
+        if (isAccessGap(error) || isResearchBoundary(error)) {
           throw error;
         }
         lastError = error;
       }
     }
     try {
-      return await this.playwright.acquire(request);
+      return await acquire(this.playwright);
     } catch (error) {
+      if (request.signal?.aborted || (error instanceof DomainError && error.details?.reason === "max_duration")) {
+        throw acquisitionDeadlineError();
+      }
       if (error instanceof DomainError) {
         throw error;
       }
@@ -67,6 +79,11 @@ export class AcquisitionRouter implements AcquisitionProvider {
       { reason: lastError instanceof DomainError ? String(lastError.details?.reason ?? "provider_unavailable") : "provider_unavailable" },
     );
   }
+}
+
+function isResearchBoundary(error: unknown): boolean {
+  return error instanceof DomainError &&
+    (error.code === "INVALID_INPUT" || ["scope_denied", "max_bytes"].includes(String(error.details?.reason)));
 }
 
 function isAccessGap(error: unknown): boolean {

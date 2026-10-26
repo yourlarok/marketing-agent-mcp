@@ -63,6 +63,11 @@ export interface ResearchGap {
   message: string;
 }
 
+export interface ResearchFrontierItem {
+  url: string;
+  depth: number;
+}
+
 export interface ResearchSession extends EntityRecord {
   goal: string;
   seeds: string[];
@@ -73,6 +78,11 @@ export interface ResearchSession extends EntityRecord {
   stopReason: string | null;
   gaps: ResearchGap[];
   evidenceIds: string[];
+  frontier: ResearchFrontierItem[];
+  visitedUrls: string[];
+  attemptCount: number;
+  candidateBytes: number;
+  elapsedMs: number;
 }
 
 export interface Competitor extends EntityRecord {
