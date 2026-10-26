@@ -24,7 +24,7 @@ import {
   type ResearchSession,
 } from "../domain/data-research-model.js";
 import { DomainError } from "../domain/errors.js";
-import type { Dataset, Evidence, Finding, Source } from "../domain/model.js";
+import type { Dataset, Evidence, Source } from "../domain/model.js";
 import { AcquisitionRouter, type AcquisitionProvider, type AcquiredPage } from "../infrastructure/acquisition-router.js";
 import {
   acquisitionPayloadBytes,
@@ -1203,6 +1203,9 @@ export class DataResearchService {
 
   async diffCompetitors(command: Command<CreateCompetitorDiff>): Promise<CompetitorDiff> {
     const input = command.input;
+    if (Object.hasOwn(input, "conclusions")) {
+      invalid("Semantic conclusions are not supported by deterministic competitor diff");
+    }
     if (
       !Array.isArray(input.competitorIds) ||
       input.competitorIds.length !== 2 ||
@@ -1221,28 +1224,6 @@ export class DataResearchService {
     }
     if (new Set(input.dimensions).size !== input.dimensions.length) {
       invalid("dimensions must not contain duplicates");
-    }
-    const conclusions = input.conclusions ?? [];
-    if (!Array.isArray(conclusions)) {
-      invalid("conclusions must be an array");
-    }
-    for (const conclusion of conclusions) {
-      if (conclusion === null || typeof conclusion !== "object" || Array.isArray(conclusion)) {
-        invalid("conclusions must contain objects");
-      }
-      assertNonEmptyString(conclusion.dimension, "conclusion.dimension");
-      assertNonEmptyString(conclusion.statement, "conclusion.statement");
-      assertNonEmptyString(conclusion.limitations, "conclusion.limitations");
-      if (!input.dimensions.includes(conclusion.dimension)) {
-        invalid("conclusion.dimension must be included in dimensions");
-      }
-      const ownedConversion = `${conclusion.dimension} ${conclusion.statement}`;
-      if (/owned[_\s-]*conversion|our\s+(?:\w+\s+){0,3}conversion|自身.{0,12}转化|自有.{0,12}转化/i.test(ownedConversion)) {
-        invalid("Public observations cannot support owned-conversion conclusions");
-      }
-      if (/\b(?:caus(?:e|al|es)|effect|impact|improv(?:e|es|ed)|increas(?:e|es|ed)|decreas(?:e|es|ed)|driv(?:e|es)|because|lead(?:s)? to)\b|因为|因此|导致|提升|提高|增加|下降|影响/i.test(conclusion.statement)) {
-        invalid("Competitor observations cannot support effect or causal conclusions");
-      }
     }
 
     return this.commands.execute({
@@ -1314,26 +1295,6 @@ export class DataResearchService {
           [...current.dimensions],
           observations,
         );
-        const findingIds: string[] = [];
-        for (const conclusion of current.conclusions ?? []) {
-          const entry = entries.find((candidate) => candidate.dimension === conclusion.dimension)!;
-          if (entry.evidenceIds.length === 0) {
-            invalid("Semantic conclusions require supporting observation evidence");
-          }
-          const finding: Finding = {
-            id: this.ids.next(),
-            workspaceId: current.workspaceId,
-            version: 1,
-            createdAt: timestamp,
-            updatedAt: timestamp,
-            kind: "inference",
-            statement: conclusion.statement,
-            evidenceIds: [...entry.evidenceIds],
-            limitations: conclusion.limitations,
-          };
-          await repos.findings.insert(finding);
-          findingIds.push(finding.id);
-        }
         const diff: CompetitorDiff = {
           id: current.id,
           workspaceId: current.workspaceId,
@@ -1342,7 +1303,7 @@ export class DataResearchService {
           updatedAt: timestamp,
           competitorIds: [...current.competitorIds],
           entries,
-          findingIds,
+          findingIds: [],
         };
         return repos.competitorDiffs.insert(diff);
       },

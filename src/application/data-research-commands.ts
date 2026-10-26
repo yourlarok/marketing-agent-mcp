@@ -95,18 +95,11 @@ export interface ConfirmCompetitor {
   status: "confirmed" | "excluded";
 }
 
-export interface CompetitorSemanticConclusion {
-  dimension: string;
-  statement: string;
-  limitations: string;
-}
-
 export interface CreateCompetitorDiff {
   id: string;
   workspaceId: string;
   competitorIds: [string, string];
   dimensions: string[];
-  conclusions?: CompetitorSemanticConclusion[];
 }
 
 export interface EvidenceAssetQuery {

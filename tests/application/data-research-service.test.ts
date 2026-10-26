@@ -1859,7 +1859,7 @@ describe("DataResearchService confirmed competitor diffs", () => {
     ]);
   });
 
-  it("persists deterministic entries and evidence-backed inference findings", async () => {
+  it("persists deterministic entries without semantic findings", async () => {
     await addObservation("evidence-z", { price: "20", cta: "Buy" });
     await addObservation("evidence-duplicate", { price: "20" });
     await addObservation("evidence-a", { price: "20", cta: "Start" });
@@ -1868,11 +1868,6 @@ describe("DataResearchService confirmed competitor diffs", () => {
 
     const diff = await service.diffCompetitors(diffCommand("diff-complete", {
       dimensions: ["price", "cta", "shipping"],
-      conclusions: [{
-        dimension: "price",
-        statement: "Both competitors publicly display the same price.",
-        limitations: "Only the cited public pages were observed; no causal effect is inferred.",
-      }],
     }));
 
     expect(diff).toMatchObject({
@@ -1883,20 +1878,13 @@ describe("DataResearchService confirmed competitor diffs", () => {
         { dimension: "cta", result: "different", evidenceIds: ["evidence-a", "evidence-z"] },
         { dimension: "shipping", result: "unknown", evidenceIds: [] },
       ],
+      findingIds: [],
     });
-    expect(diff.findingIds).toHaveLength(1);
     const persisted = await store.transaction(async (repos) => ({
       diff: await repos.competitorDiffs.get("diff-complete", "workspace-1"),
-      finding: await repos.findings.get(diff.findingIds[0]!, "workspace-1"),
       audits: await repos.audit.listForEntity("workspace-1", "competitor_diff", "diff-complete"),
     }));
     expect(persisted.diff).toEqual(diff);
-    expect(persisted.finding).toMatchObject({
-      kind: "inference",
-      statement: "Both competitors publicly display the same price.",
-      evidenceIds: ["evidence-a", "evidence-duplicate", "evidence-z"],
-      limitations: "Only the cited public pages were observed; no causal effect is inferred.",
-    });
     expect(persisted.audits).toHaveLength(1);
   });
 
@@ -1946,27 +1934,35 @@ describe("DataResearchService confirmed competitor diffs", () => {
     ]);
   });
 
-  it("rejects owned-conversion conclusions and malformed direct JavaScript input", async () => {
+  it.each([
+    ["null", null],
+    ["empty array", []],
+    ["free text", [{
+      dimension: "price",
+      statement: "The public price lifts demand.",
+      limitations: "Unstructured and unverifiable.",
+    }]],
+  ])("rejects %s conclusions without creating a diff", async (_label, conclusions) => {
     await addObservation("evidence-left", { price: "20" });
     await addObservation("evidence-right", { price: "21" });
     await addCompetitor("left", ["evidence-left"]);
     await addCompetitor("right", ["evidence-right"]);
+    const command = diffCommand("diff-conclusions", { conclusions });
+
+    await expect(service.diffCompetitors(command as never))
+      .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    await expect(store.transaction((repos) =>
+      repos.competitorDiffs.get("diff-conclusions", "workspace-1")
+    )).resolves.toBeUndefined();
+  });
+
+  it("rejects malformed direct JavaScript input", async () => {
     const invalidCommands = [
-      diffCommand("diff-owned-conversion", {
-        dimensions: ["price", "owned_conversion"],
-        conclusions: [{
-          dimension: "owned_conversion",
-          statement: "Our conversion rate will improve because of the competitor price.",
-          limitations: "Public observation only.",
-        }],
-      }),
       diffCommand("diff-malformed-status", { competitorIds: ["left", "left"] }),
       diffCommand("diff-malformed-dimensions", { dimensions: ["price", "price"] }),
-      diffCommand("diff-malformed-conclusion", {
-        conclusions: [{ dimension: "price", statement: "Different", limitations: "" }],
-      }),
     ];
-
+    await addCompetitor("left");
+    await addCompetitor("right");
     for (const command of invalidCommands) {
       await expect(service.diffCompetitors(command as never))
         .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
@@ -1984,5 +1980,147 @@ describe("DataResearchService confirmed competitor diffs", () => {
       },
       context: context("bad-status"),
     } as never)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+  });
+
+  it("diffs structured fields from the real content-link acquisition evidence chain", async () => {
+    const artifactRoot = await createTempDir();
+    try {
+      const acquisition: AcquisitionProvider = {
+        acquire: async (request) => ({
+          url: request.url,
+          finalUrl: request.url,
+          title: request.url.includes("left") ? "Left competitor" : "Right competitor",
+          text: "Public competitor page",
+          fields: request.url.includes("left")
+            ? { price: "20", cta: "Buy" }
+            : { price: "20", cta: "Start" },
+          screenshot: Buffer.from(`screenshot:${request.url}`),
+          provider: "playwright",
+          toolVersion: "fixture-1",
+        }),
+      };
+      const acquiredService = new DataResearchService(
+        store,
+        { now: () => now },
+        { next: () => `competitor-generated-${++sequence}` },
+        new ArtifactStore(artifactRoot),
+        undefined,
+        acquisition,
+      );
+      const batch = await acquiredService.ingestContentLinks({
+        input: {
+          id: "content-acquisition",
+          workspaceId: "workspace-1",
+          links: [
+            { url: "https://example.com/left", fields: { price: ".price", cta: ".cta" } },
+            { url: "https://example.com/right", fields: { price: ".price", cta: ".cta" } },
+          ],
+        },
+        context: context("content-acquisition"),
+      });
+      expect(batch.evidenceIds).toEqual([
+        "competitor-generated-2",
+        "competitor-generated-6",
+      ]);
+
+      const evidence = await store.transaction(async (repos) => Promise.all(
+        batch.evidenceIds.map((id) => repos.evidence.get(id, "workspace-1")),
+      ));
+      const sources = await store.transaction(async (repos) => Promise.all(
+        evidence.map((item) => repos.sources.get(item!.sourceId, "workspace-1")),
+      ));
+      expect(sources.map((source) => source?.metadata)).toEqual([
+        expect.objectContaining({
+          acquisition: "content_ingestion",
+          fields: { price: "20", cta: "Buy" },
+        }),
+        expect.objectContaining({
+          acquisition: "content_ingestion",
+          fields: { price: "20", cta: "Start" },
+        }),
+      ]);
+
+      await store.transaction(async (repos) => {
+        for (const [id, evidenceId] of [
+          ["acquired-left", batch.evidenceIds[0]!],
+          ["acquired-right", batch.evidenceIds[1]!],
+        ] as const) {
+          const legacy = { ...competitor(id), evidenceIds: [evidenceId] } as Record<string, unknown>;
+          delete legacy.status;
+          await repos.competitors.insert(legacy as Competitor);
+        }
+      });
+      for (const id of ["acquired-left", "acquired-right"]) {
+        await acquiredService.confirmCompetitor({
+          input: { id, workspaceId: "workspace-1", expectedVersion: 1, status: "confirmed" },
+          context: context(`${id}-confirm`),
+        });
+      }
+
+      const diff = await acquiredService.diffCompetitors(diffCommand("acquired-diff", {
+        competitorIds: ["acquired-left", "acquired-right"],
+        dimensions: ["price", "cta"],
+      }));
+      expect(diff).toMatchObject({
+        entries: [
+          {
+            dimension: "price",
+            result: "same",
+            evidenceIds: ["competitor-generated-2", "competitor-generated-6"],
+          },
+          {
+            dimension: "cta",
+            result: "different",
+            evidenceIds: ["competitor-generated-2", "competitor-generated-6"],
+          },
+        ],
+        findingIds: [],
+      });
+    } finally {
+      await removeTempDir(artifactRoot);
+    }
+  });
+
+  it("rolls back diff, audit, and idempotency records after a mid-write failure", async () => {
+    await addObservation("evidence-left", { price: "20" });
+    await addObservation("evidence-right", { price: "21" });
+    await addCompetitor("left", ["evidence-left"]);
+    await addCompetitor("right", ["evidence-right"]);
+    const failingStore: Store = {
+      close: () => store.close(),
+      transaction: (work) => store.transaction(async (repos) => work({
+        ...repos,
+        audit: {
+          ...repos.audit,
+          append: async (record) => {
+            await repos.audit.append(record);
+            throw new Error("injected failure after diff and audit writes");
+          },
+        },
+      })),
+    };
+    const failing = new DataResearchService(
+      failingStore,
+      { now: () => now },
+      { next: () => `competitor-generated-${++sequence}` },
+    );
+
+    await expect(failing.diffCompetitors(diffCommand("diff-rollback", {
+      dimensions: ["price"],
+    }))).rejects.toThrow("injected failure after diff and audit writes");
+    const residue = await store.transaction(async (repos) => ({
+      diff: await repos.competitorDiffs.get("diff-rollback", "workspace-1"),
+      audits: await repos.audit.listForEntity("workspace-1", "competitor_diff", "diff-rollback"),
+      idempotency: await repos.idempotency.get("workspace-1", "command-diff-rollback"),
+      left: await repos.competitors.get("left", "workspace-1"),
+      right: await repos.competitors.get("right", "workspace-1"),
+    }));
+    expect(residue).toMatchObject({
+      diff: undefined,
+      audits: [],
+      idempotency: undefined,
+      left: { version: 1, status: "confirmed", evidenceIds: ["evidence-left"] },
+      right: { version: 1, status: "confirmed", evidenceIds: ["evidence-right"] },
+    });
   });
 });
