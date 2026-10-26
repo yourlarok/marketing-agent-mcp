@@ -4,6 +4,8 @@ import {
   CAPABILITY_STATES,
   EVIDENCE_CLASSIFICATIONS,
   FINDING_KINDS,
+  SOURCE_OWNERSHIPS,
+  SOURCE_TYPES,
   TASK_STATES,
   type CapabilityAdapterKind,
   type CapabilityState,
@@ -94,7 +96,33 @@ function lineageReferences(record: EntityRecord, entityType: LineageEntityType):
       id: record.id,
     });
   }
-  return ids.map((id) => ({ entityType: referencedType, id }));
+  const references: EntityRef[] = ids.map((id) => ({ entityType: referencedType, id }));
+  if (entityType === "task") {
+    const dependencyIds = record.dependencyIds;
+    if (
+      !Array.isArray(dependencyIds) ||
+      dependencyIds.some((id) => typeof id !== "string")
+    ) {
+      throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {
+        entityType,
+        id: record.id,
+      });
+    }
+    references.push(
+      ...dependencyIds.map((id) => ({ entityType: "task" as const, id })),
+    );
+  }
+  return references;
+}
+
+async function requireWorkspace(
+  repos: Repositories,
+  workspaceId: string,
+): Promise<void> {
+  const workspace = await repos.workspaces.get(workspaceId, workspaceId);
+  if (!workspace) {
+    throw new DomainError("NOT_FOUND", "Workspace not found", false, { workspaceId });
+  }
 }
 
 async function requireSource(
@@ -258,6 +286,16 @@ export class MarketingService {
       input: command.input,
       context: command.context,
       write: async (repos, input, timestamp) => {
+        if (!(SOURCE_TYPES as readonly string[]).includes(input.type)) {
+          throw new DomainError("INVALID_INPUT", "type must be a supported source type");
+        }
+        if (!(SOURCE_OWNERSHIPS as readonly string[]).includes(input.ownership)) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "ownership must be a supported source ownership",
+          );
+        }
+        await requireWorkspace(repos, input.workspaceId);
         const source: Source = {
           ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
           id: input.id,
@@ -441,6 +479,7 @@ export class MarketingService {
             "Unknown findings require an explicit reason",
           );
         }
+        await requireWorkspace(repos, input.workspaceId);
         for (const evidenceId of input.evidenceIds) {
           const evidence = await repos.evidence.get(evidenceId, input.workspaceId);
           if (!evidence) {
@@ -597,6 +636,7 @@ export class MarketingService {
             "Public capability registration requires an explicit user extension",
           );
         }
+        await requireWorkspace(repos, input.workspaceId);
         const capability: ToolCapability = {
           id: input.id,
           workspaceId: input.workspaceId,

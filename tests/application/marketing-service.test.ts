@@ -344,6 +344,29 @@ describe("MarketingService command pipeline", () => {
     expect(ids.calls).toBe(1);
   });
 
+  it("returns NOT_FOUND before inserting a reference-free finding into a missing workspace", async () => {
+    const attemptContext = { actor: "agent-1", requestId: "request-missing", idempotencyKey: "command-missing" };
+
+    await expect(service.recordFinding({
+      input: {
+        id: "finding-missing-workspace",
+        workspaceId: "workspace-missing",
+        kind: "unknown",
+        statement: "The workspace is unknown",
+        evidenceIds: [],
+        unknownReason: "No workspace exists",
+      },
+      context: attemptContext,
+    })).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+
+    const persisted = await store.transaction(async (repos) => ({
+      finding: await repos.findings.get("finding-missing-workspace", "workspace-missing"),
+      audit: await repos.audit.get("audit-1", "workspace-missing"),
+      idempotency: await repos.idempotency.get("workspace-missing", attemptContext.idempotencyKey),
+    }));
+    expect(persisted).toEqual({ finding: undefined, audit: undefined, idempotency: undefined });
+  });
+
   it("scopes identical idempotency keys independently by workspace", async () => {
     const first = await service.createWorkspace({
       input: workspaceInput(),
@@ -1006,6 +1029,93 @@ describe("MarketingService command pipeline", () => {
     });
     expect(persisted.idempotency?.response).toEqual(finding);
   });
+  it.each([
+    { label: "blank ID", input: { ...workspaceInput(), id: " \t" }, context },
+    { label: "blank name", input: { ...workspaceInput(), name: " \n" }, context },
+    { label: "non-string name", input: { ...workspaceInput(), name: 42 as never }, context },
+    { label: "sparse metadata", input: { ...workspaceInput(), metadata: new Array(1) as never }, context },
+    { label: "blank actor", input: workspaceInput(), context: { ...context, actor: " " } },
+    { label: "blank request ID", input: workspaceInput(), context: { ...context, requestId: "\t" } },
+    { label: "missing idempotency key", input: workspaceInput(), context: { ...context, idempotencyKey: undefined as never } },
+    { label: "missing context", input: workspaceInput(), context: null as never },
+  ])("rejects workspace $label from a direct service call without residue", async ({ input, context: attemptContext }) => {
+    await expect(service.createWorkspace({ input, context: attemptContext }))
+      .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+
+    const scope = typeof input.id === "string" ? input.id : "workspace-1";
+    const key = typeof attemptContext?.idempotencyKey === "string"
+      ? attemptContext.idempotencyKey
+      : "command-1";
+    const persisted = await store.transaction(async (repos) => ({
+      workspace: await repos.workspaces.get(scope, scope),
+      audit: await repos.audit.get("audit-1", scope),
+      idempotency: await repos.idempotency.get(scope, key),
+    }));
+    expect(persisted).toEqual({ workspace: undefined, audit: undefined, idempotency: undefined });
+  });
+
+  it.each([
+    { field: "id", value: " " },
+    { field: "workspaceId", value: "\t" },
+    { field: "name", value: " \n" },
+    { field: "type", value: "unsupported" },
+    { field: "ownership", value: "public" },
+    { field: "metadata", value: new Array(1) as never },
+  ])("rejects source $field from a direct service call without residue", async ({ field, value }) => {
+    await service.createWorkspace({ input: workspaceInput(), context });
+    const input = {
+      id: "source-1",
+      workspaceId: "workspace-1",
+      name: "Warehouse",
+      type: "database",
+      ownership: "owned",
+      [field]: value,
+    };
+    const attemptContext = { actor: "agent-1", requestId: "request-2", idempotencyKey: "command-2" };
+
+    await expect(service.registerSource({ input: input as never, context: attemptContext }))
+      .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+
+    const persisted = await store.transaction(async (repos) => ({
+      source: await repos.sources.get(input.id, input.workspaceId),
+      audit: await repos.audit.get("audit-2", "workspace-1"),
+      idempotency: await repos.idempotency.get("workspace-1", attemptContext.idempotencyKey),
+    }));
+    expect(persisted).toEqual({ source: undefined, audit: undefined, idempotency: undefined });
+  });
+
+  it.each([
+    { field: "id", value: " " },
+    { field: "sourceId", value: "\t" },
+    { field: "name", value: null },
+    { field: "fieldDefinitions", value: new Array(1) as never },
+    { field: "metricDefinitions", value: new Array(1) as never },
+    { field: "limitations", value: new Array(1) as never },
+  ])("rejects dataset $field from a direct service call without residue", async ({ field, value }) => {
+    await service.createWorkspace({ input: workspaceInput(), context });
+    await service.registerSource({
+      input: {
+        id: "source-1",
+        workspaceId: "workspace-1",
+        name: "Warehouse",
+        type: "database",
+        ownership: "owned",
+      },
+      context: { actor: "agent-1", requestId: "request-2", idempotencyKey: "command-2" },
+    });
+    const input = { ...datasetInput(), [field]: value };
+    const attemptContext = { actor: "agent-1", requestId: "request-3", idempotencyKey: "command-3" };
+
+    await expect(service.registerDataset({ input, context: attemptContext }))
+      .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+
+    const persisted = await store.transaction(async (repos) => ({
+      dataset: await repos.datasets.get(input.id, input.workspaceId),
+      audit: await repos.audit.get("audit-3", "workspace-1"),
+      idempotency: await repos.idempotency.get("workspace-1", attemptContext.idempotencyKey),
+    }));
+    expect(persisted).toEqual({ dataset: undefined, audit: undefined, idempotency: undefined });
+  });
 });
 
 describe("MarketingService recommendations and tasks", () => {
@@ -1380,6 +1490,44 @@ describe("MarketingService recommendations and tasks", () => {
         { from: { entityType: "source", id: "source-1" }, to: { entityType: "dataset", id: "dataset-1" } },
       ],
     });
+  });
+
+  it("includes task dependencies and their complete upstream lineage with shared ancestors deduplicated", async () => {
+    await createRecommendation();
+    await createTask("task-shared");
+    await createTask("task-dependency-a", ["task-shared"]);
+    await createTask("task-dependency-b", ["task-shared"]);
+    await createTask("task-final", ["task-dependency-a", "task-dependency-b"]);
+
+    const lineage = await service.getLineage({
+      entityType: "task",
+      id: "task-final",
+      workspaceId: "workspace-1",
+    });
+
+    expect(lineage.nodes).toEqual([
+      { entityType: "source", id: "source-1", version: 1, auditRequestIds: ["task-request-2"] },
+      { entityType: "evidence", id: "evidence-1", version: 1, auditRequestIds: ["task-request-3"] },
+      { entityType: "finding", id: "finding-1", version: 1, auditRequestIds: ["task-request-4"] },
+      { entityType: "recommendation", id: "recommendation-1", version: 1, auditRequestIds: ["task-request-5"] },
+      { entityType: "task", id: "task-shared", version: 1, auditRequestIds: ["task-request-6"] },
+      { entityType: "task", id: "task-dependency-a", version: 1, auditRequestIds: ["task-request-7"] },
+      { entityType: "task", id: "task-dependency-b", version: 1, auditRequestIds: ["task-request-8"] },
+      { entityType: "task", id: "task-final", version: 1, auditRequestIds: ["task-request-9"] },
+    ]);
+    expect(lineage.edges).toEqual([
+      { from: { entityType: "source", id: "source-1" }, to: { entityType: "evidence", id: "evidence-1" } },
+      { from: { entityType: "evidence", id: "evidence-1" }, to: { entityType: "finding", id: "finding-1" } },
+      { from: { entityType: "finding", id: "finding-1" }, to: { entityType: "recommendation", id: "recommendation-1" } },
+      { from: { entityType: "recommendation", id: "recommendation-1" }, to: { entityType: "task", id: "task-shared" } },
+      { from: { entityType: "recommendation", id: "recommendation-1" }, to: { entityType: "task", id: "task-dependency-a" } },
+      { from: { entityType: "recommendation", id: "recommendation-1" }, to: { entityType: "task", id: "task-dependency-b" } },
+      { from: { entityType: "recommendation", id: "recommendation-1" }, to: { entityType: "task", id: "task-final" } },
+      { from: { entityType: "task", id: "task-shared" }, to: { entityType: "task", id: "task-dependency-a" } },
+      { from: { entityType: "task", id: "task-shared" }, to: { entityType: "task", id: "task-dependency-b" } },
+      { from: { entityType: "task", id: "task-dependency-a" }, to: { entityType: "task", id: "task-final" } },
+      { from: { entityType: "task", id: "task-dependency-b" }, to: { entityType: "task", id: "task-final" } },
+    ]);
   });
 
   it.each([

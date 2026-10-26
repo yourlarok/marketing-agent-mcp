@@ -298,6 +298,57 @@ describe("MCP server", () => {
         ],
       });
 
+      const dependencyTasks = [
+        { id: "task-shared", dependencyIds: [] },
+        { id: "task-dependency-a", dependencyIds: ["task-shared"] },
+        { id: "task-dependency-b", dependencyIds: ["task-shared"] },
+        { id: "task-final", dependencyIds: ["task-dependency-a", "task-dependency-b"] },
+      ];
+      for (const dependencyTask of dependencyTasks) {
+        const result = await client.callTool({
+          name: "task_create",
+          arguments: {
+            ...dependencyTask,
+            workspaceId: "workspace-1",
+            recommendationIds: ["recommendation-1"],
+            assignee: "lifecycle-marketer",
+            assetRequirements: [],
+            acceptanceCriteria: ["Dependency work is complete"],
+            actor: "agent-1",
+            requestId: `request-${dependencyTask.id}`,
+            idempotencyKey: `command-${dependencyTask.id}`,
+          },
+        });
+        expect(result).not.toMatchObject({ isError: true });
+      }
+      const dependencyLineageResult = await client.callTool({
+        name: "lineage_get",
+        arguments: {
+          entityType: "task",
+          id: "task-final",
+          workspaceId: "workspace-1",
+        },
+      });
+      const dependencyLineage = JSON.parse(
+        (dependencyLineageResult.content[0] as { text: string }).text,
+      );
+      expect(dependencyLineage.nodes).toEqual([
+        expect.objectContaining({ entityType: "source", id: "source-1" }),
+        expect.objectContaining({ entityType: "evidence", id: "evidence-1" }),
+        expect.objectContaining({ entityType: "finding", id: "finding-1" }),
+        expect.objectContaining({ entityType: "recommendation", id: "recommendation-1" }),
+        { entityType: "task", id: "task-shared", version: 1, auditRequestIds: ["request-task-shared"] },
+        { entityType: "task", id: "task-dependency-a", version: 1, auditRequestIds: ["request-task-dependency-a"] },
+        { entityType: "task", id: "task-dependency-b", version: 1, auditRequestIds: ["request-task-dependency-b"] },
+        { entityType: "task", id: "task-final", version: 1, auditRequestIds: ["request-task-final"] },
+      ]);
+      expect(dependencyLineage.edges).toEqual(expect.arrayContaining([
+        { from: { entityType: "task", id: "task-shared" }, to: { entityType: "task", id: "task-dependency-a" } },
+        { from: { entityType: "task", id: "task-shared" }, to: { entityType: "task", id: "task-dependency-b" } },
+        { from: { entityType: "task", id: "task-dependency-a" }, to: { entityType: "task", id: "task-final" } },
+        { from: { entityType: "task", id: "task-dependency-b" }, to: { entityType: "task", id: "task-final" } },
+      ]));
+
       const registeredCapability = await client.callTool({
         name: "capability_register",
         arguments: {
@@ -430,11 +481,147 @@ describe("MCP server", () => {
           evidence: 2,
           findings: 1,
           recommendations: 1,
-          tasks: 1,
+          tasks: 5,
           capabilities: 1,
-          audits: 12,
-          idempotency: 12,
+          audits: 16,
+          idempotency: 16,
         });
+      } finally {
+        raw.close();
+      }
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+      store.close();
+      await removeTempDir(tempDir);
+    }
+  });
+
+  it("returns NOT_FOUND for source and capability registration in a missing workspace without residue", async () => {
+    const tempDir = await createTempDir();
+    const databasePath = join(tempDir, "store.db");
+    const store = openStore(databasePath);
+    const service = new MarketingService(store, new SystemClock(), new SystemIdGenerator());
+    const server = createMcpServer(service);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([
+        client.connect(clientTransport),
+        server.connect(serverTransport),
+      ]);
+      const calls = [
+        {
+          name: "source_register",
+          arguments: {
+            id: "source-missing-workspace",
+            workspaceId: "workspace-missing",
+            name: "Source",
+            type: "manual",
+            ownership: "owned",
+            actor: "agent-1",
+            requestId: "request-missing-source",
+            idempotencyKey: "command-missing-source",
+          },
+        },
+        {
+          name: "capability_register",
+          arguments: {
+            id: "capability-missing-workspace",
+            workspaceId: "workspace-missing",
+            name: "Capability",
+            adapterKind: "api_cli",
+            origin: "user_extension",
+            actor: "agent-1",
+            requestId: "request-missing-capability",
+            idempotencyKey: "command-missing-capability",
+          },
+        },
+      ];
+      for (const call of calls) {
+        const result = await client.callTool(call);
+        expect(result).toMatchObject({ isError: true });
+        expect(JSON.stringify(result)).toContain("Resource not found");
+        expect(JSON.stringify(result)).not.toContain("Internal server error");
+      }
+
+      const raw = new DatabaseSync(databasePath);
+      try {
+        expect(raw.prepare(
+          `SELECT
+            (SELECT COUNT(*) FROM sources) AS sources,
+            (SELECT COUNT(*) FROM capabilities) AS capabilities,
+            (SELECT COUNT(*) FROM audit_records) AS audits,
+            (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
+        ).get()).toEqual({ sources: 0, capabilities: 0, audits: 0, idempotency: 0 });
+      } finally {
+        raw.close();
+      }
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+      store.close();
+      await removeTempDir(tempDir);
+    }
+  });
+
+  it("enforces the 64 KiB UTF-8 limit across complete real tool arguments", async () => {
+    const tempDir = await createTempDir();
+    const databasePath = join(tempDir, "store.db");
+    const store = openStore(databasePath);
+    const service = new MarketingService(store, new SystemClock(), new SystemIdGenerator());
+    const server = createMcpServer(service);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([
+        client.connect(clientTransport),
+        server.connect(serverTransport),
+      ]);
+      const boundaryArguments = {
+        id: "workspace-boundary",
+        name: "Boundary",
+        metadata: { note: "" },
+        actor: "agent-1",
+        requestId: "request-boundary",
+        idempotencyKey: "command-boundary",
+      };
+      const remaining = MAX_SERIALIZED_INPUT_BYTES -
+        Buffer.byteLength(JSON.stringify(boundaryArguments), "utf8");
+      const multibyteLength = Math.floor(remaining / 3);
+      boundaryArguments.metadata.note =
+        "€".repeat(multibyteLength) + "x".repeat(remaining - multibyteLength * 3);
+      expect(Buffer.byteLength(JSON.stringify(boundaryArguments), "utf8")).toBe(65_536);
+
+      const accepted = await client.callTool({
+        name: "workspace_create",
+        arguments: boundaryArguments,
+      });
+      expect(accepted).not.toMatchObject({ isError: true });
+
+      const oversizedArguments = {
+        ...boundaryArguments,
+        id: "workspace-oversized",
+        requestId: "request-oversized",
+        idempotencyKey: "command-oversized",
+        metadata: { ...boundaryArguments.metadata, extra: "€" },
+      };
+      expect(Buffer.byteLength(JSON.stringify(oversizedArguments), "utf8")).toBeGreaterThan(65_536);
+      const rejected = await client.callTool({
+        name: "workspace_create",
+        arguments: oversizedArguments,
+      });
+      expect(rejected).toMatchObject({ isError: true });
+
+      const raw = new DatabaseSync(databasePath);
+      try {
+        expect(raw.prepare(
+          `SELECT
+            (SELECT COUNT(*) FROM workspaces) AS workspaces,
+            (SELECT COUNT(*) FROM audit_records) AS audits,
+            (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
+        ).get()).toEqual({ workspaces: 1, audits: 1, idempotency: 1 });
+        expect(raw.prepare("SELECT id FROM workspaces WHERE id = ?").get("workspace-oversized")).toBeUndefined();
       } finally {
         raw.close();
       }

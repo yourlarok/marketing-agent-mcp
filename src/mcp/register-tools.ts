@@ -14,8 +14,14 @@ import {
   registerCapabilityInputSchema,
   registerDatasetInputSchema,
   registerSourceInputSchema,
+  serializedInputSchema,
   transitionTaskInputSchema,
 } from "./schemas.js";
+
+function validateToolArguments<T>(arguments_: T): T {
+  serializedInputSchema.parse(arguments_);
+  return arguments_;
+}
 
 export function registerTools(server: McpServer, service: MarketingService): void {
   server.registerTool(
@@ -27,7 +33,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          createWorkspaceInputSchema.parse(arguments_);
+          createWorkspaceInputSchema.parse(validateToolArguments(arguments_));
         const workspace = await service.createWorkspace({
           input,
           context: { actor, requestId, idempotencyKey },
@@ -50,7 +56,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          registerSourceInputSchema.parse(arguments_);
+          registerSourceInputSchema.parse(validateToolArguments(arguments_));
         const source = await service.registerSource({
           input,
           context: { actor, requestId, idempotencyKey },
@@ -73,7 +79,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          registerCapabilityInputSchema.parse(arguments_);
+          registerCapabilityInputSchema.parse(validateToolArguments(arguments_));
         const capability = await service.registerCapability({
           input,
           context: { actor, requestId, idempotencyKey },
@@ -96,7 +102,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          recordCapabilityHealthInputSchema.parse(arguments_);
+          recordCapabilityHealthInputSchema.parse(validateToolArguments(arguments_));
         const capability = await service.recordCapabilityHealth({
           input,
           context: { actor, requestId, idempotencyKey },
@@ -118,7 +124,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     },
     async (arguments_) => {
       try {
-        const query = capabilityListInputSchema.parse(arguments_);
+        const query = capabilityListInputSchema.parse(validateToolArguments(arguments_));
         const capabilities = await service.listCapabilities(query);
         return {
           content: [{ type: "text" as const, text: canonicalJson(capabilities) }],
@@ -138,7 +144,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          registerDatasetInputSchema.parse(arguments_);
+          registerDatasetInputSchema.parse(validateToolArguments(arguments_));
         const dataset = await service.registerDataset({
           input,
           context: { actor, requestId, idempotencyKey },
@@ -161,7 +167,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          recordEvidenceInputSchema.parse(arguments_);
+          recordEvidenceInputSchema.parse(validateToolArguments(arguments_));
         const evidence = await service.recordEvidence({
           input,
           context: { actor, requestId, idempotencyKey },
@@ -184,7 +190,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          recordFindingInputSchema.parse(arguments_);
+          recordFindingInputSchema.parse(validateToolArguments(arguments_));
         const finding = await service.recordFinding({
           input,
           context: { actor, requestId, idempotencyKey },
@@ -207,7 +213,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          createRecommendationInputSchema.parse(arguments_);
+          createRecommendationInputSchema.parse(validateToolArguments(arguments_));
         const recommendation = await service.createRecommendation({
           input,
           context: { actor, requestId, idempotencyKey },
@@ -230,7 +236,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          createTaskInputSchema.parse(arguments_);
+          createTaskInputSchema.parse(validateToolArguments(arguments_));
         const task = await service.createTask({
           input,
           context: { actor, requestId, idempotencyKey },
@@ -252,7 +258,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     },
     async (arguments_) => {
       try {
-        const query = lineageGetInputSchema.parse(arguments_);
+        const query = lineageGetInputSchema.parse(validateToolArguments(arguments_));
         const lineage = await service.getLineage(query);
         return {
           content: [{ type: "text" as const, text: canonicalJson(lineage) }],
@@ -272,7 +278,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     async (arguments_) => {
       try {
         const { actor, requestId, idempotencyKey, ...input } =
-          transitionTaskInputSchema.parse(arguments_);
+          transitionTaskInputSchema.parse(validateToolArguments(arguments_));
         const task = await service.transitionTask({
           input,
           context: { actor, requestId, idempotencyKey },

@@ -140,6 +140,82 @@ export interface CommandPipeline {
   execute<T, R extends EntityRecord>(operation: WriteOperation<T, R>): Promise<R>;
 }
 
+function assertNonEmptyString(value: unknown, field: string): void {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new DomainError("INVALID_INPUT", `${field} must not be empty`);
+  }
+}
+
+function assertCommandContext(context: CommandContext): void {
+  if (context === null || typeof context !== "object" || Array.isArray(context)) {
+    throw new DomainError("INVALID_INPUT", "Command context is required");
+  }
+  assertNonEmptyString(context.actor, "context.actor");
+  assertNonEmptyString(context.requestId, "context.requestId");
+  assertNonEmptyString(context.idempotencyKey, "context.idempotencyKey");
+}
+
+function assertDenseJson(value: unknown, seen = new Set<object>()): void {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new DomainError("INVALID_INPUT", "Command input must contain finite JSON numbers");
+    }
+    return;
+  }
+  if (typeof value !== "object" || seen.has(value)) {
+    throw new DomainError("INVALID_INPUT", "Command input must contain acyclic JSON values");
+  }
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        if (!Object.hasOwn(value, index)) {
+          throw new DomainError("INVALID_INPUT", "Command input arrays must not be sparse");
+        }
+        assertDenseJson(value[index], seen);
+      }
+      return;
+    }
+    const prototype = Object.getPrototypeOf(value) as object | null;
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new DomainError("INVALID_INPUT", "Command input objects must be plain JSON objects");
+    }
+    for (const entry of Object.values(value)) {
+      assertDenseJson(entry, seen);
+    }
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function assertCommonCommandInput(action: string, input: unknown): void {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    throw new DomainError("INVALID_INPUT", "Command input must be an object");
+  }
+  const record = input as Record<string, unknown>;
+  assertNonEmptyString(record.id, "id");
+  if (action !== "workspace.create") {
+    assertNonEmptyString(record.workspaceId, "workspaceId");
+  }
+  if (
+    ["workspace.create", "source.register", "dataset.register", "capability.register"]
+      .includes(action)
+  ) {
+    assertNonEmptyString(record.name, "name");
+  }
+  if (Object.hasOwn(record, "sourceId")) {
+    assertNonEmptyString(record.sourceId, "sourceId");
+  }
+  assertDenseJson(input);
+}
+
 function rejectSecretLikeInput(): never {
   throw new DomainError(
     "INVALID_INPUT",
@@ -229,6 +305,8 @@ export class AuditableCommandPipeline implements CommandPipeline {
   ) {}
 
   async execute<T, R extends EntityRecord>(operation: WriteOperation<T, R>): Promise<R> {
+    assertCommandContext(operation.context);
+    assertCommonCommandInput(operation.action, operation.input);
     assertNoSecretLikeFields(operation.input);
     const canonicalInput = canonicalJson({
       action: operation.action,

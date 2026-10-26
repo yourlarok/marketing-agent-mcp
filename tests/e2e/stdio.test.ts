@@ -200,6 +200,28 @@ describe("built stdio server acceptance", () => {
       ),
     ).toMatchObject({ id: "recommendation-e2e" });
 
+    const dependencyTasks = [
+      { id: "task-shared-e2e", dependencyIds: [] },
+      { id: "task-dependency-a-e2e", dependencyIds: ["task-shared-e2e"] },
+      { id: "task-dependency-b-e2e", dependencyIds: ["task-shared-e2e"] },
+    ];
+    for (const dependencyTask of dependencyTasks) {
+      expect(payload(await client.callTool({
+        name: "task_create",
+        arguments: {
+          ...dependencyTask,
+          workspaceId: "workspace-e2e",
+          recommendationIds: ["recommendation-e2e"],
+          assignee: "lifecycle-marketer",
+          assetRequirements: [],
+          acceptanceCriteria: ["Dependency work is complete"],
+          actor: "acceptance-agent",
+          requestId: `request-${dependencyTask.id}`,
+          idempotencyKey: `command-${dependencyTask.id}`,
+        },
+      }))).toMatchObject({ id: dependencyTask.id, state: "draft" });
+    }
+
     expect(
       payload(
         await client.callTool({
@@ -209,7 +231,7 @@ describe("built stdio server acceptance", () => {
             workspaceId: "workspace-e2e",
             recommendationIds: ["recommendation-e2e"],
             assignee: "lifecycle-marketer",
-            dependencyIds: [],
+            dependencyIds: ["task-dependency-a-e2e", "task-dependency-b-e2e"],
             assetRequirements: ["approved review template"],
             acceptanceCriteria: ["The observation has a documented decision"],
             actor: "acceptance-agent",
@@ -238,6 +260,9 @@ describe("built stdio server acceptance", () => {
         { entityType: "evidence", id: "evidence-e2e" },
         { entityType: "finding", id: "finding-e2e" },
         { entityType: "recommendation", id: "recommendation-e2e" },
+        { entityType: "task", id: "task-shared-e2e", auditRequestIds: ["request-task-shared-e2e"] },
+        { entityType: "task", id: "task-dependency-a-e2e", auditRequestIds: ["request-task-dependency-a-e2e"] },
+        { entityType: "task", id: "task-dependency-b-e2e", auditRequestIds: ["request-task-dependency-b-e2e"] },
         { entityType: "task", id: "task-e2e" },
       ],
     });
@@ -350,6 +375,9 @@ describe("built stdio server acceptance", () => {
         { entityType: "evidence", id: "evidence-e2e" },
         { entityType: "finding", id: "finding-e2e" },
         { entityType: "recommendation", id: "recommendation-e2e" },
+        { entityType: "task", id: "task-shared-e2e", auditRequestIds: ["request-task-shared-e2e"] },
+        { entityType: "task", id: "task-dependency-a-e2e", auditRequestIds: ["request-task-dependency-a-e2e"] },
+        { entityType: "task", id: "task-dependency-b-e2e", auditRequestIds: ["request-task-dependency-b-e2e"] },
         { entityType: "task", id: "task-e2e" },
       ],
     });
@@ -369,6 +397,56 @@ describe("built stdio server acceptance", () => {
         arguments: workspaceArguments,
       }),
     ).toEqual(workspace);
+  }, 30_000);
+
+  it("enforces the complete-argument UTF-8 boundary over stdio without persistence", async () => {
+    const { client } = await startClient(dataDir);
+    clients.push(client);
+    const boundaryArguments = {
+      id: "workspace-stdio-boundary",
+      name: "Stdio boundary",
+      metadata: { note: "" },
+      actor: "acceptance-agent",
+      requestId: "request-stdio-boundary",
+      idempotencyKey: "command-stdio-boundary",
+    };
+    const remaining = 65_536 - Buffer.byteLength(JSON.stringify(boundaryArguments), "utf8");
+    const multibyteLength = Math.floor(remaining / 3);
+    boundaryArguments.metadata.note =
+      "€".repeat(multibyteLength) + "x".repeat(remaining - multibyteLength * 3);
+    expect(Buffer.byteLength(JSON.stringify(boundaryArguments), "utf8")).toBe(65_536);
+    expect(payload(await client.callTool({
+      name: "workspace_create",
+      arguments: boundaryArguments,
+    }))).toMatchObject({ id: "workspace-stdio-boundary" });
+
+    const oversizedArguments = {
+      ...boundaryArguments,
+      id: "workspace-stdio-oversized",
+      requestId: "request-stdio-oversized",
+      idempotencyKey: "command-stdio-oversized",
+      metadata: { ...boundaryArguments.metadata, extra: "€" },
+    };
+    expect(Buffer.byteLength(JSON.stringify(oversizedArguments), "utf8")).toBeGreaterThan(65_536);
+    const rejected = await client.callTool({
+      name: "workspace_create",
+      arguments: oversizedArguments,
+    });
+    expect(rejected).toMatchObject({ isError: true });
+
+    const { DatabaseSync } = await import("node:sqlite");
+    const raw = new DatabaseSync(join(dataDir, "marketing.db"));
+    try {
+      expect(raw.prepare(
+        `SELECT
+          (SELECT COUNT(*) FROM workspaces) AS workspaces,
+          (SELECT COUNT(*) FROM audit_records) AS audits,
+          (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
+      ).get()).toEqual({ workspaces: 1, audits: 1, idempotency: 1 });
+      expect(raw.prepare("SELECT id FROM workspaces WHERE id = ?").get("workspace-stdio-oversized")).toBeUndefined();
+    } finally {
+      raw.close();
+    }
   }, 30_000);
 
   it("reports startup failures on stderr with a nonzero exit and clean stdout", async () => {
