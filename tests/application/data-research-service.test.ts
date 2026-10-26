@@ -70,9 +70,9 @@ function researchSession(id = "session-1"): ResearchSession {
     seeds: ["https://example.com/research"],
     scope: {
       hosts: ["example.com"], pathPrefixes: ["/research"], maxDepth: 2,
-      maxPages: 20, maxDurationMs: 60_000, maxBytes: 25 * 1024 * 1024,
+      maxPages: 20, maxDurationMs: 60_000, maxBytes: 20 * 1024 * 1024,
     },
-    limits: { maxDepth: 2, maxPages: 20, maxDurationMs: 60_000, maxBytes: 25 * 1024 * 1024 },
+    limits: { maxDepth: 2, maxPages: 20, maxDurationMs: 60_000, maxBytes: 20 * 1024 * 1024 },
     expansion: "not_requested",
     state: "ready",
     stopReason: null,
@@ -1490,6 +1490,23 @@ describe("DataResearchService permission-bounded research", () => {
 
     await expect(service.runResearch(command)).resolves.toEqual(result);
     expect(provider.hits).toHaveLength(3);
+  });
+
+  it("accepts the 20 MiB research ceiling and rejects one byte above it before I/O", async () => {
+    const scope = {
+      hosts: ["example.com"], pathPrefixes: ["/research"], maxDepth: 2,
+      maxPages: 10, maxDurationMs: 1_000, maxBytes: 20 * 1024 * 1024,
+    };
+    const accepted = await create("byte-ceiling", { scope });
+    expect(accepted.limits.maxBytes).toBe(20 * 1024 * 1024);
+
+    await expect(create("byte-ceiling-exceeded", {
+      scope: { ...scope, maxBytes: 20 * 1024 * 1024 + 1 },
+    })).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    expect(provider.hits).toEqual([]);
+    await expect(store.transaction((repos) =>
+      repos.researchSessions.get("byte-ceiling-exceeded", "workspace-1")
+    )).resolves.toBeUndefined();
   });
 
   it("lets callers lower page limits but rejects raising configured ceilings before I/O", async () => {

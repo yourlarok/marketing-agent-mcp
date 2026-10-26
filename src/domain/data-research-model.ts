@@ -42,7 +42,7 @@ export const RESEARCH_LIMIT_CEILINGS = {
   maxDepth: 2,
   maxPages: 20,
   maxDurationMs: 60_000,
-  maxBytes: 25 * 1024 * 1024,
+  maxBytes: 20 * 1024 * 1024,
 } as const;
 
 export interface ResearchLimits {

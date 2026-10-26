@@ -550,7 +550,7 @@ describe("content acquisition", () => {
           expansion: true,
           scope: {
             hosts: ["127.0.0.1"], pathPrefixes: ["/research"], maxDepth: 2,
-            maxPages: 2, maxDurationMs: 15_000, maxBytes: 25 * 1024 * 1024,
+            maxPages: 2, maxDurationMs: 15_000, maxBytes: 20 * 1024 * 1024,
           },
         },
         context: { actor: "agent-1", requestId: "request-bounded-create", idempotencyKey: "command-bounded-create" },
