@@ -2,9 +2,16 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
-const migrationPath = fileURLToPath(
-  new URL("../../migrations/001_initial.sql", import.meta.url),
-);
+const migrations = [
+  {
+    version: 1,
+    path: fileURLToPath(new URL("../../migrations/001_initial.sql", import.meta.url)),
+  },
+  {
+    version: 2,
+    path: fileURLToPath(new URL("../../migrations/002_data_research.sql", import.meta.url)),
+  },
+] as const;
 
 function normalizeJson(value: unknown, seen: Set<object>): unknown {
   if (value === null || typeof value === "string" || typeof value === "boolean") {
@@ -58,12 +65,27 @@ export function assertUtcInstant(value: string): void {
 }
 
 export function openDatabase(path: string): DatabaseSync {
-  const migration = readFileSync(migrationPath, "utf8");
   const database = new DatabaseSync(path);
   try {
     database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     database.exec("BEGIN IMMEDIATE");
-    database.exec(migration);
+    const migrationTable = database
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+      .get();
+    const currentVersion = migrationTable
+      ? (database.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get() as { version: number }).version
+      : 0;
+    const programVersion = migrations[migrations.length - 1].version;
+    if (currentVersion > programVersion) {
+      throw new Error(
+        `Database schema version ${currentVersion} is newer than supported version ${programVersion}`,
+      );
+    }
+    for (const migration of migrations) {
+      if (migration.version > currentVersion) {
+        database.exec(readFileSync(migration.path, "utf8"));
+      }
+    }
     database.exec("COMMIT");
     return database;
   } catch (error) {

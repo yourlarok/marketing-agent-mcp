@@ -59,7 +59,7 @@ interface EntityConfig {
   table: string;
   referenceColumn?: "source_id" | "evidence_id";
   referenceKey?: "sourceId" | "evidenceId";
-  references?: ReferenceTable;
+  references?: ReferenceTable | ReferenceTable[];
 }
 
 const entityConfigs: Record<string, EntityConfig> = {
@@ -106,6 +106,57 @@ const entityConfigs: Record<string, EntityConfig> = {
     table: "capabilities",
     referenceColumn: "evidence_id",
     referenceKey: "evidenceId",
+  },
+  dataRequestPlans: { table: "data_request_plans" },
+  ingestionBatches: {
+    table: "ingestion_batches",
+    references: [
+      {
+        table: "ingestion_batch_sources",
+        ownerColumn: "batch_id",
+        targetColumn: "source_id",
+        recordKey: "sourceIds",
+      },
+      {
+        table: "ingestion_batch_datasets",
+        ownerColumn: "batch_id",
+        targetColumn: "dataset_id",
+        recordKey: "datasetIds",
+      },
+      {
+        table: "ingestion_batch_evidence",
+        ownerColumn: "batch_id",
+        targetColumn: "evidence_id",
+        recordKey: "evidenceIds",
+      },
+    ],
+  },
+  researchSessions: {
+    table: "research_sessions",
+    references: {
+      table: "research_session_evidence",
+      ownerColumn: "session_id",
+      targetColumn: "evidence_id",
+      recordKey: "evidenceIds",
+    },
+  },
+  competitors: {
+    table: "competitors",
+    references: {
+      table: "competitor_evidence",
+      ownerColumn: "competitor_id",
+      targetColumn: "evidence_id",
+      recordKey: "evidenceIds",
+    },
+  },
+  competitorDiffs: {
+    table: "competitor_diffs",
+    references: {
+      table: "competitor_diff_findings",
+      ownerColumn: "diff_id",
+      targetColumn: "finding_id",
+      recordKey: "findingIds",
+    },
   },
 };
 
@@ -224,31 +275,35 @@ class SqliteEntityRepository implements EntityRepository {
     return value;
   }
 
-  private insertReferences(record: EntityRecord): void {
+  private referenceTables(): ReferenceTable[] {
     const references = this.config.references;
     if (!references) {
-      return;
+      return [];
     }
-    const ids = record[references.recordKey] ?? [];
-    if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
-      throw new TypeError(`${references.recordKey} must be an array of strings`);
+    return Array.isArray(references) ? references : [references];
+  }
+
+  private insertReferences(record: EntityRecord): void {
+    for (const references of this.referenceTables()) {
+      const ids = record[references.recordKey] ?? [];
+      if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
+        throw new TypeError(`${references.recordKey} must be an array of strings`);
+      }
+      const statement = this.database.prepare(
+        `INSERT INTO ${references.table} (workspace_id, ${references.ownerColumn}, ${references.targetColumn}, position) VALUES (?, ?, ?, ?)`,
+      );
+      ids.forEach((id, position) => {
+        statement.run(record.workspaceId, record.id, id, position);
+      });
     }
-    const statement = this.database.prepare(
-      `INSERT INTO ${references.table} (workspace_id, ${references.ownerColumn}, ${references.targetColumn}, position) VALUES (?, ?, ?, ?)`,
-    );
-    ids.forEach((id, position) => {
-      statement.run(record.workspaceId, record.id, id, position);
-    });
   }
 
   private replaceReferences(record: EntityRecord): void {
-    const references = this.config.references;
-    if (!references) {
-      return;
+    for (const references of this.referenceTables()) {
+      this.database
+        .prepare(`DELETE FROM ${references.table} WHERE ${references.ownerColumn} = ?`)
+        .run(record.id);
     }
-    this.database
-      .prepare(`DELETE FROM ${references.table} WHERE ${references.ownerColumn} = ?`)
-      .run(record.id);
     this.insertReferences(record);
   }
 }
@@ -480,10 +535,10 @@ class SqliteStore implements Store {
   }
 
   private createRepositories(): Repositories {
-    const repository = (name: string): EntityRepository =>
-      name === "tasks"
+    const repository = <T extends EntityRecord>(name: string): EntityRepository<T> =>
+      (name === "tasks"
         ? new SqliteTaskRepository(this.database, entityConfigs[name]!)
-        : new SqliteEntityRepository(this.database, entityConfigs[name]!);
+        : new SqliteEntityRepository(this.database, entityConfigs[name]!)) as unknown as EntityRepository<T>;
     return {
       workspaces: repository("workspaces"),
       sources: repository("sources"),
@@ -492,6 +547,11 @@ class SqliteStore implements Store {
       findings: repository("findings"),
       recommendations: repository("recommendations"),
       tasks: repository("tasks"),
+      dataRequestPlans: repository("dataRequestPlans"),
+      ingestionBatches: repository("ingestionBatches"),
+      researchSessions: repository("researchSessions"),
+      competitors: repository("competitors"),
+      competitorDiffs: repository("competitorDiffs"),
       capabilities: new SqliteCapabilityRepository(
         this.database,
         entityConfigs.capabilities!,

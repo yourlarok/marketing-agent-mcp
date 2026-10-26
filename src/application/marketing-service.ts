@@ -68,6 +68,11 @@ const lineageEntityTypes: Record<LineageEntityType, keyof Repositories> = {
   finding: "findings",
   recommendation: "recommendations",
   task: "tasks",
+  data_request_plan: "dataRequestPlans",
+  ingestion_batch: "ingestionBatches",
+  research_session: "researchSessions",
+  competitor: "competitors",
+  competitor_diff: "competitorDiffs",
 };
 
 function lineageReferences(record: EntityRecord, entityType: LineageEntityType): EntityRef[] {
@@ -80,23 +85,33 @@ function lineageReferences(record: EntityRecord, entityType: LineageEntityType):
     }
     return [{ entityType: "source", id: record.sourceId }];
   }
-  const reference = {
-    finding: ["evidenceIds", "evidence"],
-    recommendation: ["findingIds", "finding"],
-    task: ["recommendationIds", "recommendation"],
-  } as const;
-  if (entityType === "source") {
+  if (entityType === "source" || entityType === "data_request_plan") {
     return [];
   }
-  const [key, referencedType] = reference[entityType];
-  const ids = record[key];
-  if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
-    throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {
-      entityType,
-      id: record.id,
-    });
+  const reference = {
+    finding: [["evidenceIds", "evidence"]],
+    recommendation: [["findingIds", "finding"]],
+    task: [["recommendationIds", "recommendation"]],
+    ingestion_batch: [
+      ["sourceIds", "source"],
+      ["datasetIds", "dataset"],
+      ["evidenceIds", "evidence"],
+    ],
+    research_session: [["evidenceIds", "evidence"]],
+    competitor: [["evidenceIds", "evidence"]],
+    competitor_diff: [["findingIds", "finding"]],
+  } as const;
+  const references: EntityRef[] = [];
+  for (const [key, referencedType] of reference[entityType]) {
+    const ids = record[key];
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
+      throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {
+        entityType,
+        id: record.id,
+      });
+    }
+    references.push(...ids.map((id) => ({ entityType: referencedType, id })));
   }
-  const references: EntityRef[] = ids.map((id) => ({ entityType: referencedType, id }));
   if (entityType === "task") {
     const dependencyIds = record.dependencyIds;
     if (

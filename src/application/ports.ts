@@ -1,3 +1,11 @@
+import type {
+  Competitor,
+  CompetitorDiff,
+  DataRequestPlan,
+  IngestionBatch,
+  ResearchSession,
+} from "../domain/data-research-model.js";
+
 export type Id = string;
 export type Instant = string;
 
@@ -46,7 +54,12 @@ export type LineageEntityType =
   | "evidence"
   | "finding"
   | "recommendation"
-  | "task";
+  | "task"
+  | "data_request_plan"
+  | "ingestion_batch"
+  | "research_session"
+  | "competitor"
+  | "competitor_diff";
 
 export interface EntityRef {
   entityType: LineageEntityType;
@@ -100,6 +113,11 @@ export interface Repositories {
   findings: EntityRepository;
   recommendations: EntityRepository;
   tasks: EntityRepository;
+  dataRequestPlans: EntityRepository<DataRequestPlan>;
+  ingestionBatches: EntityRepository<IngestionBatch>;
+  researchSessions: EntityRepository<ResearchSession>;
+  competitors: EntityRepository<Competitor>;
+  competitorDiffs: EntityRepository<CompetitorDiff>;
   capabilities: CapabilityRepository;
   audit: AuditRepository;
   idempotency: IdempotencyRepository;
