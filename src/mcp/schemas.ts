@@ -6,6 +6,7 @@ export const MAX_KEY_LENGTH = 128;
 export const MAX_ID_LENGTH = 256;
 
 const secretKeyNames = [
+  "accesskey",
   "apikey",
   "authorization",
   "cookie",
@@ -15,6 +16,8 @@ const secretKeyNames = [
   "passwd",
   "privatekey",
   "secret",
+  "secretaccesskey",
+  "secretkey",
   "secrets",
   "token",
 ] as const;
@@ -29,7 +32,7 @@ export type JsonValue =
 
 export type SerializedInput = Record<string, JsonValue>;
 
-function isSecretLikeKey(key: string): boolean {
+export function isSecretLikeKey(key: string): boolean {
   const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
   return secretKeyNames.some(
     (secretName) =>
@@ -79,11 +82,29 @@ export const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   ]),
 );
 
-export const serializedInputSchema = z
+const serializedInputRecordSchema = z
   .record(z.string().max(MAX_KEY_LENGTH), jsonValueSchema)
-  .superRefine(checkObjectKeys)
+  .superRefine(checkObjectKeys);
+
+export const serializedInputSchema = z
+  .unknown()
   .superRefine((value, context) => {
-    if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_SERIALIZED_INPUT_BYTES) {
+    let serialized: string | undefined;
+    try {
+      serialized = JSON.stringify(value) as string | undefined;
+    } catch {
+      context.addIssue({
+        code: "custom",
+        message: "Tool input must be serializable JSON",
+        input: value,
+      });
+      return;
+    }
+
+    if (
+      serialized !== undefined &&
+      Buffer.byteLength(serialized, "utf8") > MAX_SERIALIZED_INPUT_BYTES
+    ) {
       context.addIssue({
         code: "too_big",
         maximum: MAX_SERIALIZED_INPUT_BYTES,
@@ -93,7 +114,8 @@ export const serializedInputSchema = z
         input: value,
       });
     }
-  });
+  })
+  .pipe(serializedInputRecordSchema);
 
 export const idSchema = z.string().trim().min(1).max(MAX_ID_LENGTH);
 export const utcTimestampSchema = z.iso.datetime();

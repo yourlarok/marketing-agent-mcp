@@ -1,28 +1,30 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import {
   DomainError,
+  type DomainErrorCode,
   type SafeErrorDetails,
   type SafeDetailValue,
 } from "../domain/errors.js";
+import { isSecretLikeKey } from "./schemas.js";
 
-const internalErrorMessage = "Internal server error";
-const secretKeyPattern =
-  /(?:^|[^a-z0-9])(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|credentials?|pass(?:wd|word)|private[_-]?key|secrets?|token)(?:$|[^a-z0-9])/i;
+const safeMessages = {
+  INVALID_INPUT: "Invalid input",
+  NOT_FOUND: "Resource not found",
+  CONFLICT: "Resource conflict",
+  IDEMPOTENCY_CONFLICT: "Idempotency conflict",
+  CAPABILITY_UNAVAILABLE: "Capability unavailable",
+  INTERNAL_ERROR: "Internal server error",
+} satisfies Record<DomainErrorCode, string>;
 
-function safeDetails(details: SafeErrorDetails | undefined): SafeErrorDetails | undefined {
+function safeDetails(
+  details: SafeErrorDetails | undefined,
+): SafeErrorDetails | undefined {
   if (!details) return undefined;
 
   const safeEntries: [string, SafeDetailValue][] = [];
   for (const [key, value] of Object.entries(details)) {
-    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const secretLike =
-      secretKeyPattern.test(key) ||
-      /(?:apikey|accesstoken|refreshtoken|authorization|cookie|credentials?|passwd|password|privatekey|secrets?|token)$/.test(
-        normalizedKey,
-      );
-
     if (
-      !secretLike &&
+      !isSecretLikeKey(key) &&
       (value === null ||
         typeof value === "boolean" ||
         (typeof value === "number" && Number.isFinite(value)) ||
@@ -37,17 +39,21 @@ function safeDetails(details: SafeErrorDetails | undefined): SafeErrorDetails | 
 
 export function toMcpError(error: unknown): McpError {
   if (!(error instanceof DomainError) || error.code === "INTERNAL_ERROR") {
-    return new McpError(ErrorCode.InternalError, internalErrorMessage, {
-      code: "INTERNAL_ERROR",
-      retryable: false,
-    });
+    return new McpError(
+      ErrorCode.InternalError,
+      safeMessages.INTERNAL_ERROR,
+      {
+        code: "INTERNAL_ERROR",
+        retryable: false,
+      },
+    );
   }
 
   return new McpError(
     error.code === "INVALID_INPUT"
       ? ErrorCode.InvalidParams
       : ErrorCode.InternalError,
-    error.message,
+    safeMessages[error.code],
     {
       code: error.code,
       retryable: error.retryable,
