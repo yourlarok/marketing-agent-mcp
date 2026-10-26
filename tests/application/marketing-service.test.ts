@@ -1006,3 +1006,312 @@ describe("MarketingService command pipeline", () => {
     expect(persisted.idempotency?.response).toEqual(finding);
   });
 });
+
+describe("MarketingService recommendations and tasks", () => {
+  let store: Store;
+  let clock: TestClock;
+  let ids: TestIds;
+  let service: MarketingService;
+  let commandSequence: number;
+
+  beforeEach(async () => {
+    store = openStore(":memory:");
+    clock = new TestClock();
+    ids = new TestIds(Array.from({ length: 100 }, (_, index) => `audit-${index + 1}`));
+    service = new MarketingService(store, clock, ids);
+    commandSequence = 0;
+    await service.createWorkspace({
+      input: workspaceInput(),
+      context: nextContext(),
+    });
+    await service.registerSource({
+      input: {
+        id: "source-1",
+        workspaceId: "workspace-1",
+        name: "Warehouse",
+        type: "database",
+        ownership: "owned",
+      },
+      context: nextContext(),
+    });
+    await service.recordEvidence({
+      input: evidenceInput(),
+      context: nextContext(),
+    });
+    await service.recordFinding({
+      input: {
+        id: "finding-1",
+        workspaceId: "workspace-1",
+        kind: "fact",
+        statement: "January revenue reconciled to the ledger",
+        evidenceIds: ["evidence-1"],
+      },
+      context: nextContext(),
+    });
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  function nextContext(): CommandContext {
+    commandSequence += 1;
+    return {
+      actor: "agent-1",
+      requestId: `task-request-${commandSequence}`,
+      idempotencyKey: `task-command-${commandSequence}`,
+    };
+  }
+
+  function recommendationInput() {
+    return {
+      id: "recommendation-1",
+      workspaceId: "workspace-1",
+      findingIds: ["finding-1"],
+      hypothesis: "A repeat-customer campaign will increase retained revenue",
+      affectedStage: "retention",
+      priority: "high",
+      expectedMetric: "repeat_customer_revenue",
+    };
+  }
+
+  function taskInput() {
+    return {
+      id: "task-1",
+      workspaceId: "workspace-1",
+      recommendationIds: ["recommendation-1"],
+      assignee: "lifecycle-marketer",
+      dependencyIds: [] as string[],
+      assetRequirements: ["approved email template"],
+      acceptanceCriteria: ["Campaign is approved and scheduled"],
+    };
+  }
+
+  async function createRecommendation(id = "recommendation-1") {
+    return service.createRecommendation({
+      input: { ...recommendationInput(), id },
+      context: nextContext(),
+    });
+  }
+
+  async function createTask(
+    id: string,
+    dependencyIds: string[] = [],
+    recommendationIds = ["recommendation-1"],
+  ) {
+    return service.createTask({
+      input: {
+        ...taskInput(),
+        id,
+        dependencyIds,
+        recommendationIds,
+      },
+      context: nextContext(),
+    });
+  }
+
+  it("creates a recommendation and an auditable draft task", async () => {
+    const recommendation = await createRecommendation();
+    expect(recommendation).toEqual({
+      ...recommendationInput(),
+      version: 1,
+      createdAt: firstNow,
+      updatedAt: firstNow,
+    });
+
+    const task = await createTask("task-1");
+    expect(task).toEqual({
+      ...taskInput(),
+      state: "draft",
+      version: 1,
+      createdAt: firstNow,
+      updatedAt: firstNow,
+    });
+    expect(
+      await store.transaction((repos) =>
+        repos.audit.get("audit-6", "workspace-1"),
+      ),
+    ).toMatchObject({
+      action: "task.create",
+      entityType: "task",
+      entityId: "task-1",
+    });
+  });
+
+  it.each([{ acceptanceCriteria: [] }, { acceptanceCriteria: [" \t\n"] }])(
+    "rejects empty acceptance criteria $acceptanceCriteria without task residue",
+    async ({ acceptanceCriteria }) => {
+      await createRecommendation();
+
+      await expect(
+        service.createTask({
+          input: { ...taskInput(), acceptanceCriteria },
+          context: nextContext(),
+        }),
+      ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+      expect(
+        await store.transaction((repos) => repos.tasks.get("task-1", "workspace-1")),
+      ).toBeUndefined();
+    },
+  );
+
+  it("rejects a recommendation with a nonexistent finding", async () => {
+    await expect(
+      service.createRecommendation({
+        input: { ...recommendationInput(), findingIds: ["finding-missing"] },
+        context: nextContext(),
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+  });
+
+  it("rejects a recommendation that resolves a finding only in another workspace", async () => {
+    await service.createWorkspace({
+      input: { id: "workspace-2", name: "Contoso" },
+      context: nextContext(),
+    });
+    await service.registerSource({
+      input: {
+        id: "source-other",
+        workspaceId: "workspace-2",
+        name: "Other warehouse",
+        type: "database",
+        ownership: "owned",
+      },
+      context: nextContext(),
+    });
+    await service.recordEvidence({
+      input: {
+        ...evidenceInput(),
+        id: "evidence-other",
+        workspaceId: "workspace-2",
+        sourceId: "source-other",
+      },
+      context: nextContext(),
+    });
+    await service.recordFinding({
+      input: {
+        id: "finding-other",
+        workspaceId: "workspace-2",
+        kind: "fact",
+        statement: "An observation private to another workspace",
+        evidenceIds: ["evidence-other"],
+      },
+      context: nextContext(),
+    });
+
+    await expect(
+      service.createRecommendation({
+        input: { ...recommendationInput(), findingIds: ["finding-other"] },
+        context: nextContext(),
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    expect(
+      await store.transaction((repos) =>
+        repos.recommendations.get("recommendation-1", "workspace-1"),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("rejects a self-dependency before persistence", async () => {
+    await createRecommendation();
+
+    await expect(
+      createTask("task-1", ["task-1"]),
+    ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    expect(
+      await store.transaction((repos) => repos.tasks.get("task-1", "workspace-1")),
+    ).toBeUndefined();
+  });
+
+  it("rejects dependencies and recommendations outside the workspace", async () => {
+    await createRecommendation();
+    await store.transaction(async (repos) => {
+      await repos.workspaces.insert({
+        id: "workspace-2",
+        workspaceId: "workspace-2",
+        version: 1,
+        createdAt: firstNow,
+        updatedAt: firstNow,
+        name: "Contoso",
+      });
+      await repos.tasks.insert({
+        id: "task-other-workspace",
+        workspaceId: "workspace-2",
+        version: 1,
+        createdAt: firstNow,
+        updatedAt: firstNow,
+        recommendationIds: [],
+        assignee: "other-marketer",
+        dependencyIds: [],
+        assetRequirements: [],
+        acceptanceCriteria: ["Other workspace criterion"],
+        state: "draft",
+      });
+      await repos.recommendations.insert({
+        ...(await repos.recommendations.get("recommendation-1", "workspace-1"))!,
+        id: "recommendation-other",
+        workspaceId: "workspace-2",
+        findingIds: [],
+      });
+    });
+
+    await expect(
+      createTask("task-2", ["task-other-workspace"]),
+    ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    await expect(
+      createTask("task-3", [], ["recommendation-other"]),
+    ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+  });
+
+  it("blocks readiness until every dependency is completed", async () => {
+    await createRecommendation();
+    await createTask("dependency-1");
+    const task = await createTask("task-1", ["dependency-1"]);
+
+    await expect(
+      service.transitionTask({
+        input: { id: task.id, workspaceId: task.workspaceId, next: "ready" },
+        context: nextContext(),
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+
+    for (const next of ["ready", "in_progress", "completed"] as const) {
+      await service.transitionTask({
+        input: { id: "dependency-1", workspaceId: "workspace-1", next },
+        context: nextContext(),
+      });
+    }
+    await service.transitionTask({
+      input: { id: task.id, workspaceId: task.workspaceId, next: "ready" },
+      context: nextContext(),
+    });
+    const started = await service.transitionTask({
+      input: { id: task.id, workspaceId: task.workspaceId, next: "in_progress" },
+      context: nextContext(),
+    });
+    expect(started).toMatchObject({ state: "in_progress", version: 3 });
+  });
+
+  it("updates task state and version through the command pipeline", async () => {
+    await createRecommendation();
+    await createTask("task-1");
+    clock.set(secondNow);
+
+    const ready = await service.transitionTask({
+      input: { id: "task-1", workspaceId: "workspace-1", next: "ready" },
+      context: nextContext(),
+    });
+
+    expect(ready).toMatchObject({
+      state: "ready",
+      version: 2,
+      createdAt: firstNow,
+      updatedAt: secondNow,
+    });
+    expect(
+      await store.transaction((repos) =>
+        repos.audit.get("audit-7", "workspace-1"),
+      ),
+    ).toMatchObject({ action: "task.transition", entityId: "task-1" });
+  });
+});

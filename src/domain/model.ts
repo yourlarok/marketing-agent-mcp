@@ -54,3 +54,29 @@ export interface Finding extends EntityRecord {
   limitations?: string;
   unknownReason?: string;
 }
+
+export interface Recommendation extends EntityRecord {
+  findingIds: string[];
+  hypothesis: string;
+  affectedStage: string;
+  priority: string;
+  expectedMetric: string;
+}
+
+export const TASK_STATES = [
+  "draft",
+  "ready",
+  "in_progress",
+  "blocked",
+  "completed",
+] as const;
+export type TaskState = (typeof TASK_STATES)[number];
+
+export interface Task extends EntityRecord {
+  recommendationIds: string[];
+  assignee: string;
+  dependencyIds: string[];
+  assetRequirements: string[];
+  acceptanceCriteria: string[];
+  state: TaskState;
+}

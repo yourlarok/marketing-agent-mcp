@@ -3,11 +3,14 @@ import type { MarketingService } from "../application/marketing-service.js";
 import { canonicalJson } from "../infrastructure/sqlite.js";
 import { toMcpError } from "./error-mapper.js";
 import {
+  createRecommendationInputSchema,
+  createTaskInputSchema,
   createWorkspaceInputSchema,
   recordEvidenceInputSchema,
   recordFindingInputSchema,
   registerDatasetInputSchema,
   registerSourceInputSchema,
+  transitionTaskInputSchema,
 } from "./schemas.js";
 
 export function registerTools(server: McpServer, service: MarketingService): void {
@@ -119,6 +122,75 @@ export function registerTools(server: McpServer, service: MarketingService): voi
         });
         return {
           content: [{ type: "text" as const, text: canonicalJson(finding) }],
+        };
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "recommendation_create",
+    {
+      description: "Create a finding-backed marketing recommendation",
+      inputSchema: createRecommendationInputSchema.shape,
+    },
+    async (arguments_) => {
+      try {
+        const { actor, requestId, idempotencyKey, ...input } =
+          createRecommendationInputSchema.parse(arguments_);
+        const recommendation = await service.createRecommendation({
+          input,
+          context: { actor, requestId, idempotencyKey },
+        });
+        return {
+          content: [{ type: "text" as const, text: canonicalJson(recommendation) }],
+        };
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "task_create",
+    {
+      description: "Create an executable recommendation-backed draft task",
+      inputSchema: createTaskInputSchema.shape,
+    },
+    async (arguments_) => {
+      try {
+        const { actor, requestId, idempotencyKey, ...input } =
+          createTaskInputSchema.parse(arguments_);
+        const task = await service.createTask({
+          input,
+          context: { actor, requestId, idempotencyKey },
+        });
+        return {
+          content: [{ type: "text" as const, text: canonicalJson(task) }],
+        };
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "task_transition",
+    {
+      description: "Transition a task with state and dependency safety checks",
+      inputSchema: transitionTaskInputSchema.shape,
+    },
+    async (arguments_) => {
+      try {
+        const { actor, requestId, idempotencyKey, ...input } =
+          transitionTaskInputSchema.parse(arguments_);
+        const task = await service.transitionTask({
+          input,
+          context: { actor, requestId, idempotencyKey },
+        });
+        return {
+          content: [{ type: "text" as const, text: canonicalJson(task) }],
         };
       } catch (error) {
         throw toMcpError(error);

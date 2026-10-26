@@ -2,22 +2,32 @@ import { DomainError } from "../domain/errors.js";
 import {
   EVIDENCE_CLASSIFICATIONS,
   FINDING_KINDS,
+  TASK_STATES,
   type Dataset,
   type Evidence,
   type Finding,
+  type Recommendation,
   type Source,
+  type Task,
   type Workspace,
 } from "../domain/model.js";
+import {
+  assertTaskDependencyGraph,
+  assertTaskTransition,
+} from "../domain/task-machine.js";
 import { assertUtcInstant } from "../infrastructure/sqlite.js";
 import {
   AuditableCommandPipeline,
   type Command,
   type CommandPipeline,
+  type CreateRecommendation,
+  type CreateTask,
   type CreateWorkspace,
   type RecordEvidence,
   type RecordFinding,
   type RegisterDataset,
   type RegisterSource,
+  type TransitionTask,
 } from "./commands.js";
 import type {
   Clock,
@@ -50,6 +60,70 @@ function assertUtcInput(value: string, field: string): void {
       `${field} must be a valid UTC ISO-8601 instant`,
     );
   }
+}
+
+function assertNonEmptyString(value: unknown, field: string): void {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new DomainError("INVALID_INPUT", `${field} must not be empty`);
+  }
+}
+
+function assertStringArray(
+  value: unknown,
+  field: string,
+  options: { nonEmpty?: boolean; unique?: boolean } = {},
+): void {
+  if (
+    !Array.isArray(value) ||
+    (options.nonEmpty && value.length === 0) ||
+    value.some((entry) => typeof entry !== "string" || entry.trim().length === 0)
+  ) {
+    throw new DomainError(
+      "INVALID_INPUT",
+      `${field} must be ${options.nonEmpty ? "a non-empty" : "an"} array of non-empty strings`,
+    );
+  }
+  if (options.unique && new Set(value).size !== value.length) {
+    throw new DomainError("INVALID_INPUT", `${field} must not contain duplicates`);
+  }
+}
+
+async function requireTask(
+  repos: Repositories,
+  workspaceId: string,
+  taskId: string,
+): Promise<Task> {
+  const task = await repos.tasks.get(taskId, workspaceId);
+  if (!task) {
+    throw new DomainError("NOT_FOUND", "Task not found in workspace", false, {
+      taskId,
+      workspaceId,
+    });
+  }
+  return task as Task;
+}
+
+async function assertWorkspaceDependencyGraph(
+  repos: Repositories,
+  candidate: Pick<Task, "id" | "workspaceId" | "dependencyIds">,
+): Promise<void> {
+  const nodes = new Map<string, Pick<Task, "id" | "dependencyIds">>([
+    [candidate.id, candidate],
+  ]);
+  const load = async (taskId: string): Promise<void> => {
+    if (nodes.has(taskId)) {
+      return;
+    }
+    const task = await requireTask(repos, candidate.workspaceId, taskId);
+    nodes.set(task.id, task);
+    for (const dependencyId of task.dependencyIds) {
+      await load(dependencyId);
+    }
+  };
+  for (const dependencyId of candidate.dependencyIds) {
+    await load(dependencyId);
+  }
+  assertTaskDependencyGraph(nodes.values());
 }
 
 export class MarketingService {
@@ -298,6 +372,143 @@ export class MarketingService {
             : { unknownReason: input.unknownReason }),
         };
         return repos.findings.insert(finding) as Promise<Finding>;
+      },
+    });
+  }
+
+  createRecommendation(
+    command: Command<CreateRecommendation>,
+  ): Promise<Recommendation> {
+    return this.commands.execute({
+      workspaceId: command.input.workspaceId,
+      action: "recommendation.create",
+      entityType: "recommendation",
+      input: command.input,
+      context: command.context,
+      write: async (repos, input, timestamp) => {
+        assertStringArray(input.findingIds, "findingIds", {
+          nonEmpty: true,
+          unique: true,
+        });
+        assertNonEmptyString(input.hypothesis, "hypothesis");
+        assertNonEmptyString(input.affectedStage, "affectedStage");
+        assertNonEmptyString(input.priority, "priority");
+        assertNonEmptyString(input.expectedMetric, "expectedMetric");
+        for (const findingId of input.findingIds) {
+          const finding = await repos.findings.get(findingId, input.workspaceId);
+          if (!finding) {
+            throw new DomainError(
+              "NOT_FOUND",
+              "Finding not found in workspace",
+              false,
+              { findingId, workspaceId: input.workspaceId },
+            );
+          }
+        }
+        const recommendation: Recommendation = {
+          id: input.id,
+          workspaceId: input.workspaceId,
+          version: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          findingIds: input.findingIds,
+          hypothesis: input.hypothesis,
+          affectedStage: input.affectedStage,
+          priority: input.priority,
+          expectedMetric: input.expectedMetric,
+        };
+        return repos.recommendations.insert(
+          recommendation,
+        ) as Promise<Recommendation>;
+      },
+    });
+  }
+
+  createTask(command: Command<CreateTask>): Promise<Task> {
+    return this.commands.execute({
+      workspaceId: command.input.workspaceId,
+      action: "task.create",
+      entityType: "task",
+      input: command.input,
+      context: command.context,
+      write: async (repos, input, timestamp) => {
+        assertStringArray(input.recommendationIds, "recommendationIds", {
+          nonEmpty: true,
+          unique: true,
+        });
+        assertNonEmptyString(input.assignee, "assignee");
+        assertStringArray(input.dependencyIds, "dependencyIds", { unique: true });
+        assertStringArray(input.assetRequirements, "assetRequirements");
+        assertStringArray(input.acceptanceCriteria, "acceptanceCriteria", {
+          nonEmpty: true,
+        });
+        for (const recommendationId of input.recommendationIds) {
+          const recommendation = await repos.recommendations.get(
+            recommendationId,
+            input.workspaceId,
+          );
+          if (!recommendation) {
+            throw new DomainError(
+              "NOT_FOUND",
+              "Recommendation not found in workspace",
+              false,
+              { recommendationId, workspaceId: input.workspaceId },
+            );
+          }
+        }
+        const task: Task = {
+          id: input.id,
+          workspaceId: input.workspaceId,
+          version: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          recommendationIds: input.recommendationIds,
+          assignee: input.assignee,
+          dependencyIds: input.dependencyIds,
+          assetRequirements: input.assetRequirements,
+          acceptanceCriteria: input.acceptanceCriteria,
+          state: "draft",
+        };
+        await assertWorkspaceDependencyGraph(repos, task);
+        return repos.tasks.insert(task) as Promise<Task>;
+      },
+    });
+  }
+
+  transitionTask(command: Command<TransitionTask>): Promise<Task> {
+    return this.commands.execute({
+      workspaceId: command.input.workspaceId,
+      action: "task.transition",
+      entityType: "task",
+      input: command.input,
+      context: command.context,
+      write: async (repos, input, timestamp) => {
+        if (!(TASK_STATES as readonly string[]).includes(input.next)) {
+          throw new DomainError("INVALID_INPUT", "next must be a supported task state");
+        }
+        const task = await requireTask(repos, input.workspaceId, input.id);
+        assertTaskTransition(task.state, input.next);
+        if (input.next === "ready" || input.next === "in_progress") {
+          for (const dependencyId of task.dependencyIds) {
+            const dependency = await requireTask(
+              repos,
+              input.workspaceId,
+              dependencyId,
+            );
+            if (dependency.state !== "completed") {
+              throw new DomainError(
+                "CONFLICT",
+                "Task dependencies must be completed before it is ready",
+                false,
+                { taskId: task.id, dependencyId },
+              );
+            }
+          }
+        }
+        return repos.tasks.update(
+          { ...task, state: input.next, updatedAt: timestamp },
+          task.version,
+        ) as Promise<Task>;
       },
     });
   }

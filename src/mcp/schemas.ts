@@ -171,3 +171,42 @@ export const recordFindingInputSchema = z.strictObject({
   unknownReason: z.string().trim().min(1).max(8_192).optional(),
   ...commandContextInput,
 });
+
+const uniqueIdsSchema = z
+  .array(idSchema)
+  .max(MAX_COLLECTION_ENTRIES)
+  .refine((ids) => new Set(ids).size === ids.length, {
+    message: "IDs must not contain duplicates",
+  });
+const textListSchema = z
+  .array(z.string().trim().min(1).max(8_192))
+  .max(MAX_COLLECTION_ENTRIES);
+
+export const createRecommendationInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  findingIds: uniqueIdsSchema.min(1),
+  hypothesis: z.string().trim().min(1).max(8_192),
+  affectedStage: z.string().trim().min(1).max(1_024),
+  priority: z.string().trim().min(1).max(1_024),
+  expectedMetric: z.string().trim().min(1).max(1_024),
+  ...commandContextInput,
+});
+
+export const createTaskInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  recommendationIds: uniqueIdsSchema.min(1),
+  assignee: z.string().trim().min(1).max(1_024),
+  dependencyIds: uniqueIdsSchema,
+  assetRequirements: textListSchema,
+  acceptanceCriteria: textListSchema.min(1),
+  ...commandContextInput,
+});
+
+export const transitionTaskInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  next: z.enum(["draft", "ready", "in_progress", "blocked", "completed"]),
+  ...commandContextInput,
+});

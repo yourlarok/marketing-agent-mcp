@@ -99,7 +99,10 @@ describe("MCP server", () => {
         "dataset_register",
         "evidence_record",
         "finding_record",
+        "recommendation_create",
         "source_register",
+        "task_create",
+        "task_transition",
         "workspace_create",
       ]);
 
@@ -217,6 +220,60 @@ describe("MCP server", () => {
         evidenceIds: ["evidence-1"],
       });
 
+      const recommendation = await client.callTool({
+        name: "recommendation_create",
+        arguments: {
+          id: "recommendation-1",
+          workspaceId: "workspace-1",
+          findingIds: ["finding-1"],
+          hypothesis: "Following up on the observation will improve retention",
+          affectedStage: "retention",
+          priority: "high",
+          expectedMetric: "retained_accounts",
+          actor: "agent-1",
+          requestId: "request-6",
+          idempotencyKey: "command-6",
+        },
+      });
+      expect(
+        JSON.parse((recommendation.content[0] as { text: string }).text),
+      ).toMatchObject({ id: "recommendation-1", findingIds: ["finding-1"] });
+
+      const task = await client.callTool({
+        name: "task_create",
+        arguments: {
+          id: "task-1",
+          workspaceId: "workspace-1",
+          recommendationIds: ["recommendation-1"],
+          assignee: "lifecycle-marketer",
+          dependencyIds: [],
+          assetRequirements: ["approved email template"],
+          acceptanceCriteria: ["Campaign is approved and scheduled"],
+          actor: "agent-1",
+          requestId: "request-7",
+          idempotencyKey: "command-7",
+        },
+      });
+      expect(JSON.parse((task.content[0] as { text: string }).text)).toMatchObject({
+        id: "task-1",
+        state: "draft",
+      });
+
+      const transitioned = await client.callTool({
+        name: "task_transition",
+        arguments: {
+          id: "task-1",
+          workspaceId: "workspace-1",
+          next: "ready",
+          actor: "agent-1",
+          requestId: "request-8",
+          idempotencyKey: "command-8",
+        },
+      });
+      expect(
+        JSON.parse((transitioned.content[0] as { text: string }).text),
+      ).toMatchObject({ id: "task-1", state: "ready", version: 2 });
+
       const raw = new DatabaseSync(databasePath);
       try {
         expect(
@@ -228,6 +285,8 @@ describe("MCP server", () => {
                 (SELECT COUNT(*) FROM datasets) AS datasets,
                 (SELECT COUNT(*) FROM evidence) AS evidence,
                 (SELECT COUNT(*) FROM findings) AS findings,
+                (SELECT COUNT(*) FROM recommendations) AS recommendations,
+                (SELECT COUNT(*) FROM tasks) AS tasks,
                 (SELECT COUNT(*) FROM audit_records) AS audits,
                 (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
             )
@@ -238,8 +297,10 @@ describe("MCP server", () => {
           datasets: 1,
           evidence: 1,
           findings: 1,
-          audits: 5,
-          idempotency: 5,
+          recommendations: 1,
+          tasks: 1,
+          audits: 8,
+          idempotency: 8,
         });
       } finally {
         raw.close();

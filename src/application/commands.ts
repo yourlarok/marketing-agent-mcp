@@ -5,6 +5,7 @@ import type {
   FindingKind,
   SourceOwnership,
   SourceType,
+  TaskState,
 } from "../domain/model.js";
 import { isSecretLikeKey } from "../domain/secrets.js";
 import { canonicalJson } from "../infrastructure/sqlite.js";
@@ -74,6 +75,32 @@ export interface RecordFinding {
   evidenceIds: string[];
   limitations?: string;
   unknownReason?: string;
+}
+
+export interface CreateRecommendation {
+  id: string;
+  workspaceId: string;
+  findingIds: string[];
+  hypothesis: string;
+  affectedStage: string;
+  priority: string;
+  expectedMetric: string;
+}
+
+export interface CreateTask {
+  id: string;
+  workspaceId: string;
+  recommendationIds: string[];
+  assignee: string;
+  dependencyIds: string[];
+  assetRequirements: string[];
+  acceptanceCriteria: string[];
+}
+
+export interface TransitionTask {
+  id: string;
+  workspaceId: string;
+  next: TaskState;
 }
 
 interface WriteOperation<T, R extends EntityRecord> {
