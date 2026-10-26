@@ -456,6 +456,32 @@ describe("MCP server", () => {
         expect.objectContaining({ id: "capability-1", state: "verified" }),
       ]);
 
+      const padding = " ".repeat(MAX_SERIALIZED_INPUT_BYTES);
+      const overflowContext = (suffix: string): Record<string, string> => ({
+        actor: "agent-1",
+        requestId: `request-overflow-${suffix}`,
+        idempotencyKey: `command-overflow-${suffix}`,
+      });
+      const overflowCalls = [
+        ["workspace_create", { id: `${padding}workspace-overflow`, name: "Overflow", ...overflowContext("workspace") }],
+        ["source_register", { id: "source-overflow", workspaceId: `${padding}workspace-1`, name: "Overflow", type: "manual", ownership: "owned", ...overflowContext("source") }],
+        ["capability_register", { id: "capability-overflow", workspaceId: `${padding}workspace-1`, name: "Overflow", adapterKind: "api_cli", origin: "user_extension", ...overflowContext("capability") }],
+        ["capability_health_record", { id: "capability-1", workspaceId: `${padding}workspace-1`, expectedVersion: 3, healthy: false, checkedAt: "2026-10-26T12:31:00.000Z", reason: "Overflow rejected", ...overflowContext("health") }],
+        ["capability_list", { workspaceId: `${padding}workspace-1` }],
+        ["dataset_register", { id: "dataset-overflow", workspaceId: `${padding}workspace-1`, sourceId: "source-1", name: "Overflow", coverageStart: "2026-01-01T00:00:00.000Z", coverageEnd: "2026-01-02T00:00:00.000Z", fieldDefinitions: [], metricDefinitions: [], limitations: [], ...overflowContext("dataset") }],
+        ["evidence_record", { id: "evidence-overflow", workspaceId: `${padding}workspace-1`, sourceId: "source-1", sourceLocator: "overflow", observedAt: "2026-02-01T00:00:00.000Z", summary: "Overflow", contentHash: "d".repeat(64), classification: "owned_operating", ...overflowContext("evidence") }],
+        ["finding_record", { id: "finding-overflow", workspaceId: `${padding}workspace-1`, kind: "fact", statement: "Overflow", evidenceIds: ["evidence-1"], ...overflowContext("finding") }],
+        ["recommendation_create", { id: "recommendation-overflow", workspaceId: `${padding}workspace-1`, findingIds: ["finding-1"], hypothesis: "Overflow", affectedStage: "retention", priority: "high", expectedMetric: "retention", ...overflowContext("recommendation") }],
+        ["task_create", { id: "task-overflow", workspaceId: `${padding}workspace-1`, recommendationIds: ["recommendation-1"], assignee: "agent", dependencyIds: [], assetRequirements: [], acceptanceCriteria: ["Overflow rejected"], ...overflowContext("task") }],
+        ["task_transition", { id: "task-1", workspaceId: `${padding}workspace-1`, next: "in_progress", expectedVersion: 2, ...overflowContext("transition") }],
+        ["lineage_get", { entityType: "task", id: "task-1", workspaceId: `${padding}workspace-1` }],
+      ] as const;
+      for (const [name, arguments_] of overflowCalls) {
+        expect(Buffer.byteLength(JSON.stringify(arguments_), "utf8"), name).toBeGreaterThan(MAX_SERIALIZED_INPUT_BYTES);
+        const result = await client.callTool({ name, arguments: arguments_ });
+        expect(result, name).toMatchObject({ isError: true });
+      }
+
       const raw = new DatabaseSync(databasePath);
       try {
         expect(

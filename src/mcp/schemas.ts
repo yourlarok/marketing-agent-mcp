@@ -446,3 +446,188 @@ export const evidenceAssetGetInputSchema = z.strictObject({
   evidenceId: idSchema,
   assetId: idSchema,
 });
+
+const rawIdSchema = z.string().min(1).max(MAX_ID_LENGTH);
+const rawTextSchema = (maximum: number) => z.string().min(1).max(maximum);
+const rawCommandContextInput = {
+  actor: rawIdSchema,
+  requestId: rawIdSchema,
+  idempotencyKey: rawIdSchema,
+};
+const rawUniqueIdsSchema = z
+  .array(rawIdSchema)
+  .max(MAX_COLLECTION_ENTRIES)
+  .refine((ids) => new Set(ids).size === ids.length, {
+    message: "IDs must not contain duplicates",
+  });
+const rawTextListSchema = z
+  .array(rawTextSchema(8_192))
+  .max(MAX_COLLECTION_ENTRIES);
+
+export const createWorkspaceToolSchema = createWorkspaceInputSchema.extend({
+  id: rawIdSchema,
+  name: rawTextSchema(1_024),
+  ...rawCommandContextInput,
+});
+export const registerSourceToolSchema = registerSourceInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  name: rawTextSchema(1_024),
+  ...rawCommandContextInput,
+});
+export const registerCapabilityToolSchema = registerCapabilityInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  name: rawTextSchema(1_024),
+  ...rawCommandContextInput,
+});
+export const recordCapabilityHealthToolSchema = recordCapabilityHealthInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  toolVersion: rawTextSchema(1_024).optional(),
+  evidenceId: rawIdSchema.optional(),
+  reason: rawTextSchema(8_192).optional(),
+  ...rawCommandContextInput,
+});
+export const capabilityListToolSchema = capabilityListInputSchema.extend({
+  workspaceId: rawIdSchema,
+});
+export const registerDatasetToolSchema = registerDatasetInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  sourceId: rawIdSchema,
+  name: rawTextSchema(1_024),
+  ...rawCommandContextInput,
+});
+export const recordEvidenceToolSchema = recordEvidenceInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  sourceId: rawIdSchema,
+  sourceLocator: rawTextSchema(4_096),
+  summary: rawTextSchema(8_192),
+  toolHealth: z.strictObject({
+    purpose: z.literal("tool_health"),
+    capabilityId: rawIdSchema,
+    healthy: z.boolean(),
+    checkedAt: utcTimestampSchema,
+    toolVersion: rawTextSchema(1_024),
+  }).optional(),
+  ...rawCommandContextInput,
+});
+export const recordFindingToolSchema = recordFindingInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  statement: rawTextSchema(8_192),
+  evidenceIds: rawUniqueIdsSchema,
+  limitations: rawTextSchema(8_192).optional(),
+  unknownReason: rawTextSchema(8_192).optional(),
+  ...rawCommandContextInput,
+});
+export const createRecommendationToolSchema = createRecommendationInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  findingIds: rawUniqueIdsSchema.min(1),
+  hypothesis: rawTextSchema(8_192),
+  affectedStage: rawTextSchema(1_024),
+  priority: rawTextSchema(1_024),
+  expectedMetric: rawTextSchema(1_024),
+  ...rawCommandContextInput,
+});
+export const createTaskToolSchema = createTaskInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  recommendationIds: rawUniqueIdsSchema.min(1),
+  assignee: rawTextSchema(1_024),
+  dependencyIds: rawUniqueIdsSchema,
+  assetRequirements: rawTextListSchema,
+  acceptanceCriteria: rawTextListSchema.min(1),
+  ...rawCommandContextInput,
+});
+export const transitionTaskToolSchema = transitionTaskInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  ...rawCommandContextInput,
+});
+export const lineageGetToolSchema = lineageGetInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+});
+export const dataRequestPlanToolSchema = dataRequestPlanInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  objective: rawTextSchema(MAX_SERIALIZED_INPUT_BYTES),
+  availableFields: rawTextListSchema,
+  ...rawCommandContextInput,
+});
+export const dataRequestDeclineToolSchema = dataRequestDeclineInputSchema.extend({
+  planId: rawIdSchema,
+  workspaceId: rawIdSchema,
+  reason: rawTextSchema(8_192),
+  ...rawCommandContextInput,
+});
+export const ingestFilesToolSchema = ingestFilesInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  paths: z.array(rawTextSchema(8_192)).min(1).max(100),
+  planId: rawIdSchema.optional(),
+  ...rawCommandContextInput,
+});
+export const ingestTemporaryApiToolSchema = ingestTemporaryApiInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  url: rawTextSchema(4_096),
+  credentialRef: rawTextSchema(1_024).optional(),
+  planId: rawIdSchema.optional(),
+  ...rawCommandContextInput,
+});
+export const ingestContentLinksToolSchema = ingestContentLinksInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  links: z.array(z.strictObject({
+    url: rawTextSchema(4_096),
+    fields: z.record(z.string().max(MAX_KEY_LENGTH), z.string().min(1).max(1_000)).optional(),
+  })).min(1).max(100),
+  ...rawCommandContextInput,
+});
+export const researchSessionCreateToolSchema = researchSessionCreateInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  goal: rawTextSchema(8_192),
+  seeds: z.array(rawTextSchema(4_096)).min(1).max(100),
+  scope: researchLimitsSchema.extend({
+    hosts: z.array(rawTextSchema(1_024)).min(1).max(100),
+    pathPrefixes: z.array(rawTextSchema(4_096)).min(1).max(100),
+  }),
+  ...rawCommandContextInput,
+});
+export const researchPermissionSetToolSchema = researchPermissionSetInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  ...rawCommandContextInput,
+});
+export const researchSessionRunToolSchema = researchSessionRunInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  ...rawCommandContextInput,
+});
+export const competitorConfirmToolSchema = competitorConfirmInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  ...rawCommandContextInput,
+});
+export const competitorDiffCreateToolSchema = competitorDiffCreateInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+  competitorIds: z.tuple([rawIdSchema, rawIdSchema]),
+  dimensions: rawTextListSchema.min(1),
+  ...rawCommandContextInput,
+});
+export const dataResearchGetToolSchema = dataResearchGetInputSchema.extend({
+  id: rawIdSchema,
+  workspaceId: rawIdSchema,
+});
+export const evidenceAssetGetToolSchema = evidenceAssetGetInputSchema.extend({
+  workspaceId: rawIdSchema,
+  evidenceId: rawIdSchema,
+  assetId: rawIdSchema,
+});

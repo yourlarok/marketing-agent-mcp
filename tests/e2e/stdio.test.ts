@@ -71,11 +71,23 @@ describe("built stdio server acceptance", () => {
       "capability_health_record",
       "capability_list",
       "capability_register",
+      "competitor_confirm",
+      "competitor_diff_create",
+      "data_request_decline",
+      "data_request_plan",
+      "data_research_get",
       "dataset_register",
+      "evidence_asset_get",
       "evidence_record",
       "finding_record",
+      "ingest_content_links",
+      "ingest_files",
+      "ingest_temporary_api",
       "lineage_get",
       "recommendation_create",
+      "research_permission_set",
+      "research_session_create",
+      "research_session_run",
       "source_register",
       "task_create",
       "task_transition",
@@ -351,7 +363,7 @@ describe("built stdio server acceptance", () => {
     expect(malformed).toMatchObject({ isError: true });
     expect(JSON.stringify(malformed)).toContain("Input validation error");
     expect(JSON.stringify(malformed)).not.toContain("stack");
-    expect((await client.listTools()).tools).toHaveLength(12);
+    expect((await client.listTools()).tools).toHaveLength(24);
 
     await firstProcess.client.close();
     clients.splice(clients.indexOf(firstProcess.client), 1);

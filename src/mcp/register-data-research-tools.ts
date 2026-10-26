@@ -6,17 +6,29 @@ import { toMcpError } from "./error-mapper.js";
 import { validateToolArguments } from "./register-tools.js";
 import {
   competitorConfirmInputSchema,
+  competitorConfirmToolSchema,
   competitorDiffCreateInputSchema,
+  competitorDiffCreateToolSchema,
   dataRequestDeclineInputSchema,
+  dataRequestDeclineToolSchema,
   dataRequestPlanInputSchema,
+  dataRequestPlanToolSchema,
   dataResearchGetInputSchema,
+  dataResearchGetToolSchema,
   evidenceAssetGetInputSchema,
+  evidenceAssetGetToolSchema,
   ingestContentLinksInputSchema,
+  ingestContentLinksToolSchema,
   ingestFilesInputSchema,
+  ingestFilesToolSchema,
   ingestTemporaryApiInputSchema,
+  ingestTemporaryApiToolSchema,
   researchPermissionSetInputSchema,
+  researchPermissionSetToolSchema,
   researchSessionCreateInputSchema,
+  researchSessionCreateToolSchema,
   researchSessionRunInputSchema,
+  researchSessionRunToolSchema,
 } from "./schemas.js";
 
 function textResult(value: unknown): {
@@ -34,7 +46,7 @@ export function registerDataResearchTools(
     "data_request_plan",
     {
       description: "Create a deterministic, evidence-aware data request plan",
-      inputSchema: dataRequestPlanInputSchema,
+      inputSchema: dataRequestPlanToolSchema,
     },
     async (arguments_) => {
       try {
@@ -54,7 +66,7 @@ export function registerDataResearchTools(
     "data_request_decline",
     {
       description: "Decline an active data request with an explicit limitation",
-      inputSchema: dataRequestDeclineInputSchema,
+      inputSchema: dataRequestDeclineToolSchema,
     },
     async (arguments_) => {
       try {
@@ -74,7 +86,7 @@ export function registerDataResearchTools(
     "ingest_files",
     {
       description: "Import CSV or XLSX files with quality and provenance records",
-      inputSchema: ingestFilesInputSchema,
+      inputSchema: ingestFilesToolSchema,
     },
     async (arguments_) => {
       try {
@@ -94,7 +106,7 @@ export function registerDataResearchTools(
     "ingest_temporary_api",
     {
       description: "Ingest an authorized expiring API response without accepting credentials",
-      inputSchema: ingestTemporaryApiInputSchema,
+      inputSchema: ingestTemporaryApiToolSchema,
     },
     async (arguments_) => {
       try {
@@ -114,7 +126,7 @@ export function registerDataResearchTools(
     "ingest_content_links",
     {
       description: "Acquire public content links through professional browser tools",
-      inputSchema: ingestContentLinksInputSchema,
+      inputSchema: ingestContentLinksToolSchema,
     },
     async (arguments_) => {
       try {
@@ -134,7 +146,7 @@ export function registerDataResearchTools(
     "research_session_create",
     {
       description: "Create a scope- and budget-bounded public research session",
-      inputSchema: researchSessionCreateInputSchema,
+      inputSchema: researchSessionCreateToolSchema,
     },
     async (arguments_) => {
       try {
@@ -154,7 +166,7 @@ export function registerDataResearchTools(
     "research_permission_set",
     {
       description: "Allow or deny expansion beyond the research seed pages",
-      inputSchema: researchPermissionSetInputSchema,
+      inputSchema: researchPermissionSetToolSchema,
     },
     async (arguments_) => {
       try {
@@ -174,7 +186,7 @@ export function registerDataResearchTools(
     "research_session_run",
     {
       description: "Run a research session within its approved scope and budgets",
-      inputSchema: researchSessionRunInputSchema,
+      inputSchema: researchSessionRunToolSchema,
     },
     async (arguments_) => {
       try {
@@ -194,7 +206,7 @@ export function registerDataResearchTools(
     "competitor_confirm",
     {
       description: "Confirm or exclude a competitor with optimistic concurrency",
-      inputSchema: competitorConfirmInputSchema,
+      inputSchema: competitorConfirmToolSchema,
     },
     async (arguments_) => {
       try {
@@ -214,7 +226,7 @@ export function registerDataResearchTools(
     "competitor_diff_create",
     {
       description: "Create a deterministic evidence-linked competitor comparison",
-      inputSchema: competitorDiffCreateInputSchema,
+      inputSchema: competitorDiffCreateToolSchema,
     },
     async (arguments_) => {
       try {
@@ -234,7 +246,7 @@ export function registerDataResearchTools(
     "data_research_get",
     {
       description: "Read workspace-scoped data research lineage and audit provenance",
-      inputSchema: dataResearchGetInputSchema,
+      inputSchema: dataResearchGetToolSchema,
     },
     async (arguments_) => {
       try {
@@ -253,7 +265,7 @@ export function registerDataResearchTools(
     "evidence_asset_get",
     {
       description: "Read an evidence asset by workspace, evidence, and asset IDs only",
-      inputSchema: evidenceAssetGetInputSchema,
+      inputSchema: evidenceAssetGetToolSchema,
     },
     async (arguments_) => {
       try {

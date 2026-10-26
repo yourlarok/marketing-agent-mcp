@@ -5,18 +5,30 @@ import { canonicalJson } from "../infrastructure/sqlite.js";
 import { toMcpError } from "./error-mapper.js";
 import {
   capabilityListInputSchema,
+  capabilityListToolSchema,
   createRecommendationInputSchema,
+  createRecommendationToolSchema,
   createTaskInputSchema,
+  createTaskToolSchema,
   createWorkspaceInputSchema,
+  createWorkspaceToolSchema,
   lineageGetInputSchema,
+  lineageGetToolSchema,
   recordCapabilityHealthInputSchema,
+  recordCapabilityHealthToolSchema,
   recordEvidenceInputSchema,
+  recordEvidenceToolSchema,
   recordFindingInputSchema,
+  recordFindingToolSchema,
   registerCapabilityInputSchema,
+  registerCapabilityToolSchema,
   registerDatasetInputSchema,
+  registerDatasetToolSchema,
   registerSourceInputSchema,
+  registerSourceToolSchema,
   serializedInputSchema,
   transitionTaskInputSchema,
+  transitionTaskToolSchema,
 } from "./schemas.js";
 
 export function validateToolArguments<T>(arguments_: T): T {
@@ -32,7 +44,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "workspace_create",
     {
       description: "Create an auditable marketing workspace",
-      inputSchema: createWorkspaceInputSchema,
+      inputSchema: createWorkspaceToolSchema,
     },
     async (arguments_) => {
       try {
@@ -55,7 +67,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "source_register",
     {
       description: "Register an auditable marketing data source",
-      inputSchema: registerSourceInputSchema,
+      inputSchema: registerSourceToolSchema,
     },
     async (arguments_) => {
       try {
@@ -78,7 +90,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "capability_register",
     {
       description: "Register controlled tool metadata without installing or executing it",
-      inputSchema: registerCapabilityInputSchema,
+      inputSchema: registerCapabilityToolSchema,
     },
     async (arguments_) => {
       try {
@@ -101,7 +113,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "capability_health_record",
     {
       description: "Record externally checked capability health and evidence",
-      inputSchema: recordCapabilityHealthInputSchema,
+      inputSchema: recordCapabilityHealthToolSchema,
     },
     async (arguments_) => {
       try {
@@ -124,7 +136,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "capability_list",
     {
       description: "List workspace-scoped controlled tool capabilities",
-      inputSchema: capabilityListInputSchema,
+      inputSchema: capabilityListToolSchema,
     },
     async (arguments_) => {
       try {
@@ -143,7 +155,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "dataset_register",
     {
       description: "Register dataset metadata and source provenance",
-      inputSchema: registerDatasetInputSchema,
+      inputSchema: registerDatasetToolSchema,
     },
     async (arguments_) => {
       try {
@@ -166,7 +178,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "evidence_record",
     {
       description: "Record evidence metadata without fetching remote content",
-      inputSchema: recordEvidenceInputSchema,
+      inputSchema: recordEvidenceToolSchema,
     },
     async (arguments_) => {
       try {
@@ -189,7 +201,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "finding_record",
     {
       description: "Record a fact, inference, or unknown with explicit truth boundaries",
-      inputSchema: recordFindingInputSchema,
+      inputSchema: recordFindingToolSchema,
     },
     async (arguments_) => {
       try {
@@ -212,7 +224,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "recommendation_create",
     {
       description: "Create a finding-backed marketing recommendation",
-      inputSchema: createRecommendationInputSchema,
+      inputSchema: createRecommendationToolSchema,
     },
     async (arguments_) => {
       try {
@@ -235,7 +247,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "task_create",
     {
       description: "Create an executable recommendation-backed draft task",
-      inputSchema: createTaskInputSchema,
+      inputSchema: createTaskToolSchema,
     },
     async (arguments_) => {
       try {
@@ -258,7 +270,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "lineage_get",
     {
       description: "Read bounded workspace-scoped lineage and audit provenance",
-      inputSchema: lineageGetInputSchema,
+      inputSchema: lineageGetToolSchema,
     },
     async (arguments_) => {
       try {
@@ -277,7 +289,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "task_transition",
     {
       description: "Transition a task with state and dependency safety checks",
-      inputSchema: transitionTaskInputSchema,
+      inputSchema: transitionTaskToolSchema,
     },
     async (arguments_) => {
       try {

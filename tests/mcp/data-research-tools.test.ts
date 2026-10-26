@@ -1,5 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -56,7 +57,7 @@ function entity(id: string, workspaceId = "workspace-1"): EntityRecord {
   };
 }
 
-function context(suffix: string): Record<string, string> {
+function context(suffix: string): { actor: string; requestId: string; idempotencyKey: string } {
   return {
     actor: "agent-1",
     requestId: `request-${suffix}`,
@@ -69,6 +70,7 @@ describe("data research MCP tools", () => {
   let store: Store;
   let client: Client;
   let server: ReturnType<typeof createMcpServer>;
+  let dataResearch: DataResearchService;
   let sequence: number;
   let originalImportRoot: string | undefined;
 
@@ -90,12 +92,12 @@ describe("data research MCP tools", () => {
     tempDir = await createTempDir();
     originalImportRoot = process.env.MARKETING_IMPORT_ROOT;
     process.env.MARKETING_IMPORT_ROOT = tempDir;
-    store = openStore(":memory:");
+    store = openStore(join(tempDir, "store.db"));
     sequence = 0;
     const clock = { now: () => now };
     const ids = { next: () => `generated-${++sequence}` };
     const marketing = new MarketingService(store, clock, ids);
-    const dataResearch = new DataResearchService(
+    dataResearch = new DataResearchService(
       store,
       clock,
       ids,
@@ -392,6 +394,116 @@ describe("data research MCP tools", () => {
     });
     expect(nestedSecret).toMatchObject({ isError: true });
     expect(JSON.stringify(nestedSecret)).not.toContain(secret);
+  });
+
+  it("rejects raw oversized whitespace on every new tool without persistence", async () => {
+    const scope = {
+      hosts: ["example.com"],
+      pathPrefixes: ["/research"],
+      maxDepth: 1,
+      maxPages: 2,
+      maxDurationMs: 10_000,
+      maxBytes: 1024 * 1024,
+    };
+    const plan = await dataResearch.planDataRequests({
+      input: {
+        id: "overflow-plan",
+        workspaceId: "workspace-1",
+        objective: "Overflow plan",
+        questionTypes: ["conversion"],
+        availableFields: [],
+      },
+      context: context("seed-overflow-plan"),
+    });
+    await dataResearch.createResearchSession({
+      input: {
+        id: "overflow-permission",
+        workspaceId: "workspace-1",
+        goal: "Permission",
+        seeds: ["https://example.com/research"],
+        expansion: true,
+        scope,
+      },
+      context: context("seed-overflow-permission"),
+    });
+    await dataResearch.createResearchSession({
+      input: {
+        id: "overflow-run",
+        workspaceId: "workspace-1",
+        goal: "Run",
+        seeds: ["https://example.com/research"],
+        expansion: false,
+        scope,
+      },
+      context: context("seed-overflow-run"),
+    });
+    const assetBatch = await dataResearch.ingestContentLinks({
+      input: {
+        id: "overflow-asset-seed",
+        workspaceId: "workspace-1",
+        links: [{ url: "https://example.com/research" }],
+      },
+      context: context("seed-overflow-asset"),
+    });
+    const assetEvidence = await store.transaction((repos) =>
+      repos.evidence.get(assetBatch.evidenceIds[0]!, "workspace-1")
+    );
+    const assetId = (assetEvidence?.assets as { id: string }[])[0]!.id;
+    await store.transaction(async (repos) => {
+      await repos.competitors.insert({
+        ...entity("overflow-confirm"),
+        status: "excluded",
+        evidenceIds: [],
+      } as Competitor);
+      for (const id of ["overflow-left", "overflow-right"]) {
+        await repos.competitors.insert({
+          ...entity(id),
+          status: "confirmed",
+          evidenceIds: [],
+        } as Competitor);
+      }
+    });
+    await writeFile(join(tempDir, "overflow.csv"), "name,amount\nAcme,12\n");
+
+    const padding = " ".repeat(MAX_SERIALIZED_INPUT_BYTES);
+    const workspaceId = `${padding}workspace-1`;
+    const calls = [
+      ["data_request_plan", { id: "overflow-new-plan", workspaceId, objective: "Overflow", questionTypes: ["conversion"], availableFields: [], ...context("overflow-new-plan") }],
+      ["data_request_decline", { planId: plan.id, workspaceId, expectedPlanVersion: 1, questionType: "conversion", reason: "Overflow", ...context("overflow-decline") }],
+      ["ingest_files", { id: "overflow-files", workspaceId, paths: ["overflow.csv"], ...context("overflow-files") }],
+      ["ingest_temporary_api", { id: "overflow-api", workspaceId, url: "https://example.com/metrics.csv", ownership: "authorized", expiresAt: "2026-10-26T13:00:00.000Z", ...context("overflow-api") }],
+      ["ingest_content_links", { id: "overflow-links", workspaceId, links: [{ url: "https://example.com/research" }], ...context("overflow-links") }],
+      ["research_session_create", { id: "overflow-session", workspaceId, goal: "Overflow", seeds: ["https://example.com/research"], expansion: false, scope, ...context("overflow-session") }],
+      ["research_permission_set", { id: "overflow-permission", workspaceId, expectedVersion: 1, expansion: "denied", ...context("overflow-set-permission") }],
+      ["research_session_run", { id: "overflow-run", workspaceId, expectedVersion: 1, ...context("overflow-run-research") }],
+      ["competitor_confirm", { id: "overflow-confirm", workspaceId, expectedVersion: 1, status: "confirmed", ...context("overflow-confirm-competitor") }],
+      ["competitor_diff_create", { id: "overflow-diff", workspaceId, competitorIds: ["overflow-left", "overflow-right"], dimensions: ["price"], ...context("overflow-diff-create") }],
+      ["data_research_get", { entityType: "data_request_plan", id: plan.id, workspaceId }],
+      ["evidence_asset_get", { workspaceId, evidenceId: assetBatch.evidenceIds[0]!, assetId }],
+    ] as const;
+
+    const raw = new DatabaseSync(join(tempDir, "store.db"));
+    try {
+      const residue = () => raw.prepare(
+        `SELECT
+          (SELECT COUNT(*) FROM data_request_plans) AS plans,
+          (SELECT COUNT(*) FROM ingestion_batches) AS batches,
+          (SELECT COUNT(*) FROM research_sessions) AS sessions,
+          (SELECT COUNT(*) FROM competitors) AS competitors,
+          (SELECT COUNT(*) FROM competitor_diffs) AS diffs,
+          (SELECT COUNT(*) FROM audit_records) AS audits,
+          (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
+      ).get();
+      const before = residue();
+      for (const [name, arguments_] of calls) {
+        expect(Buffer.byteLength(JSON.stringify(arguments_), "utf8"), name).toBeGreaterThan(MAX_SERIALIZED_INPUT_BYTES);
+        const result = await client.callTool({ name, arguments: arguments_ });
+        expect(result, name).toMatchObject({ isError: true });
+      }
+      expect(residue()).toEqual(before);
+    } finally {
+      raw.close();
+    }
   });
 
   it("maps expired temporary API failures to safe MCP errors", async () => {
