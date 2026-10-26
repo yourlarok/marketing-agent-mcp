@@ -111,10 +111,11 @@ API 还必须具有 `owned` 或 `authorized` 所有权，并提供未来的 UTC 
 
 - command 是部署方配置的固定可执行文件；args 必须是 **JSON 字符串数组**，不是 shell 命令行。配置 args 时必须同时配置 command。
 - server 每次采集启动该 stdio MCP，并调用其 `acquire_content` 工具，参数包含 `url`、`fields`、可选 `scope`、`maxBytes` 和 `timeoutMs`。
-- 成功结果必须在 `structuredContent` 中提供 `url`、`finalUrl`、`title`、`text`、`fields`、可选 `links` 和有效 PNG 的 `screenshotBase64`。URL origin、字段集合、研究 scope、大小与 PNG 完整性都会再次校验。
+- 对带 `scope` 的采集，server 会在**同一 provider 进程的业务请求之前**启动真实 loopback canary 监听器，并发送一个越界 URL。provider 或其代理必须返回 `SCOPE_DENIED`，且以 `enforcement: "provider_pre_request" | "proxy_pre_request"` 明确声明请求前拒绝；canary 实际命中必须为 0。忽略 scope、先请求再拒绝或伪造合法 `finalUrl` 的 provider 都不可 verified，并按不可用处理。`pathPrefixes: ["/"]` 等无法生成越界 canary 的 scope 也不能通过专业 MCP 验证，可回退到自身带固定代理的 Chromium。
+- 成功结果必须在 `structuredContent` 中提供 `url`、`finalUrl`、`title`、`text`、`fields`、可选 `links` 和有效 PNG 的 `screenshotBase64`。URL origin、字段集合、研究 scope、大小与 PNG 完整性都会再次校验；这些响应校验是纵深防御，不能替代上述请求前验收。
 - 专业 MCP 的普通不可用/协议失败可回退到 Chromium；访问缺口、scope 拒绝和研究预算边界不会用 fallback 绕过。
 - 每次调用结束都会关闭专业 MCP client。server 默认不把任意业务环境变量或凭据转发给该子进程；供应商认证应由其自身受控配置完成。
-- 本项目不附带或安装特定供应商的专业 MCP，也不保证任何第三方工具可用。命令配置属于受信任部署配置，不是工具调用方可注入的脚本入口。
+- 本项目不附带或安装特定供应商的专业 MCP，也不保证任何第三方工具可用。命令配置属于受信任部署配置，不是工具调用方可注入的脚本入口。canary 是对配置 provider/代理行为的验收，不是操作系统网络沙箱；部署方仍须信任 provider 的启动代码及其运行账户，并以容器或主机网络策略约束其他出站访问。
 
 ## 数据准备与研究流程
 
@@ -125,8 +126,8 @@ API 还必须具有 `owned` 或 `authorized` 所有权，并提供未来的 UTC 
 1. 用 `workspace_create` 创建工作区。
 2. 用 `data_request_plan` 声明目标、`questionTypes` 与当前 `availableFields`，得到第 1 轮计划。
 3. 用 `ingest_files` 导入 CSV/XLSX；关联计划时同时传 `planId` 和当前 `expectedPlanVersion`。一次可传多个路径，XLSX 每个 sheet 形成独立 Dataset/Evidence。
-4. 读取 batch 返回的 `datasetIds` / `evidenceIds`。每个数据集保存原始资产、规范化 JSONL 和质量报告；质量统计与 issue 包括行列数、重复/空行、类型不一致、重复/空表头、列数不一致和缺失公式缓存值。
-5. 成功导入会推进计划轮次并合并字段。无法回答的问题继续显式列出缺失字段；用 `data_request_decline` 拒绝某一轮时必须给出限制原因。
+4. 读取 batch 返回的 `datasetIds` / `evidenceIds`。每个数据集保存原始资产、规范化 JSONL 和质量报告；质量统计与 issue 包括行列数、逐字段/总缺失单元格、重复/空行、类型不一致、重复/空表头、列数不一致和缺失公式缓存值。`coverageStart` / `coverageEnd` 从 `published_at`、`converted_at` 或 `stage_changed_at` 的实际有效值提取；无法确定时为 `null`，不会写入导入时间。
+5. 成功导入会推进计划轮次并保留各 dataset 的质量描述。一个问题只有在**单一 dataset** 同时提供全部必需字段、至少一行数据、每个必需字段至少一个非空值且数据未 stale 时才可 answerable；零行、必需字段全空、stale 和跨 dataset 拼字段都不能进入 `ready`。后续有效 dataset 可在下一轮推进。用 `data_request_decline` 拒绝某一轮时必须给出限制原因。
 
 支持的问题类型为 `content_performance`、`lead_funnel`、`conversion`、`competitor_content`。XLSX 公式不会重新计算，缺失缓存结果会作为质量限制保留。
 
@@ -145,17 +146,17 @@ API 还必须具有 `owned` 或 `authorized` 所有权，并提供未来的 UTC 
 1. `research_session_create` 提供 goal、seeds、是否请求 expansion，以及完整 scope/limits。所有 seed 必须位于 scope 内。
 2. `expansion: true` 的 session 初始为 `awaiting_permission`。用 `research_permission_set` 明确选择 `allowed` 或 `denied`。
 3. 用 `research_session_run` 执行。未授权 expansion 时仍可处理 seed，但以 `permission_required` 部分停止；拒绝后仅处理 seed；允许后仅沿同 host、同 path prefix 的链接扩展。
-4. 查看 `state`、`stopReason`、`gaps`、`frontier`、`visitedUrls`、`attemptCount`、`candidateBytes` 与 `elapsedMs`。运行时 limits 只能调低，不能超过 session 已配置上限。
+4. 查看 `state`、`stopReason`、`gaps`、`frontier`、`visitedUrls`、`attemptCount`、`candidateBytes` 与 `elapsedMs`。运行时 limits 只能调低，不能超过 session 已配置上限。`maxDepth: 0` 在 create/run 均合法，表示只处理 seeds、不沿链接扩展；其他预算仍必须为正数。
 
 完成的研究 session 不能随意重跑；等待权限的 seed-only 部分结果可在授权后继续保留的 frontier。
 
 ### 5. 血缘、重启与证据读取
 
-`data_research_get` 可读取 `data_request_plan`、`ingestion_batch`、`research_session`、`competitor`、`competitor_diff` 的工作区血缘与审计 request ID。原 `lineage_get` 继续读取营销任务链。
+`data_research_get` 可读取 `data_request_plan`、`ingestion_batch`、`research_session`、`competitor`、`competitor_diff` 的工作区血缘与审计 request ID，并返回完整 `entity` 和继续流程所需的 `descriptors`：plan rounds/questions/batch refs、batch 的 Source/Dataset/Evidence、session/competitor 的 Evidence（含 assets）、Diff entries/competitors/findings。`ingest_content_links` 同时返回 `competitorIds`，业务衔接不需要直接 SQL。原 `lineage_get` 继续读取营销任务链。
 
 `evidence_asset_get` 只接受 `workspaceId`、`evidenceId`、`assetId`，返回资产元数据及 base64 `content`，不接受文件路径。Evidence 的 `assets` 元数据提供 asset ID 与 kind。
 
-SQLite、实体版本、审计和幂等结果在同一数据目录重启后保留；artifact 通过内容哈希重新读取。`data_research_get` 不返回整个实体 payload，需结合命令响应与资产读取获取业务内容。
+SQLite、实体版本、审计和幂等结果在同一数据目录重启后保留；artifact 通过内容哈希重新读取。重启后可仅用 `data_research_get` 恢复 plan/session/diff payload 和资产描述，再用 `evidence_asset_get` 读取正文。
 
 ## 上限、部分失败与隐私
 

@@ -80,9 +80,20 @@ describe("deterministic data preparation", () => {
       sourceLayer: "content_metrics",
     });
 
+    const fields = ["content_id", "published_at", "impressions", "clicks"];
     const conversion = planDataRequestRound(
       ["content_performance", "conversion"],
-      ["content_id", "published_at", "impressions", "clicks"],
+      fields,
+      [],
+      [{
+        source: qualityBatch().datasets[0]!.source,
+        fields,
+        rowCount: 1,
+        missingCellsByField: {},
+        stale: false,
+        coverageStart: null,
+        coverageEnd: null,
+      }],
     );
     expect(conversion.questions).toHaveLength(1);
     expect(conversion.questions[0]).toMatchObject({
@@ -101,7 +112,7 @@ describe("deterministic data preparation", () => {
     });
 
     expect(reports).toHaveLength(1);
-    expect(reports[0]!.statistics).toEqual(qualityBatch().datasets[0]!.quality);
+    expect(reports[0]!.statistics).toMatchObject(qualityBatch().datasets[0]!.quality);
     expect(reports[0]!.issues.map((issue) => issue.category)).toEqual(
       expect.arrayContaining(["missing", "duplicate", "type", "format", "freshness"]),
     );
@@ -128,16 +139,81 @@ describe("deterministic data preparation", () => {
     expect(() => createDataQualityReports(batch)).toThrow(/issue code/i);
   });
 
-  it("marks a fully supplied question ready without inventing another request", () => {
+  it("does not mark declared fields answerable without a usable dataset", () => {
     const round = planDataRequestRound(
       ["competitor_content"],
       ["competitor", "content_url", "published_at", "engagement"],
     );
 
-    expect(round).toMatchObject({
-      state: "ready",
-      answerableQuestionTypes: ["competitor_content"],
-      questions: [],
+    expect(round.state).not.toBe("ready");
+    expect(round.answerableQuestionTypes).toEqual([]);
+  });
+
+  it.each([
+    ["zero rows", { rowCount: 0, missingCellsByField: {}, stale: false }],
+    ["all required cells empty", {
+      rowCount: 2,
+      missingCellsByField: { content_id: 2, published_at: 2, impressions: 2, clicks: 2 },
+      stale: false,
+    }],
+    ["stale data", { rowCount: 1, missingCellsByField: {}, stale: true }],
+  ])("rejects answerability for %s", (_name, quality) => {
+    const fields = ["content_id", "published_at", "impressions", "clicks"];
+    const round = planDataRequestRound(
+      ["content_performance"],
+      fields,
+      [],
+      [{
+        source: qualityBatch().datasets[0]!.source,
+        fields,
+        coverageStart: null,
+        coverageEnd: null,
+        ...quality,
+      }] as never,
+    );
+
+    expect(round.state).not.toBe("ready");
+    expect(round.answerableQuestionTypes).toEqual([]);
+  });
+
+  it("rejects fields assembled across datasets and advances when one valid dataset arrives", () => {
+    const source = qualityBatch().datasets[0]!.source;
+    const datasets = [
+      { source, fields: ["content_id", "published_at"], rowCount: 1, missingCellsByField: {}, stale: false, coverageStart: null, coverageEnd: null },
+      { source, fields: ["impressions", "clicks"], rowCount: 1, missingCellsByField: {}, stale: false, coverageStart: null, coverageEnd: null },
+    ];
+    const fields = ["content_id", "published_at", "impressions", "clicks"];
+    const split = planDataRequestRound(["content_performance"], fields, [], datasets as never);
+    expect(split.answerableQuestionTypes).toEqual([]);
+    expect(split.state).not.toBe("ready");
+
+    const valid = planDataRequestRound(["content_performance"], fields, [], [...datasets, {
+      source, fields, rowCount: 2, missingCellsByField: {}, stale: false,
+      coverageStart: "2026-01-01T00:00:00.000Z", coverageEnd: "2026-01-02T00:00:00.000Z",
+    }] as never);
+    expect(valid).toMatchObject({ state: "ready", answerableQuestionTypes: ["content_performance"], questions: [] });
+  });
+
+  it("counts missing cells and extracts actual coverage or null when it is unknown", () => {
+    const batch = qualityBatch();
+    batch.datasets[0]!.fields = [
+      { name: "content_id", index: 0, inferredType: "string" },
+      { name: "published_at", index: 1, inferredType: "string" },
+    ];
+    batch.datasets[0]!.rowsJsonl = [
+      JSON.stringify({ content_id: "a", published_at: "2026-01-02T00:00:00.000Z" }),
+      JSON.stringify({ content_id: "", published_at: "2026-01-01T00:00:00.000Z" }),
+    ].join("\n") + "\n";
+    batch.datasets[0]!.quality.rowCount = 2;
+    const covered = createDataQualityReports(batch)[0]!;
+    expect(covered.statistics).toMatchObject({ missingCellCount: 1, missingCellsByField: { content_id: 1, published_at: 0 } });
+    expect(covered).toMatchObject({
+      coverageStart: "2026-01-01T00:00:00.000Z",
+      coverageEnd: "2026-01-02T00:00:00.000Z",
     });
+
+    batch.datasets[0]!.rowsJsonl = '{"content_id":"a","published_at":""}\n';
+    const unknown = createDataQualityReports(batch)[0]!;
+    expect(unknown).toMatchObject({ coverageStart: null, coverageEnd: null });
   });
 });

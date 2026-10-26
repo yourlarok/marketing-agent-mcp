@@ -192,6 +192,87 @@ describe("content acquisition", () => {
     }
   }, 20_000);
 
+  it("proves provider pre-request scope enforcement with a real canary before verification", async () => {
+    const markerRoot = await createTempDir();
+    const marker = join(markerRoot, "scope-canary.log");
+    const mcp = new McpAcquisitionProvider({
+      command: process.execPath,
+      args: [fixtureCommand],
+      env: { ...process.env, MCP_FIXTURE_MARKER: marker },
+      envAllowlist: ["MCP_FIXTURE_MARKER"],
+    });
+    try {
+      const page = await mcp.acquire({
+        url: `${baseUrl}/dynamic`,
+        fields: { headline: "#headline" },
+        scope: { hosts: ["127.0.0.1"], pathPrefixes: ["/dynamic"] },
+      });
+      expect(page.provider).toBe("mcp");
+      expect(mcp.state).toBe("verified");
+      expect((mcp as unknown as { scopeCanaryHits: number }).scopeCanaryHits).toBe(0);
+      const invocations = (await readFile(marker, "utf8")).trim().split("\n");
+      expect(invocations).toHaveLength(2);
+      expect(invocations[0]).toContain("/__marketing_mcp_scope_canary__");
+      expect(invocations[1]).toBe(`${baseUrl}/dynamic`);
+    } finally {
+      await removeTempDir(markerRoot);
+    }
+  }, 20_000);
+
+  it("rejects a defective provider that hits the out-of-scope canary before denying it", async () => {
+    const markerRoot = await createTempDir();
+    const marker = join(markerRoot, "defective-scope.log");
+    const mcp = new McpAcquisitionProvider({
+      command: process.execPath,
+      args: [fixtureCommand],
+      env: { ...process.env, MCP_FIXTURE_MARKER: marker, MCP_FIXTURE_MODE: "defective-canary" },
+      envAllowlist: ["MCP_FIXTURE_MARKER", "MCP_FIXTURE_MODE"],
+    });
+    try {
+      await expect(mcp.acquire({
+        url: `${baseUrl}/dynamic`,
+        scope: { hosts: ["127.0.0.1"], pathPrefixes: ["/dynamic"] },
+      })).rejects.toMatchObject({
+        code: "CAPABILITY_UNAVAILABLE",
+        details: { reason: "mcp_scope_enforcement" },
+      });
+      expect(mcp.state).toBe("unavailable");
+      expect((mcp as unknown as { scopeCanaryHits: number }).scopeCanaryHits).toBe(1);
+      const invocations = (await readFile(marker, "utf8")).trim().split("\n");
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]).toContain("/__marketing_mcp_scope_canary__");
+    } finally {
+      await removeTempDir(markerRoot);
+    }
+  }, 20_000);
+
+  it("does not verify a provider that ignores scope and forges a legal-looking finalUrl", async () => {
+    const markerRoot = await createTempDir();
+    const marker = join(markerRoot, "forged-scope.log");
+    const mcp = new McpAcquisitionProvider({
+      command: process.execPath,
+      args: [fixtureCommand],
+      env: { ...process.env, MCP_FIXTURE_MARKER: marker, MCP_FIXTURE_MODE: "ignore-scope" },
+      envAllowlist: ["MCP_FIXTURE_MARKER", "MCP_FIXTURE_MODE"],
+    });
+    try {
+      await expect(mcp.acquire({
+        url: `${baseUrl}/dynamic`,
+        scope: { hosts: ["127.0.0.1"], pathPrefixes: ["/dynamic"] },
+      })).rejects.toMatchObject({
+        code: "CAPABILITY_UNAVAILABLE",
+        details: { reason: "mcp_scope_enforcement" },
+      });
+      expect(mcp.state).toBe("unavailable");
+      expect((mcp as unknown as { scopeCanaryHits: number }).scopeCanaryHits).toBe(0);
+      const invocations = (await readFile(marker, "utf8")).trim().split("\n");
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]).toContain("/__marketing_mcp_scope_canary__");
+    } finally {
+      await removeTempDir(markerRoot);
+    }
+  }, 20_000);
+
   it("falls back from an unhealthy configured MCP provider to Playwright", async () => {
     const mcp = new McpAcquisitionProvider({ command: join(fixtureRoot, "missing-provider"), args: [] });
     const router = new AcquisitionRouter({ mcp, playwright: playwright() });

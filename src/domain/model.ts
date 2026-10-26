@@ -21,8 +21,8 @@ export interface Source extends EntityRecord {
 export interface Dataset extends EntityRecord {
   sourceId: string;
   name: string;
-  coverageStart: string;
-  coverageEnd: string;
+  coverageStart: string | null;
+  coverageEnd: string | null;
   fieldDefinitions: JsonValue;
   metricDefinitions: JsonValue;
   limitations: JsonValue;

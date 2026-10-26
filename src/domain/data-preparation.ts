@@ -114,10 +114,28 @@ export interface FreshnessAssessment {
   maxAgeHours?: number;
 }
 
+export interface CellMissingStatistics {
+  missingCellCount: number;
+  missingCellsByField: Record<string, number>;
+}
+
 export interface DataQualityReport {
   source: QualityDataset["source"];
-  statistics: DatasetQualityStatistics;
+  statistics: DatasetQualityStatistics & CellMissingStatistics;
   issues: DataQualityIssue[];
+  coverageStart: string | null;
+  coverageEnd: string | null;
+}
+
+export interface DataRequestDatasetDescriptor {
+  datasetId?: string;
+  source: QualityDataset["source"];
+  fields: string[];
+  rowCount: number;
+  missingCellsByField: Record<string, number>;
+  stale: boolean;
+  coverageStart: string | null;
+  coverageEnd: string | null;
 }
 
 export interface DataRequestQuestion {
@@ -150,6 +168,8 @@ export interface DataRequestPlanDetails {
   declinedQuestionTypes: QuestionType[];
   limitations: string[];
   qualityReports: DataQualityReport[];
+  datasetDescriptors: DataRequestDatasetDescriptor[];
+  ingestionBatchIds: string[];
   rounds: DataRequestRound[];
 }
 
@@ -200,6 +220,46 @@ function qualityCategory(code: string): DataQualityCategory {
     default:
       return invalid(`Unsupported parsed dataset issue code: ${code}`);
   }
+}
+
+const COVERAGE_FIELDS = new Set(["published_at", "converted_at", "stage_changed_at"]);
+
+function datasetProfile(dataset: QualityDataset): CellMissingStatistics & {
+  coverageStart: string | null;
+  coverageEnd: string | null;
+} {
+  const missingCellsByField = Object.fromEntries(dataset.fields.map((field) => [field.name, 0]));
+  const coverageTimes: number[] = [];
+  const lines = dataset.rowsJsonl.length === 0 ? [] : dataset.rowsJsonl.trimEnd().split("\n");
+  for (const line of lines) {
+    let row: unknown;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      invalid("dataset rowsJsonl must contain one JSON object per line");
+    }
+    if (row === null || typeof row !== "object" || Array.isArray(row)) {
+      invalid("dataset rowsJsonl must contain one JSON object per line");
+    }
+    for (const field of dataset.fields) {
+      const value = (row as Record<string, unknown>)[field.name];
+      if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) {
+        missingCellsByField[field.name] = (missingCellsByField[field.name] ?? 0) + 1;
+      } else if (COVERAGE_FIELDS.has(field.name) &&
+        (typeof value === "string" || typeof value === "number")) {
+        const parsed = Date.parse(String(value));
+        if (Number.isFinite(parsed)) {
+          coverageTimes.push(parsed);
+        }
+      }
+    }
+  }
+  return {
+    missingCellCount: Object.values(missingCellsByField).reduce((sum, count) => sum + count, 0),
+    missingCellsByField,
+    coverageStart: coverageTimes.length > 0 ? new Date(Math.min(...coverageTimes)).toISOString() : null,
+    coverageEnd: coverageTimes.length > 0 ? new Date(Math.max(...coverageTimes)).toISOString() : null,
+  };
 }
 
 export function createDataQualityReports(
@@ -269,18 +329,41 @@ export function createDataQualityReports(
         message: "Dataset exceeds the allowed observation age",
       });
     }
+    const profile = datasetProfile(dataset);
     return {
       source: { ...dataset.source },
-      statistics: { ...dataset.quality },
+      statistics: {
+        ...dataset.quality,
+        missingCellCount: profile.missingCellCount,
+        missingCellsByField: profile.missingCellsByField,
+      },
       issues,
+      coverageStart: profile.coverageStart,
+      coverageEnd: profile.coverageEnd,
     };
   });
+}
+
+export function createDataRequestDatasetDescriptors(
+  batch: QualityBatch,
+  freshness: FreshnessAssessment = {},
+): DataRequestDatasetDescriptor[] {
+  return createDataQualityReports(batch, freshness).map((report, index) => ({
+    source: { ...report.source },
+    fields: batch.datasets[index]!.fields.map((field) => field.name),
+    rowCount: report.statistics.rowCount,
+    missingCellsByField: { ...report.statistics.missingCellsByField },
+    stale: report.issues.some((issue) => issue.code === "STALE_DATA"),
+    coverageStart: report.coverageStart,
+    coverageEnd: report.coverageEnd,
+  }));
 }
 
 export function planDataRequestRound(
   questionTypes: QuestionType[],
   availableFields: string[],
   declinedQuestionTypes: QuestionType[] = [],
+  datasetDescriptors: DataRequestDatasetDescriptor[] = [],
 ): PlannedDataRequestRound {
   assertQuestionTypes(questionTypes);
   assertAvailableFields(availableFields);
@@ -311,9 +394,14 @@ export function planDataRequestRound(
       break;
     }
   }
-  const answerableQuestionTypes = active.filter((questionType) =>
-    DATA_QUESTION_CATALOG[questionType].acceptedFields.every((field) => available.has(field))
-  );
+  const answerableQuestionTypes = active.filter((questionType) => {
+    const requiredFields = DATA_QUESTION_CATALOG[questionType].acceptedFields;
+    return datasetDescriptors.some((dataset) =>
+      !dataset.stale && dataset.rowCount > 0 && requiredFields.every((field) =>
+        dataset.fields.includes(field) && (dataset.missingCellsByField[field] ?? 0) < dataset.rowCount
+      )
+    );
+  });
   const hasAnyData = active.some((questionType) =>
     DATA_QUESTION_CATALOG[questionType].acceptedFields.some((field) => available.has(field))
   );

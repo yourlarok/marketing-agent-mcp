@@ -245,7 +245,7 @@ export function registerDataResearchTools(
   server.registerTool(
     "data_research_get",
     {
-      description: "Read workspace-scoped data research lineage and audit provenance",
+      description: "Read a workspace-scoped business entity, continuation descriptors, and lineage",
       inputSchema: dataResearchGetToolSchema,
     },
     async (arguments_) => {
@@ -254,7 +254,11 @@ export function registerDataResearchTools(
         if (!marketing) {
           throw new Error("Marketing service is required for data research reads");
         }
-        return textResult(await marketing.getLineage(query));
+        const [result, lineage] = await Promise.all([
+          dataResearch.getDataResearch(query),
+          marketing.getLineage(query),
+        ]);
+        return textResult({ ...lineage, ...result });
       } catch (error) {
         throw toMcpError(error);
       }

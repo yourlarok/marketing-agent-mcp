@@ -102,6 +102,12 @@ export interface CreateCompetitorDiff {
   dimensions: string[];
 }
 
+export interface DataResearchGetQuery {
+  entityType: "data_request_plan" | "ingestion_batch" | "research_session" | "competitor" | "competitor_diff";
+  id: string;
+  workspaceId: string;
+}
+
 export interface EvidenceAssetQuery {
   workspaceId: string;
   evidenceId: string;

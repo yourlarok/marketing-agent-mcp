@@ -19,6 +19,7 @@ export interface IngestionBatch extends EntityRecord {
   datasetIds: string[];
   evidenceIds: string[];
   failures: IngestionFileFailure[];
+  competitorIds?: string[];
 }
 
 export const RESEARCH_EXPANSION_STATES = [
@@ -43,6 +44,13 @@ export const RESEARCH_LIMIT_CEILINGS = {
   maxPages: 20,
   maxDurationMs: 60_000,
   maxBytes: 20 * 1024 * 1024,
+} as const;
+
+export const RESEARCH_LIMIT_MINIMA = {
+  maxDepth: 0,
+  maxPages: 1,
+  maxDurationMs: 1,
+  maxBytes: 1,
 } as const;
 
 export interface ResearchLimits {

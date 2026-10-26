@@ -1,3 +1,6 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { PNG } from "pngjs";
@@ -9,6 +12,7 @@ import {
   assertAcquisitionPayloadBudget,
   assertAcquisitionUrlInScope,
   canonicalAcquisitionUrl,
+  isAcquisitionUrlInScope,
   raceWithAcquisitionAbort,
 } from "./acquisition-policy.js";
 import {
@@ -37,6 +41,24 @@ const accessGapSchema = z.object({
   }),
 });
 
+const scopeDenialSchema = z.object({
+  error: z.object({
+    code: z.literal("SCOPE_DENIED"),
+    reason: z.literal("scope_denied"),
+    enforcement: z.enum(["provider_pre_request", "proxy_pre_request"]),
+    message: z.string().max(1_000),
+  }),
+});
+
+function scopeEnforcementError(): DomainError {
+  return new DomainError(
+    "CAPABILITY_UNAVAILABLE",
+    "Professional MCP did not prove fail-closed request-scope enforcement",
+    false,
+    { reason: "mcp_scope_enforcement" },
+  );
+}
+
 export interface McpAcquisitionOptions {
   command: string;
   args?: string[];
@@ -48,6 +70,7 @@ export interface McpAcquisitionOptions {
 
 export class McpAcquisitionProvider implements AcquisitionProvider {
   state: CapabilityState = "configured";
+  scopeCanaryHits = 0;
 
   constructor(private readonly options: McpAcquisitionOptions) {
     if (!options.command.trim()) {
@@ -80,6 +103,14 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
     try {
       await raceWithAcquisitionAbort(client.connect(transport), request.signal);
       const timeout = Math.min(this.options.timeoutMs ?? 15_000, remainingAcquisitionTimeout(request));
+      const deadline = Date.now() + timeout;
+      await this.verifyScopeEnforcement(client, request, timeout);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new DomainError("CAPABILITY_UNAVAILABLE", "Research acquisition deadline reached", false, {
+          reason: "max_duration",
+        });
+      }
       const result = await client.callTool({
         name: "acquire_content",
         arguments: {
@@ -87,9 +118,9 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
           fields: request.fields ?? {},
           ...(request.scope ? { scope: request.scope } : {}),
           ...(request.maxBytes !== undefined ? { maxBytes: request.maxBytes } : {}),
-          timeoutMs: timeout,
+          timeoutMs: remaining,
         },
-      }, undefined, { timeout, ...(request.signal ? { signal: request.signal } : {}) });
+      }, undefined, { timeout: remaining, ...(request.signal ? { signal: request.signal } : {}) });
       if (result.isError) {
         const gap = accessGapSchema.safeParse(result.structuredContent);
         if (gap.success) {
@@ -114,7 +145,7 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
       }
       this.state = "unavailable";
       if (error instanceof DomainError &&
-        ["mcp_invalid_response", "scope_denied", "max_bytes", "max_duration"].includes(String(error.details?.reason))) {
+        ["mcp_invalid_response", "mcp_scope_enforcement", "scope_denied", "max_bytes", "max_duration"].includes(String(error.details?.reason))) {
         throw error;
       }
       throw new DomainError(
@@ -125,6 +156,57 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
       );
     } finally {
       await client.close().catch(() => undefined);
+    }
+  }
+
+  private async verifyScopeEnforcement(client: Client, request: AcquireRequest, timeout: number): Promise<void> {
+    this.scopeCanaryHits = 0;
+    if (!request.scope) {
+      return;
+    }
+    const canaryServer = createServer((_request, response) => {
+      this.scopeCanaryHits += 1;
+      response.writeHead(204).end();
+    });
+    await new Promise<void>((resolveListen, rejectListen) => {
+      canaryServer.once("error", rejectListen);
+      canaryServer.listen(0, "127.0.0.1", () => {
+        canaryServer.off("error", rejectListen);
+        resolveListen();
+      });
+    });
+    const canaryUrl = `http://127.0.0.1:${(canaryServer.address() as AddressInfo).port}/__marketing_mcp_scope_canary__`;
+    let closed = false;
+    const close = async (): Promise<void> => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      canaryServer.closeAllConnections();
+      await new Promise<void>((resolveClose) => canaryServer.close(() => resolveClose()));
+    };
+    try {
+      if (isAcquisitionUrlInScope(canaryUrl, request.scope)) {
+        throw scopeEnforcementError();
+      }
+      const result = await client.callTool({
+        name: "acquire_content",
+        arguments: {
+          url: canaryUrl,
+          fields: {},
+          scope: request.scope,
+          maxBytes: 1,
+          timeoutMs: timeout,
+        },
+      }, undefined, { timeout, ...(request.signal ? { signal: request.signal } : {}) });
+      await delay(25, undefined, ...(request.signal ? [{ signal: request.signal }] : []));
+      await close();
+      const denial = scopeDenialSchema.safeParse(result.structuredContent);
+      if (this.scopeCanaryHits !== 0 || result.isError !== true || !denial.success) {
+        throw scopeEnforcementError();
+      }
+    } finally {
+      await close();
     }
   }
 }

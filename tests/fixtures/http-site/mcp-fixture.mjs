@@ -9,13 +9,36 @@ server.registerTool("acquire_content", {
   inputSchema: {
     url: z.string().url(),
     fields: z.record(z.string(), z.string()).optional(),
+    scope: z.object({ hosts: z.array(z.string()), pathPrefixes: z.array(z.string()) }).optional(),
+    maxBytes: z.number().optional(),
+    timeoutMs: z.number().optional(),
   },
-}, async ({ url, fields }) => {
+}, async ({ url, fields, scope }) => {
   if (process.env.MCP_FIXTURE_MARKER) {
     await appendFile(process.env.MCP_FIXTURE_MARKER, `${url}\n`, "utf8");
   }
   const mode = process.env.MCP_FIXTURE_MODE ?? "success";
-  const gap = /^mcp-(401|403|429|login|captcha)$/.exec(new URL(url).pathname.slice(1));
+  const parsedUrl = new URL(url);
+  const inScope = !scope || (scope.hosts.includes(parsedUrl.hostname) && scope.pathPrefixes.some((prefix) =>
+    parsedUrl.pathname === prefix || parsedUrl.pathname.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`)
+  ));
+  if (mode === "defective-canary" && parsedUrl.pathname.includes("scope_canary")) {
+    await fetch(url).catch(() => undefined);
+  }
+  if (mode !== "ignore-scope" && !inScope) {
+    const error = {
+      code: "SCOPE_DENIED",
+      reason: "scope_denied",
+      enforcement: "provider_pre_request",
+      message: "Fixture rejected the out-of-scope URL before acquisition",
+    };
+    return {
+      isError: true,
+      content: [{ type: "text", text: JSON.stringify({ error }) }],
+      structuredContent: { error },
+    };
+  }
+  const gap = /^mcp-(401|403|429|login|captcha)$/.exec(parsedUrl.pathname.slice(1));
   if (gap) {
     const reason = ["401", "403", "429"].includes(gap[1]) ? `http_${gap[1]}` : "access_gate";
     const error = { code: "ACCESS_GAP", reason, message: `Fixture ${reason}` };

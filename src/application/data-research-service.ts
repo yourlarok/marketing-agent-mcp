@@ -4,8 +4,10 @@ import {
   PARSED_ISSUE_CODES,
   QUESTION_TYPES,
   createDataQualityReports,
+  createDataRequestDatasetDescriptors,
   planDataRequestRound,
   type DataQualityReport,
+  type DataRequestDatasetDescriptor,
   type DataRequestPlanDetails,
   type QuestionType,
 } from "../domain/data-preparation.js";
@@ -13,6 +15,7 @@ import { compareCompetitorObservations } from "../domain/competitor-diff.js";
 import {
   COMPETITOR_STATUSES,
   RESEARCH_LIMIT_CEILINGS,
+  RESEARCH_LIMIT_MINIMA,
   type Competitor,
   type CompetitorDiff,
   type DataRequestPlan,
@@ -52,6 +55,7 @@ import type {
   CreateCompetitorDiff,
   CreateDataRequestPlan,
   CreateResearchSession,
+  DataResearchGetQuery,
   DeclineDataRound,
   EvidenceAssetContent,
   EvidenceAssetQuery,
@@ -184,7 +188,11 @@ function requirePlanDetails(plan: DataRequestPlan): DataRequestPlan & DataReques
   ) {
     throw new DomainError("CONFLICT", "Data request plan is not a guided plan", false, { id: plan.id });
   }
-  return plan as DataRequestPlan & DataRequestPlanDetails;
+  return {
+    ...plan,
+    ingestionBatchIds: Array.isArray(plan.ingestionBatchIds) ? plan.ingestionBatchIds : [],
+    datasetDescriptors: Array.isArray(plan.datasetDescriptors) ? plan.datasetDescriptors : [],
+  } as DataRequestPlan & DataRequestPlanDetails;
 }
 
 interface PreparedDataset {
@@ -192,6 +200,23 @@ interface PreparedDataset {
   normalized: StoredArtifact;
   quality: StoredArtifact;
   qualityReport: DataQualityReport;
+  datasetId?: string;
+}
+
+function preparedDatasetDescriptor(prepared: PreparedDataset): DataRequestDatasetDescriptor {
+  if (!prepared.datasetId) {
+    throw new Error("Dataset persistence did not assign an ID");
+  }
+  return {
+    datasetId: prepared.datasetId,
+    source: { ...prepared.parsed.source },
+    fields: prepared.parsed.fields.map((field) => field.name),
+    rowCount: prepared.qualityReport.statistics.rowCount,
+    missingCellsByField: { ...prepared.qualityReport.statistics.missingCellsByField },
+    stale: prepared.qualityReport.issues.some((issue) => issue.code === "STALE_DATA"),
+    coverageStart: prepared.qualityReport.coverageStart,
+    coverageEnd: prepared.qualityReport.coverageEnd,
+  };
 }
 
 interface PreparedFile {
@@ -226,8 +251,9 @@ function canonicalResearchUrl(value: unknown, _field = "url", base?: string): st
 }
 
 function researchLimit(value: unknown, field: keyof ResearchLimits, ceiling: number): number {
-  if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > ceiling) {
-    invalid(`${field} must be a positive integer no greater than ${ceiling}`);
+  const minimum = RESEARCH_LIMIT_MINIMA[field];
+  if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > ceiling) {
+    invalid(`${field} must be ${minimum === 0 ? "a non-negative" : "a positive"} integer no greater than ${ceiling}`);
   }
   return value as number;
 }
@@ -976,6 +1002,7 @@ export class DataResearchService {
     await requireWorkspace(repos, input.workspaceId);
     const sourceIds: string[] = [];
     const evidenceIds: string[] = [];
+    const competitorIds: string[] = [];
     for (const prepared of pages) {
       const { page } = prepared;
       const source: Source = {
@@ -1036,6 +1063,7 @@ export class DataResearchService {
         evidenceIds: [evidence.id],
       };
       await repos.competitors.insert(competitor);
+      competitorIds.push(competitor.id);
     }
     const batch: IngestionBatch = {
       id: input.id,
@@ -1048,6 +1076,7 @@ export class DataResearchService {
       datasetIds: [],
       evidenceIds,
       failures,
+      competitorIds,
     };
     return repos.ingestionBatches.insert(batch) as Promise<IngestionBatch>;
   }
@@ -1093,13 +1122,14 @@ export class DataResearchService {
           updatedAt: timestamp,
           sourceId: source.id,
           name: `${parsed.source.fileName}${parsed.source.sheetName ? `#${parsed.source.sheetName}` : ""}`,
-          coverageStart: timestamp,
-          coverageEnd: timestamp,
+          coverageStart: prepared.qualityReport.coverageStart,
+          coverageEnd: prepared.qualityReport.coverageEnd,
           fieldDefinitions: parsed.fields.map((field) => ({ ...field })),
           metricDefinitions: [],
           limitations: parsed.issues.map((issue) => issue.message),
-          quality: { ...parsed.quality },
+          quality: { ...prepared.qualityReport.statistics },
         };
+        prepared.datasetId = dataset.id;
         await repos.datasets.insert(dataset);
         datasetIds.push(dataset.id);
         const evidence: Evidence = {
@@ -1143,20 +1173,27 @@ export class DataResearchService {
         file.datasets.flatMap((dataset) => dataset.parsed.fields.map((field) => field.name))
       );
       const availableFields = [...new Set([...current.availableFields, ...importedFields])];
+      const datasetDescriptors = [
+        ...current.datasetDescriptors,
+        ...files.flatMap((file) => file.datasets.map(preparedDatasetDescriptor)),
+      ];
       const planned = planDataRequestRound(
         current.questionTypes,
         availableFields,
         current.declinedQuestionTypes,
+        datasetDescriptors,
       );
       const round = current.round + 1;
       await repos.dataRequestPlans.update({
         ...current,
         ...planned,
         availableFields,
+        datasetDescriptors,
         qualityReports: [
           ...current.qualityReports,
           ...files.flatMap((file) => file.datasets.map((dataset) => dataset.qualityReport)),
         ],
+        ingestionBatchIds: [...current.ingestionBatchIds, input.id],
         round,
         updatedAt: timestamp,
         rounds: [...current.rounds, { round, ...planned }],
@@ -1321,6 +1358,71 @@ export class DataResearchService {
     });
   }
 
+  async getDataResearch(query: DataResearchGetQuery) {
+    assertNonEmptyString(query.workspaceId, "workspaceId");
+    assertNonEmptyString(query.id, "id");
+    return this.store.transaction(async (repos) => {
+      const required = async <T>(record: Promise<T | undefined>, entityType: string, id: string): Promise<T> => {
+        const value = await record;
+        if (!value) {
+          throw new DomainError("NOT_FOUND", "Data research entity not found in workspace", false, {
+            entityType,
+            id,
+            workspaceId: query.workspaceId,
+          });
+        }
+        return value;
+      };
+      const evidence = (ids: string[]): Promise<Evidence[]> => Promise.all(ids.map((id) =>
+        required(repos.evidence.get(id, query.workspaceId) as Promise<Evidence | undefined>, "evidence", id)
+      ));
+      switch (query.entityType) {
+        case "data_request_plan": {
+          const entity = await required(repos.dataRequestPlans.get(query.id, query.workspaceId), query.entityType, query.id);
+          const current = requirePlanDetails(entity);
+          return {
+            entity,
+            descriptors: {
+              rounds: current.rounds,
+              questions: current.questions,
+              batches: current.ingestionBatchIds.map((id) => ({ entityType: "ingestion_batch", id })),
+            },
+          };
+        }
+        case "ingestion_batch": {
+          const entity = await required(repos.ingestionBatches.get(query.id, query.workspaceId), query.entityType, query.id);
+          return {
+            entity,
+            descriptors: {
+              sources: await Promise.all(entity.sourceIds.map((id) => required(repos.sources.get(id, query.workspaceId), "source", id))),
+              datasets: await Promise.all(entity.datasetIds.map((id) => required(repos.datasets.get(id, query.workspaceId), "dataset", id))),
+              evidence: await evidence(entity.evidenceIds),
+            },
+          };
+        }
+        case "research_session": {
+          const entity = await required(repos.researchSessions.get(query.id, query.workspaceId), query.entityType, query.id);
+          return { entity, descriptors: { evidence: await evidence(entity.evidenceIds) } };
+        }
+        case "competitor": {
+          const entity = await required(repos.competitors.get(query.id, query.workspaceId), query.entityType, query.id);
+          return { entity, descriptors: { evidence: await evidence(entity.evidenceIds) } };
+        }
+        case "competitor_diff": {
+          const entity = await required(repos.competitorDiffs.get(query.id, query.workspaceId), query.entityType, query.id);
+          return {
+            entity,
+            descriptors: {
+              competitors: await Promise.all(entity.competitorIds.map((id) => required(repos.competitors.get(id, query.workspaceId), "competitor", id))),
+              entries: entity.entries,
+              findings: await Promise.all(entity.findingIds.map((id) => required(repos.findings.get(id, query.workspaceId), "finding", id))),
+            },
+          };
+        }
+      }
+    });
+  }
+
   async getEvidenceAsset(query: EvidenceAssetQuery): Promise<EvidenceAssetContent> {
     assertNonEmptyString(query.workspaceId, "workspaceId");
     assertNonEmptyString(query.evidenceId, "evidenceId");
@@ -1360,10 +1462,18 @@ export class DataResearchService {
           invalid("freshness must be an object");
         }
         await requireWorkspace(repos, input.workspaceId);
-        const planned = planDataRequestRound(input.questionTypes, input.availableFields);
         const qualityReports = input.batch
           ? createDataQualityReports(input.batch, input.freshness)
           : [];
+        const datasetDescriptors = input.batch
+          ? createDataRequestDatasetDescriptors(input.batch, input.freshness)
+          : [];
+        const planned = planDataRequestRound(
+          input.questionTypes,
+          input.availableFields,
+          [],
+          datasetDescriptors,
+        );
         const plan: DataRequestPlan = {
           id: input.id,
           workspaceId: input.workspaceId,
@@ -1378,6 +1488,8 @@ export class DataResearchService {
           declinedQuestionTypes: [],
           limitations: [],
           qualityReports,
+          datasetDescriptors,
+          ingestionBatchIds: [],
           rounds: [{ round: 1, ...planned }],
         };
         return repos.dataRequestPlans.insert(plan) as Promise<DataRequestPlan>;
@@ -1419,10 +1531,14 @@ export class DataResearchService {
           });
         }
         const availableFields = [...new Set([...current.availableFields, ...input.availableFields])];
+        const datasetDescriptors = input.batch
+          ? [...current.datasetDescriptors, ...createDataRequestDatasetDescriptors(input.batch, input.freshness)]
+          : current.datasetDescriptors;
         const planned = planDataRequestRound(
           current.questionTypes,
           availableFields,
           current.declinedQuestionTypes,
+          datasetDescriptors,
         );
         const qualityReports = input.batch
           ? [...current.qualityReports, ...createDataQualityReports(input.batch, input.freshness)]
@@ -1432,6 +1548,7 @@ export class DataResearchService {
           ...current,
           ...planned,
           availableFields,
+          datasetDescriptors,
           qualityReports,
           round,
           updatedAt: timestamp,
@@ -1483,6 +1600,7 @@ export class DataResearchService {
           current.questionTypes,
           current.availableFields,
           declinedQuestionTypes,
+          current.datasetDescriptors,
         );
         const limitation = `${input.questionType}: ${input.reason.trim()}`;
         const round = current.round + 1;

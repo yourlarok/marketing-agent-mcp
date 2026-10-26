@@ -615,6 +615,20 @@ describe("DataResearchService guided data rounds", () => {
         workspaceId: "workspace-1",
         expectedPlanVersion: 2,
         availableFields: ["impressions", "clicks"],
+        batch: {
+          datasets: [{
+            source: { path: "/imports/performance.csv", fileName: "performance.csv", format: "csv", sizeBytes: 100 },
+            fields: [
+              { name: "content_id", index: 0, inferredType: "string" },
+              { name: "published_at", index: 1, inferredType: "string" },
+              { name: "impressions", index: 2, inferredType: "number" },
+              { name: "clicks", index: 3, inferredType: "number" },
+            ],
+            rowsJsonl: '{"content_id":"content-1","published_at":"2026-10-26T12:00:00.000Z","impressions":10,"clicks":2}\n',
+            quality: { rowCount: 1, columnCount: 4, duplicateRowCount: 0, emptyRowCount: 0, typeInconsistencyCount: 0 },
+            issues: [],
+          }],
+        },
       },
       context: commandContext("reconcile-conversion"),
     });
@@ -681,6 +695,19 @@ describe("DataResearchService guided data rounds", () => {
         objective: "Measure conversion",
         questionTypes: ["conversion"],
         availableFields: ["conversion_id", "converted_at", "conversion_value"],
+        batch: {
+          datasets: [{
+            source: { path: "/imports/conversions.csv", fileName: "conversions.csv", format: "csv", sizeBytes: 100 },
+            fields: [
+              { name: "conversion_id", index: 0, inferredType: "string" },
+              { name: "converted_at", index: 1, inferredType: "string" },
+              { name: "conversion_value", index: 2, inferredType: "number" },
+            ],
+            rowsJsonl: '{"conversion_id":"c-1","converted_at":"2026-10-26T12:00:00.000Z","conversion_value":20}\n',
+            quality: { rowCount: 1, columnCount: 3, duplicateRowCount: 0, emptyRowCount: 0, typeInconsistencyCount: 0 },
+            issues: [],
+          }],
+        },
       },
       context: commandContext("plan"),
     });
@@ -1187,7 +1214,12 @@ describe("DataResearchService atomic imports and evidence assets", () => {
         audit: await repos.audit.listForEntity("workspace-1", "ingestion_batch", batch.id),
       }));
       expect(graph.source).toMatchObject({ type: "api", ownership: "owned" });
-      expect(graph.dataset).toMatchObject({ name: "metrics.json", quality: { rowCount: 1, columnCount: 4 } });
+      expect(graph.dataset).toMatchObject({
+        name: "metrics.json",
+        coverageStart: "2026-10-26T12:00:00.000Z",
+        coverageEnd: "2026-10-26T12:00:00.000Z",
+        quality: { rowCount: 1, columnCount: 4, missingCellCount: 0 },
+      });
       expect(graph.plan).toMatchObject({ version: 2, round: 2, answerableQuestionTypes: ["content_performance"] });
       expect(graph.plan?.qualityReports).toHaveLength(1);
       expect(graph.audit).toHaveLength(1);
@@ -1476,6 +1508,26 @@ describe("DataResearchService permission-bounded research", () => {
     expect(result).toMatchObject({ expansion: "denied", state: "completed", stopReason: "permission_denied" });
     expect(result.evidenceIds).toHaveLength(1);
     expect(provider.hits).toEqual([seed, seed]);
+  });
+
+  it("accepts maxDepth zero at create and run for seed-only research", async () => {
+    const created = await create("seed-only-research", {
+      scope: {
+        hosts: ["example.com"],
+        pathPrefixes: ["/research"],
+        maxDepth: 0,
+        maxPages: 10,
+        maxDurationMs: 1_000,
+        maxBytes: 100_000,
+      },
+    });
+    expect(created).toMatchObject({ state: "awaiting_permission", limits: { maxDepth: 0 } });
+    await service.setResearchPermission(permissionCommand(created.id, 1, "allowed"));
+
+    const result = await service.runResearch(runCommand(created.id, 2, { maxDepth: 0 }));
+    expect(result).toMatchObject({ state: "partial", stopReason: "max_depth", limits: { maxDepth: 0 } });
+    expect(result.evidenceIds).toHaveLength(1);
+    expect(provider.hits).toEqual([seed]);
   });
 
   it("crawls only approved in-scope canonical URLs within depth and replays without browsing", async () => {

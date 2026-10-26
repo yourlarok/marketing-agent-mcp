@@ -279,7 +279,7 @@ describe("data research MCP tools", () => {
       scope: {
         hosts: ["example.com"],
         pathPrefixes: ["/research"],
-        maxDepth: 1,
+        maxDepth: 0,
         maxPages: 2,
         maxDurationMs: 10_000,
         maxBytes: 1024 * 1024,
@@ -301,7 +301,7 @@ describe("data research MCP tools", () => {
       id: "session-1",
       workspaceId: "workspace-1",
       expectedVersion: 2,
-      limits: { maxPages: 1 },
+      limits: { maxPages: 1, maxDepth: 0 },
       ...context("research-run"),
     });
     expect(run).toMatchObject({ state: "completed", stopReason: "completed", version: 3 });

@@ -2,7 +2,6 @@ import { copyFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
@@ -154,38 +153,17 @@ describe("built data-research stdio acceptance", () => {
     expect(running.stderr()).not.toContain("MCP shutdown failed");
   }
 
-  function storedPayload(table: "evidence" | "competitors", id: string): JsonRecord {
-    const database = new DatabaseSync(join(dataDir, "marketing.db"));
-    try {
-      const row = database.prepare(`SELECT payload FROM ${table} WHERE id = ? AND workspace_id = ?`)
-        .get(id, workspaceId) as { payload: string } | undefined;
-      expect(row, `${table}/${id}`).toBeDefined();
-      return JSON.parse(row!.payload) as JsonRecord;
-    } finally {
-      database.close();
-    }
-  }
-
-  function competitorForEvidence(evidenceId: string): JsonRecord {
-    const database = new DatabaseSync(join(dataDir, "marketing.db"));
-    try {
-      const row = database.prepare(
-        `SELECT c.payload FROM competitors c
-         JOIN competitor_evidence ce ON ce.competitor_id = c.id
-         WHERE ce.evidence_id = ? AND c.workspace_id = ?`,
-      ).get(evidenceId, workspaceId) as { payload: string } | undefined;
-      expect(row, `competitor for ${evidenceId}`).toBeDefined();
-      return JSON.parse(row!.payload) as JsonRecord;
-    } finally {
-      database.close();
-    }
-  }
-
   it("completes real file, HTTP, Chromium, research, diff, asset, and restart workflows", async () => {
     const first = await startClient();
     const { client } = first;
     const call = async (name: string, arguments_: JsonRecord): Promise<JsonRecord> =>
       payload(await client.callTool({ name, arguments: arguments_ }));
+    const get = async (entityType: string, id: string, target = client): Promise<JsonRecord> =>
+      payload(await target.callTool({ name: "data_research_get", arguments: { entityType, id, workspaceId } }));
+    const batchEvidence = async (batchId: string): Promise<JsonRecord[]> => {
+      const batch = await get("ingestion_batch", batchId);
+      return (batch.descriptors as JsonRecord).evidence as JsonRecord[];
+    };
 
     await call("workspace_create", {
       id: workspaceId,
@@ -213,7 +191,8 @@ describe("built data-research stdio acceptance", () => {
     expect(files).toMatchObject({ state: "completed", failures: [] });
     expect(files.datasetIds).toHaveLength(3);
     expect(files.evidenceIds).toHaveLength(3);
-    const fileEvidence = storedPayload("evidence", (files.evidenceIds as string[])[0]!);
+    const fileEvidence = (await batchEvidence(files.id as string))[0]!;
+    expect(fileEvidence.id).toBe((files.evidenceIds as string[])[0]);
     const fileAssets = fileEvidence.assets as { id: string; kind: string }[];
     const qualityAsset = fileAssets.find((asset) => asset.kind === "quality_report")!;
     const quality = await call("evidence_asset_get", {
@@ -248,7 +227,8 @@ describe("built data-research stdio acceptance", () => {
       authorization: `Bearer ${credentialValue}`,
     });
     const apiEvidenceId = (api.evidenceIds as string[])[0]!;
-    const apiEvidence = storedPayload("evidence", apiEvidenceId);
+    const apiEvidence = (await batchEvidence(api.id as string))[0]!;
+    expect(apiEvidence.id).toBe(apiEvidenceId);
     const originalAsset = (apiEvidence.assets as { id: string; kind: string }[])
       .find((asset) => asset.kind === "api_response")!;
     const original = await call("evidence_asset_get", {
@@ -270,7 +250,9 @@ describe("built data-research stdio acceptance", () => {
     });
     expect(links).toMatchObject({ state: "completed", failures: [] });
     const contentEvidenceIds = links.evidenceIds as string[];
+    const competitorIds = links.competitorIds as string[];
     expect(contentEvidenceIds).toHaveLength(2);
+    expect(competitorIds).toHaveLength(2);
 
     await call("research_session_create", {
       id: "session-e2e",
@@ -312,12 +294,9 @@ describe("built data-research stdio acceptance", () => {
     expect(requests.map((request) => request.path)).not.toContain("/outside");
     expect(requests.map((request) => request.path)).not.toContain("/research/too-deep");
 
-    const competitorIds = contentEvidenceIds.map((evidenceId) => {
-      const competitor = competitorForEvidence(evidenceId);
-      expect(competitor).toMatchObject({ status: "excluded", evidenceIds: [evidenceId] });
-      return competitor.id as string;
-    });
     for (const [index, id] of competitorIds.entries()) {
+      const candidate = await get("competitor", id);
+      expect(candidate.entity).toMatchObject({ status: "excluded", evidenceIds: [contentEvidenceIds[index]] });
       const confirmed = await call("competitor_confirm", {
         id,
         workspaceId,
@@ -330,7 +309,7 @@ describe("built data-research stdio acceptance", () => {
     const diff = await call("competitor_diff_create", {
       id: "diff-e2e",
       workspaceId,
-      competitorIds,
+      competitorIds: competitorIds as [string, string],
       dimensions: ["price", "cta"],
       ...context("diff"),
     });
@@ -345,15 +324,24 @@ describe("built data-research stdio acceptance", () => {
 
     await stopClient(first);
     const second = await startClient();
+    const restoredPlan = await get("data_request_plan", "plan-e2e", second.client);
+    expect(restoredPlan.entity).toMatchObject({ id: "plan-e2e", version: 3, round: 3 });
+    expect(restoredPlan.descriptors).toMatchObject({
+      rounds: [{ round: 1 }, { round: 2 }, { round: 3 }],
+      batches: [{ entityType: "ingestion_batch", id: "batch-files-e2e" }, { entityType: "ingestion_batch", id: "batch-api-e2e" }],
+    });
+    const restoredSession = await get("research_session", "session-e2e", second.client);
+    expect(restoredSession.entity).toMatchObject({ id: "session-e2e", version: 3, attemptCount: 2 });
+    expect((restoredSession.descriptors as JsonRecord).evidence).toHaveLength(2);
+    const restoredDiff = await get("competitor_diff", "diff-e2e", second.client);
+    expect(restoredDiff.entity).toMatchObject({ id: "diff-e2e", version: 1, competitorIds });
+    expect(restoredDiff.descriptors).toMatchObject({ entries: diff.entries });
     for (const [entityType, id, version] of [
       ["data_request_plan", "plan-e2e", 3],
       ["research_session", "session-e2e", 3],
       ["competitor_diff", "diff-e2e", 1],
     ] as const) {
-      const restored = payload(await second.client.callTool({
-        name: "data_research_get",
-        arguments: { entityType, id, workspaceId },
-      }));
+      const restored = await get(entityType, id, second.client);
       expect(restored.workspaceId).toBe(workspaceId);
       expect(restored.nodes).toContainEqual(expect.objectContaining({ entityType, id, version }));
     }
@@ -362,6 +350,7 @@ describe("built data-research stdio acceptance", () => {
       arguments: { workspaceId, evidenceId: apiEvidenceId, assetId: originalAsset.id },
     }));
     expect(restoredOriginal).toEqual(original);
+    expect(restoredOriginal).toMatchObject({ id: originalAsset.id, kind: "api_response", contentHash: original.contentHash, byteLength: original.byteLength });
     expect(second.stderr()).not.toContain(credentialValue);
     await stopClient(second);
   }, 90_000);
