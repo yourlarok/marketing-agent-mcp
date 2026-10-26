@@ -75,13 +75,21 @@ function assertStringArray(
 ): void {
   if (
     !Array.isArray(value) ||
-    (options.nonEmpty && value.length === 0) ||
-    value.some((entry) => typeof entry !== "string" || entry.trim().length === 0)
+    (options.nonEmpty && value.length === 0)
   ) {
     throw new DomainError(
       "INVALID_INPUT",
       `${field} must be ${options.nonEmpty ? "a non-empty" : "an"} array of non-empty strings`,
     );
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const entry = value[index];
+    if (typeof entry !== "string" || entry.trim().length === 0) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        `${field} must be ${options.nonEmpty ? "a non-empty" : "an"} array of non-empty strings`,
+      );
+    }
   }
   if (options.unique && new Set(value).size !== value.length) {
     throw new DomainError("INVALID_INPUT", `${field} must not contain duplicates`);

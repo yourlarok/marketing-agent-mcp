@@ -36,6 +36,14 @@ export function assertTaskDependencyGraph(
 ): void {
   const graph = new Map<string, readonly string[]>();
   for (const task of tasks) {
+    if (graph.has(task.id)) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "Task dependency graph must not contain duplicate node IDs",
+        false,
+        { taskId: task.id },
+      );
+    }
     graph.set(task.id, task.dependencyIds);
   }
   for (const [id, dependencyIds] of graph) {

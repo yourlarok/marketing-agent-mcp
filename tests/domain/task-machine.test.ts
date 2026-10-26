@@ -76,4 +76,16 @@ describe("task dependency graph", () => {
       expect.objectContaining<Partial<DomainError>>({ code: "CONFLICT" }),
     );
   });
+
+  it("rejects duplicate node IDs instead of overwriting graph edges", () => {
+    expect(() =>
+      assertTaskDependencyGraph([
+        { id: "task-a", dependencyIds: ["task-b"] },
+        { id: "task-a", dependencyIds: [] },
+        { id: "task-b", dependencyIds: ["task-a"] },
+      ]),
+    ).toThrowError(
+      expect.objectContaining<Partial<DomainError>>({ code: "INVALID_INPUT" }),
+    );
+  });
 });

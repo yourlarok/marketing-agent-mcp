@@ -1314,4 +1314,90 @@ describe("MarketingService recommendations and tasks", () => {
       ),
     ).toMatchObject({ action: "task.transition", entityId: "task-1" });
   });
+
+  it.each([
+    { label: "sparse IDs", findingIds: new Array(1) as never },
+    { label: "non-string IDs", findingIds: [42] as never },
+    { label: "blank IDs", findingIds: [" \t"] },
+    { label: "duplicate IDs", findingIds: ["finding-1", "finding-1"] },
+  ])(
+    "rejects recommendation $label from a direct service call without residue",
+    async ({ findingIds }) => {
+      const attemptContext = nextContext();
+      await expect(
+        service.createRecommendation({
+          input: { ...recommendationInput(), findingIds },
+          context: attemptContext,
+        }),
+      ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+
+      const persisted = await store.transaction(async (repos) => ({
+        recommendation: await repos.recommendations.get(
+          "recommendation-1",
+          "workspace-1",
+        ),
+        audit: await repos.audit.get("audit-5", "workspace-1"),
+        idempotency: await repos.idempotency.get(
+          "workspace-1",
+          attemptContext.idempotencyKey,
+        ),
+      }));
+      expect(persisted).toEqual({
+        recommendation: undefined,
+        audit: undefined,
+        idempotency: undefined,
+      });
+    },
+  );
+
+  it.each([
+    { field: "recommendationIds", label: "sparse IDs", value: new Array(1) as never },
+    { field: "recommendationIds", label: "non-string IDs", value: [42] as never },
+    { field: "recommendationIds", label: "blank IDs", value: [" \t"] },
+    {
+      field: "recommendationIds",
+      label: "duplicate IDs",
+      value: ["recommendation-1", "recommendation-1"],
+    },
+    { field: "dependencyIds", label: "sparse IDs", value: new Array(1) as never },
+    { field: "dependencyIds", label: "non-string IDs", value: [42] as never },
+    { field: "dependencyIds", label: "blank IDs", value: [" \t"] },
+    {
+      field: "dependencyIds",
+      label: "duplicate IDs",
+      value: ["dependency-1", "dependency-1"],
+    },
+    { field: "assetRequirements", label: "a sparse array", value: new Array(1) as never },
+    { field: "assetRequirements", label: "non-string entries", value: [42] as never },
+    { field: "assetRequirements", label: "blank entries", value: [" \t"] },
+    { field: "acceptanceCriteria", label: "a sparse array", value: new Array(1) as never },
+    { field: "acceptanceCriteria", label: "non-string entries", value: [42] as never },
+    { field: "acceptanceCriteria", label: "blank entries", value: [" \t"] },
+  ])(
+    "rejects task $field with $label from a direct service call without residue",
+    async ({ field, value }) => {
+      await createRecommendation();
+      const attemptContext = nextContext();
+      await expect(
+        service.createTask({
+          input: { ...taskInput(), [field]: value },
+          context: attemptContext,
+        }),
+      ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+
+      const persisted = await store.transaction(async (repos) => ({
+        task: await repos.tasks.get("task-1", "workspace-1"),
+        audit: await repos.audit.get("audit-6", "workspace-1"),
+        idempotency: await repos.idempotency.get(
+          "workspace-1",
+          attemptContext.idempotencyKey,
+        ),
+      }));
+      expect(persisted).toEqual({
+        task: undefined,
+        audit: undefined,
+        idempotency: undefined,
+      });
+    },
+  );
 });
