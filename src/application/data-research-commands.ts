@@ -3,6 +3,7 @@ import type {
   QuestionType,
 } from "../domain/data-preparation.js";
 import type { EvidenceAsset } from "../domain/model.js";
+import type { ResearchExpansion, ResearchLimits, ResearchScope } from "../domain/data-research-model.js";
 import type { IngestLimits, ParsedFileBatch } from "../infrastructure/file-ingestor.js";
 
 export interface CreateDataRequestPlan {
@@ -62,6 +63,29 @@ export interface IngestContentLinks {
     url: string;
     fields?: Record<string, string>;
   }[];
+}
+
+export interface CreateResearchSession {
+  id: string;
+  workspaceId: string;
+  goal: string;
+  seeds: string[];
+  expansion: boolean;
+  scope: ResearchScope;
+}
+
+export interface SetResearchPermission {
+  id: string;
+  workspaceId: string;
+  expectedVersion: number;
+  expansion: Extract<ResearchExpansion, "allowed" | "denied">;
+}
+
+export interface RunResearch {
+  id: string;
+  workspaceId: string;
+  expectedVersion: number;
+  limits?: Partial<ResearchLimits>;
 }
 
 export interface EvidenceAssetQuery {

@@ -17,6 +17,7 @@ export interface AcquiredPage {
   title: string;
   text: string;
   fields: Record<string, string>;
+  links?: string[];
   screenshot: Buffer;
   provider: "mcp" | "playwright";
   toolVersion: string;
@@ -154,6 +155,9 @@ export class PlaywrightAcquisitionProvider implements AcquisitionProvider {
       if (downloadDenied) {
         throw unavailable("download_denied", "Content acquisition downloads are disabled");
       }
+      const links = await page.locator("css=a[href]").evaluateAll((anchors) =>
+        anchors.slice(0, 1_000).map((anchor) => anchor.getAttribute("href")!)
+      );
       let screenshot: Buffer;
       try {
         screenshot = Buffer.from(await this.captureScreenshot(page));
@@ -173,6 +177,7 @@ export class PlaywrightAcquisitionProvider implements AcquisitionProvider {
         title: await page.title(),
         text,
         fields,
+        links,
         screenshot,
         provider: "playwright",
         toolVersion: browser.version(),

@@ -17,6 +17,7 @@ const acquiredPageSchema = z.object({
   title: z.string(),
   text: z.string(),
   fields: z.record(z.string(), z.string()),
+  links: z.array(z.string().max(8_192)).max(1_000).optional(),
   screenshotBase64: z.string().max(14_000_000),
 });
 
@@ -144,6 +145,7 @@ function parseSuccess(content: unknown, request: AcquireRequest): Omit<AcquiredP
       title: parsed.title,
       text: parsed.text,
       fields: parsed.fields,
+      ...(parsed.links ? { links: parsed.links } : {}),
       screenshot,
     };
   } catch (error) {

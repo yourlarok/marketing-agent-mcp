@@ -9,10 +9,15 @@ import {
   type DataRequestPlanDetails,
   type QuestionType,
 } from "../domain/data-preparation.js";
-import type {
-  DataRequestPlan,
-  IngestionBatch,
-  IngestionFileFailure,
+import {
+  RESEARCH_LIMIT_CEILINGS,
+  type DataRequestPlan,
+  type IngestionBatch,
+  type IngestionFileFailure,
+  type ResearchGap,
+  type ResearchLimits,
+  type ResearchScope,
+  type ResearchSession,
 } from "../domain/data-research-model.js";
 import { DomainError } from "../domain/errors.js";
 import type { Dataset, Evidence, Source } from "../domain/model.js";
@@ -34,6 +39,7 @@ import {
 } from "./commands.js";
 import type {
   CreateDataRequestPlan,
+  CreateResearchSession,
   DeclineDataRound,
   EvidenceAssetContent,
   EvidenceAssetQuery,
@@ -41,6 +47,8 @@ import type {
   IngestContentLinks,
   IngestTemporaryApi,
   ReconcileDataRequestPlan,
+  RunResearch,
+  SetResearchPermission,
 } from "./data-research-commands.js";
 import type {
   Clock,
@@ -189,6 +197,86 @@ interface PreparedLink {
   screenshot: StoredArtifact;
 }
 
+interface PreparedResearch {
+  pages: PreparedLink[];
+  gaps: ResearchGap[];
+  stopReason: string;
+  limits: ResearchLimits;
+}
+
+function canonicalResearchUrl(value: unknown, field = "url"): string {
+  assertNonEmptyString(value, field);
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    invalid(`${field} must be a valid URL`);
+  }
+  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) {
+    invalid(`${field} must be HTTP or HTTPS without userinfo`);
+  }
+  url.hash = "";
+  return url.href;
+}
+
+function researchLimit(value: unknown, field: keyof ResearchLimits, ceiling: number): number {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > ceiling) {
+    invalid(`${field} must be a positive integer no greater than ${ceiling}`);
+  }
+  return value as number;
+}
+
+function normalizeResearchLimits(value: unknown): ResearchLimits {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    invalid("scope limits must be an object");
+  }
+  const limits = value as Record<string, unknown>;
+  return {
+    maxDepth: researchLimit(limits.maxDepth, "maxDepth", RESEARCH_LIMIT_CEILINGS.maxDepth),
+    maxPages: researchLimit(limits.maxPages, "maxPages", RESEARCH_LIMIT_CEILINGS.maxPages),
+    maxDurationMs: researchLimit(limits.maxDurationMs, "maxDurationMs", RESEARCH_LIMIT_CEILINGS.maxDurationMs),
+    maxBytes: researchLimit(limits.maxBytes, "maxBytes", RESEARCH_LIMIT_CEILINGS.maxBytes),
+  };
+}
+
+function normalizeResearchScope(value: unknown): ResearchScope {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    invalid("scope must be an object");
+  }
+  const scope = value as Record<string, unknown>;
+  if (!Array.isArray(scope.hosts) || scope.hosts.length === 0 || scope.hosts.length > 100) {
+    invalid("scope.hosts must be a non-empty array with at most 100 hosts");
+  }
+  const hosts = scope.hosts.map((host) => {
+    assertNonEmptyString(host, "scope.hosts");
+    if (/[\s@/?#]/.test(host)) {
+      invalid("scope.hosts must contain host names only");
+    }
+    return host.toLowerCase();
+  });
+  if (!Array.isArray(scope.pathPrefixes) || scope.pathPrefixes.length === 0 || scope.pathPrefixes.length > 100) {
+    invalid("scope.pathPrefixes must be a non-empty array with at most 100 paths");
+  }
+  const pathPrefixes = scope.pathPrefixes.map((path) => {
+    assertNonEmptyString(path, "scope.pathPrefixes");
+    if (!path.startsWith("/")) {
+      invalid("scope.pathPrefixes must start with /");
+    }
+    return path;
+  });
+  return { hosts: [...new Set(hosts)], pathPrefixes: [...new Set(pathPrefixes)], ...normalizeResearchLimits(scope) };
+}
+
+function inResearchScope(value: string, scope: ResearchScope): boolean {
+  try {
+    const url = new URL(value);
+    return scope.hosts.includes(url.hostname.toLowerCase()) &&
+      scope.pathPrefixes.some((prefix) => url.pathname.startsWith(prefix));
+  } catch {
+    return false;
+  }
+}
+
 function csvCell(value: unknown): string {
   if (value !== null && typeof value !== "string" && typeof value !== "boolean" &&
     (typeof value !== "number" || !Number.isFinite(value))) {
@@ -229,6 +317,323 @@ export class DataResearchService {
     private readonly acquisition: AcquisitionProvider = AcquisitionRouter.fromEnvironment(),
   ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
+  }
+
+  createResearchSession(command: Command<CreateResearchSession>): Promise<ResearchSession> {
+    const input = command.input;
+    assertNonEmptyString(input.goal, "goal");
+    if (typeof input.expansion !== "boolean") {
+      invalid("expansion must be a boolean");
+    }
+    if (!Array.isArray(input.seeds) || input.seeds.length === 0 || input.seeds.length > 100) {
+      invalid("seeds must be a non-empty array with at most 100 URLs");
+    }
+    const scope = normalizeResearchScope(input.scope);
+    const seeds = [...new Set(input.seeds.map((seed) => canonicalResearchUrl(seed, "seeds")))];
+    for (const seed of seeds) {
+      if (!inResearchScope(seed, scope)) {
+        invalid("Every seed must be inside scope.hosts and scope.pathPrefixes");
+      }
+    }
+    const normalized = { ...input, goal: input.goal.trim(), seeds, scope };
+
+    return this.commands.execute({
+      workspaceId: input.workspaceId,
+      action: "research_session.create",
+      entityType: "research_session",
+      input: normalized,
+      context: command.context,
+      write: async (repos, current, timestamp) => {
+        await requireWorkspace(repos, current.workspaceId);
+        const session: ResearchSession = {
+          id: current.id,
+          workspaceId: current.workspaceId,
+          version: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          goal: current.goal,
+          seeds: [...current.seeds],
+          scope: current.scope,
+          limits: {
+            maxDepth: current.scope.maxDepth,
+            maxPages: current.scope.maxPages,
+            maxDurationMs: current.scope.maxDurationMs,
+            maxBytes: current.scope.maxBytes,
+          },
+          expansion: current.expansion ? "awaiting_permission" : "not_requested",
+          state: current.expansion ? "awaiting_permission" : "ready",
+          stopReason: null,
+          gaps: [],
+          evidenceIds: [],
+        };
+        return repos.researchSessions.insert(session) as Promise<ResearchSession>;
+      },
+    });
+  }
+
+  setResearchPermission(command: Command<SetResearchPermission>): Promise<ResearchSession> {
+    const input = command.input;
+    if (input.expansion !== "allowed" && input.expansion !== "denied") {
+      invalid("expansion permission must be allowed or denied");
+    }
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
+      invalid("expectedVersion must be a positive integer");
+    }
+    return this.commands.execute({
+      workspaceId: input.workspaceId,
+      action: "research_session.permission",
+      entityType: "research_session",
+      input,
+      context: command.context,
+      write: async (repos, current, timestamp) => {
+        const session = await this.loadResearchSession(repos, current.id, current.workspaceId, current.expectedVersion);
+        if (session.expansion !== "awaiting_permission" || session.state !== "awaiting_permission") {
+          throw new DomainError("CONFLICT", "Research expansion is not awaiting permission", false, { id: session.id });
+        }
+        return repos.researchSessions.update({
+          ...session,
+          expansion: current.expansion,
+          state: "ready",
+          updatedAt: timestamp,
+        }, current.expectedVersion) as Promise<ResearchSession>;
+      },
+    });
+  }
+
+  async runResearch(command: Command<RunResearch>): Promise<ResearchSession> {
+    const input = command.input;
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
+      invalid("expectedVersion must be a positive integer");
+    }
+    if (input.limits !== undefined &&
+      (input.limits === null || typeof input.limits !== "object" || Array.isArray(input.limits))) {
+      invalid("limits must be an object");
+    }
+
+    let prepared: PreparedResearch | undefined;
+    const prepare = async (): Promise<void> => {
+      prepared = undefined;
+      const session = await this.store.transaction((repos) =>
+        this.loadResearchSession(repos, input.id, input.workspaceId, input.expectedVersion)
+      );
+      if (session.state !== "ready" && session.state !== "awaiting_permission") {
+        throw new DomainError("CONFLICT", "Research session has already run", false, { id: session.id });
+      }
+      const limits = { ...session.limits };
+      for (const key of Object.keys(RESEARCH_LIMIT_CEILINGS) as (keyof ResearchLimits)[]) {
+        const requested = input.limits?.[key];
+        if (requested !== undefined) {
+          limits[key] = researchLimit(requested, key, session.limits[key]);
+        }
+      }
+      prepared = await this.crawlResearch(session, limits);
+    };
+
+    return this.commands.executeBatch({
+      workspaceId: input.workspaceId,
+      action: "research_session.run",
+      entityType: "research_session",
+      input,
+      context: command.context,
+      write: async (repos, _current, timestamp) => {
+        const session = await this.loadResearchSession(repos, input.id, input.workspaceId, input.expectedVersion);
+        if (session.state !== "ready" && session.state !== "awaiting_permission") {
+          throw new DomainError("CONFLICT", "Research session has already run", false, { id: session.id });
+        }
+        if (!prepared) {
+          throw new Error("Research preparation did not complete");
+        }
+        return this.writeResearchResult(repos, session, prepared, timestamp);
+      },
+    }, prepare);
+  }
+
+  private async loadResearchSession(
+    repos: Repositories,
+    id: string,
+    workspaceId: string,
+    expectedVersion: number,
+  ): Promise<ResearchSession> {
+    const session = await repos.researchSessions.get(id, workspaceId);
+    if (!session) {
+      throw new DomainError("NOT_FOUND", "Research session not found in workspace", false, { id, workspaceId });
+    }
+    if (session.version !== expectedVersion) {
+      throw new DomainError("CONFLICT", "Research session version does not match", false, { id });
+    }
+    return session;
+  }
+
+  private async crawlResearch(session: ResearchSession, limits: ResearchLimits): Promise<PreparedResearch> {
+    const queue = session.seeds.map((url) => ({ url, depth: 0 }));
+    const visited = new Set(queue.map((item) => item.url));
+    const pages: PreparedLink[] = [];
+    const gaps: ResearchGap[] = [];
+    const startedAt = Date.now();
+    let attempts = 0;
+    let bytes = 0;
+    let stopReason = "completed";
+    let depthLimited = false;
+
+    while (queue.length > 0) {
+      if (attempts >= limits.maxPages) {
+        stopReason = "max_pages";
+        break;
+      }
+      if (Date.now() - startedAt >= limits.maxDurationMs) {
+        stopReason = "max_duration";
+        break;
+      }
+      const current = queue.shift()!;
+      attempts += 1;
+      let page: AcquiredPage;
+      try {
+        page = await this.acquisition.acquire({ url: current.url });
+      } catch (error) {
+        gaps.push({
+          url: current.url,
+          reason: "acquisition_failed",
+          message: error instanceof Error ? error.message : "Content acquisition failed",
+        });
+        continue;
+      }
+
+      let finalUrl: string;
+      try {
+        finalUrl = canonicalResearchUrl(page.finalUrl, "finalUrl");
+      } catch {
+        gaps.push({ url: current.url, reason: "invalid_final_url", message: "Acquisition returned an invalid final URL" });
+        continue;
+      }
+      if (!inResearchScope(finalUrl, session.scope)) {
+        gaps.push({ url: current.url, reason: "out_of_scope", message: "Acquisition finished outside the approved scope" });
+        continue;
+      }
+      const serialized = Buffer.from(JSON.stringify({
+        url: current.url,
+        finalUrl,
+        title: page.title,
+        text: page.text,
+        fields: page.fields,
+        provider: page.provider,
+      }));
+      const pageBytes = serialized.length + page.screenshot.length;
+      if (bytes + pageBytes > limits.maxBytes) {
+        gaps.push({ url: current.url, reason: "max_bytes", message: "Research byte limit reached" });
+        stopReason = "max_bytes";
+        break;
+      }
+      const [text, screenshot] = await Promise.all([
+        this.artifacts.put(serialized),
+        this.artifacts.put(page.screenshot),
+      ]);
+      pages.push({ page: { ...page, url: current.url, finalUrl }, text, screenshot });
+      bytes += pageBytes;
+
+      if (session.expansion === "allowed") {
+        for (const link of page.links ?? []) {
+          let candidate: string;
+          try {
+            candidate = canonicalResearchUrl(new URL(link, finalUrl).href, "link");
+          } catch {
+            continue;
+          }
+          if (!inResearchScope(candidate, session.scope) || visited.has(candidate)) {
+            continue;
+          }
+          if (current.depth >= limits.maxDepth) {
+            depthLimited = true;
+            continue;
+          }
+          visited.add(candidate);
+          queue.push({ url: candidate, depth: current.depth + 1 });
+        }
+      }
+      if (Date.now() - startedAt >= limits.maxDurationMs) {
+        stopReason = "max_duration";
+        break;
+      }
+    }
+
+    if (stopReason === "completed") {
+      if (depthLimited) {
+        stopReason = "max_depth";
+      } else if (session.expansion === "awaiting_permission") {
+        stopReason = "permission_required";
+      } else if (session.expansion === "denied") {
+        stopReason = "permission_denied";
+      }
+    }
+    return { pages, gaps, stopReason, limits };
+  }
+
+  private async writeResearchResult(
+    repos: Repositories,
+    session: ResearchSession,
+    prepared: PreparedResearch,
+    timestamp: string,
+  ): Promise<ResearchSession> {
+    const evidenceIds: string[] = [];
+    for (const preparedPage of prepared.pages) {
+      const { page } = preparedPage;
+      const source: Source = {
+        id: this.ids.next(),
+        workspaceId: session.workspaceId,
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        name: page.title || page.finalUrl,
+        type: "link",
+        ownership: "external_public",
+        metadata: {
+          url: page.url,
+          finalUrl: page.finalUrl,
+          title: page.title,
+          fields: page.fields,
+          provider: page.provider,
+          toolVersion: page.toolVersion,
+        },
+      };
+      await repos.sources.insert(source);
+      const evidence: Evidence = {
+        id: this.ids.next(),
+        workspaceId: session.workspaceId,
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        sourceId: source.id,
+        sourceLocator: page.url,
+        observedAt: timestamp,
+        summary: `Observed public research page ${page.finalUrl}`,
+        contentHash: preparedPage.text.contentHash,
+        classification: "external_observation",
+        assets: [
+          { id: this.ids.next(), kind: "page_text", ...preparedPage.text },
+          { id: this.ids.next(), kind: "screenshot", ...preparedPage.screenshot },
+        ],
+        toolHealth: {
+          purpose: "tool_health",
+          capabilityId: page.provider,
+          healthy: true,
+          checkedAt: timestamp,
+          toolVersion: page.toolVersion,
+        },
+      };
+      await repos.evidence.insert(evidence);
+      evidenceIds.push(evidence.id);
+    }
+    const state = prepared.stopReason === "completed" && prepared.gaps.length === 0
+      ? "completed"
+      : prepared.pages.length === 0 ? "blocked" : "partial";
+    return repos.researchSessions.update({
+      ...session,
+      limits: prepared.limits,
+      state,
+      stopReason: prepared.stopReason,
+      gaps: prepared.gaps,
+      evidenceIds,
+      updatedAt: timestamp,
+    }, session.version) as Promise<ResearchSession>;
   }
 
   async importFiles(command: Command<ImportFiles>): Promise<IngestionBatch> {

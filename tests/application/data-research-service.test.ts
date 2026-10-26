@@ -28,6 +28,7 @@ import type {
 } from "../../src/domain/data-research-model.js";
 import type { DomainError } from "../../src/domain/errors.js";
 import { ArtifactStore } from "../../src/infrastructure/artifact-store.js";
+import type { AcquiredPage, AcquisitionProvider } from "../../src/infrastructure/acquisition-router.js";
 import { SafeHttpClient } from "../../src/infrastructure/safe-http.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
@@ -63,7 +64,21 @@ function ingestionBatch(id = "batch-1"): IngestionBatch {
 }
 
 function researchSession(id = "session-1"): ResearchSession {
-  return { ...entity(id), evidenceIds: ["evidence-2", "evidence-1"] };
+  return {
+    ...entity(id),
+    goal: "Research public pages",
+    seeds: ["https://example.com/research"],
+    scope: {
+      hosts: ["example.com"], pathPrefixes: ["/research"], maxDepth: 2,
+      maxPages: 20, maxDurationMs: 60_000, maxBytes: 25 * 1024 * 1024,
+    },
+    limits: { maxDepth: 2, maxPages: 20, maxDurationMs: 60_000, maxBytes: 25 * 1024 * 1024 },
+    expansion: "not_requested",
+    state: "ready",
+    stopReason: null,
+    gaps: [],
+    evidenceIds: ["evidence-2", "evidence-1"],
+  };
 }
 
 function competitor(id = "competitor-1"): Competitor {
@@ -1299,5 +1314,238 @@ describe("DataResearchService atomic imports and evidence assets", () => {
       }) as never)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
       expect(hits()).toBe(0);
     });
+  });
+});
+
+describe("DataResearchService permission-bounded research", () => {
+  const seed = "https://example.com/research/start";
+  let store: Store;
+  let artifacts: ArtifactStore;
+  let artifactRoot: string;
+  let provider: FakeAcquisitionProvider;
+  let service: DataResearchService;
+  let sequence: number;
+
+  class FakeAcquisitionProvider implements AcquisitionProvider {
+    readonly pages = new Map<string, AcquiredPage>();
+    readonly failures = new Map<string, Error>();
+    readonly hits: string[] = [];
+    delayMs = 0;
+
+    add(url: string, links: string[] = [], text = `Observed ${url}`): void {
+      this.pages.set(new URL(url).href, {
+        url: new URL(url).href,
+        finalUrl: new URL(url).href,
+        title: `Title ${new URL(url).pathname}`,
+        text,
+        fields: {},
+        links,
+        screenshot: Buffer.from(`screenshot:${url}`),
+        provider: "playwright",
+        toolVersion: "fixture-1",
+      });
+    }
+
+    async acquire(request: { url: string }): Promise<AcquiredPage> {
+      this.hits.push(request.url);
+      if (this.delayMs > 0) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, this.delayMs));
+      }
+      const failure = this.failures.get(new URL(request.url).href);
+      if (failure) {
+        throw failure;
+      }
+      const page = this.pages.get(new URL(request.url).href);
+      if (!page) {
+        throw new Error(`Unexpected acquisition: ${request.url}`);
+      }
+      return { ...page, url: request.url };
+    }
+  }
+
+  function context(suffix: string): CommandContext {
+    return { actor: "agent-1", requestId: `request-${suffix}`, idempotencyKey: `command-${suffix}` };
+  }
+
+  function createCommand(id: string, extra: Record<string, unknown> = {}) {
+    return {
+      input: {
+        id,
+        workspaceId: "workspace-1",
+        goal: "Map public competitor evidence",
+        seeds: [seed],
+        expansion: true,
+        scope: {
+          hosts: ["example.com"],
+          pathPrefixes: ["/research"],
+          maxDepth: 2,
+          maxPages: 10,
+          maxDurationMs: 1_000,
+          maxBytes: 100_000,
+        },
+        ...extra,
+      },
+      context: context(`${id}-create`),
+    };
+  }
+
+  async function create(id: string, extra: Record<string, unknown> = {}): Promise<ResearchSession> {
+    return service.createResearchSession(createCommand(id, extra));
+  }
+
+  function permissionCommand(id: string, expectedVersion: number, expansion: "allowed" | "denied") {
+    return {
+      input: { id, workspaceId: "workspace-1", expectedVersion, expansion },
+      context: context(`${id}-${expansion}`),
+    };
+  }
+
+  function runCommand(id: string, expectedVersion: number, limits: Record<string, number> = {}) {
+    return {
+      input: { id, workspaceId: "workspace-1", expectedVersion, limits },
+      context: context(`${id}-run`),
+    };
+  }
+
+  beforeEach(async () => {
+    store = openStore(":memory:");
+    artifactRoot = await createTempDir();
+    artifacts = new ArtifactStore(artifactRoot);
+    provider = new FakeAcquisitionProvider();
+    provider.add(seed, [
+      `${seed}#cycle`,
+      "https://example.com/research/child?b=2&a=1#fragment",
+      "https://other.example/research/off-host",
+      "https://example.com/outside/off-path",
+    ]);
+    provider.add("https://example.com/research/child?b=2&a=1", [
+      "https://example.com/research/grand",
+      "https://example.com/research/child?b=2&a=1#duplicate",
+    ]);
+    provider.add("https://example.com/research/grand", ["https://example.com/research/too-deep"]);
+    provider.add("https://example.com/research/too-deep");
+    sequence = 0;
+    service = new DataResearchService(
+      store,
+      { now: () => now },
+      { next: () => `research-${++sequence}` },
+      artifacts,
+      undefined,
+      provider,
+    );
+    await store.transaction((repos) => repos.workspaces.insert(entity("workspace-1")));
+  });
+
+  afterEach(async () => {
+    store.close();
+    await removeTempDir(artifactRoot);
+  });
+
+  it("does not expand before permission or after denial, while still processing seeds", async () => {
+    const awaiting = await create("awaiting-research");
+    expect(awaiting).toMatchObject({ expansion: "awaiting_permission", state: "awaiting_permission" });
+    expect(await store.transaction((repos) => repos.researchSessions.get(awaiting.id, "workspace-1"))).toEqual(awaiting);
+
+    const unapproved = await service.runResearch(runCommand(awaiting.id, 1));
+    expect(unapproved).toMatchObject({
+      expansion: "awaiting_permission",
+      state: "partial",
+      stopReason: "permission_required",
+    });
+    expect(unapproved.evidenceIds).toHaveLength(1);
+    expect(provider.hits).toEqual([seed]);
+
+    const deniedSession = await create("denied-research");
+    const denied = await service.setResearchPermission(permissionCommand(deniedSession.id, 1, "denied"));
+    expect(denied).toMatchObject({ expansion: "denied", state: "ready" });
+    const result = await service.runResearch(runCommand(deniedSession.id, 2));
+    expect(result).toMatchObject({ expansion: "denied", stopReason: "permission_denied" });
+    expect(result.evidenceIds).toHaveLength(1);
+    expect(provider.hits).toEqual([seed, seed]);
+  });
+
+  it("crawls only approved in-scope canonical URLs within depth and replays without browsing", async () => {
+    const created = await create("allowed-research", { seeds: [`${seed}#first`, seed] });
+    await service.setResearchPermission(permissionCommand(created.id, 1, "allowed"));
+    const command = runCommand(created.id, 2);
+
+    const result = await service.runResearch(command);
+    expect(result).toMatchObject({ state: "partial", stopReason: "max_depth" });
+    expect(result.evidenceIds).toHaveLength(3);
+    expect(provider.hits).toEqual([
+      seed,
+      "https://example.com/research/child?b=2&a=1",
+      "https://example.com/research/grand",
+    ]);
+
+    const evidence = await store.transaction(async (repos) => Promise.all(
+      result.evidenceIds.map((id) => repos.evidence.get(id, "workspace-1")),
+    ));
+    expect(evidence.every((item) => item?.classification === "external_observation")).toBe(true);
+    expect(evidence.map((item) => item?.sourceLocator)).toEqual([
+      seed,
+      "https://example.com/research/child?b=2&a=1",
+      "https://example.com/research/grand",
+    ]);
+
+    await expect(service.runResearch(command)).resolves.toEqual(result);
+    expect(provider.hits).toHaveLength(3);
+  });
+
+  it("lets callers lower page limits but rejects raising configured ceilings before I/O", async () => {
+    const created = await create("limited-research");
+    await service.setResearchPermission(permissionCommand(created.id, 1, "allowed"));
+
+    const limited = await service.runResearch(runCommand(created.id, 2, { maxPages: 1, maxDepth: 1 }));
+    expect(limited).toMatchObject({ stopReason: "max_pages" });
+    expect(limited.evidenceIds).toHaveLength(1);
+    expect(provider.hits).toEqual([seed]);
+
+    const rejected = await create("excessive-research", {
+      scope: {
+        hosts: ["example.com"], pathPrefixes: ["/research"], maxDepth: 2,
+        maxPages: 1_000_000, maxDurationMs: 1_000, maxBytes: 100_000,
+      },
+    }).catch((error: unknown) => error);
+    expect(rejected).toMatchObject({ code: "INVALID_INPUT" });
+
+    const excessiveRun = await create("excessive-run");
+    await service.setResearchPermission(permissionCommand(excessiveRun.id, 1, "allowed"));
+    const hits = provider.hits.length;
+    await expect(service.runResearch(runCommand(excessiveRun.id, 2, { maxPages: 11 })))
+      .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    expect(provider.hits).toHaveLength(hits);
+  });
+
+  it("enforces cumulative byte and elapsed-time ceilings and records the stop reason", async () => {
+    const byteSession = await create("byte-research");
+    await service.setResearchPermission(permissionCommand(byteSession.id, 1, "allowed"));
+    const byteLimited = await service.runResearch(runCommand(byteSession.id, 2, { maxBytes: 1 }));
+    expect(byteLimited).toMatchObject({ state: "blocked", stopReason: "max_bytes" });
+    expect(byteLimited.evidenceIds).toEqual([]);
+    expect(byteLimited.gaps[0]).toMatchObject({ url: seed, reason: "max_bytes" });
+
+    const timeSession = await create("time-research");
+    await service.setResearchPermission(permissionCommand(timeSession.id, 1, "allowed"));
+    provider.delayMs = 5;
+    const timeLimited = await service.runResearch(runCommand(timeSession.id, 2, { maxDurationMs: 1 }));
+    expect(timeLimited.stopReason).toBe("max_duration");
+    expect(timeLimited.evidenceIds).toHaveLength(1);
+  });
+
+  it("preserves successful evidence and an explicit gap when one seed fails", async () => {
+    const failed = "https://example.com/research/failure";
+    provider.failures.set(failed, new Error("fixture page failed"));
+    const created = await create("partial-research", { seeds: [seed, failed], expansion: false });
+
+    const result = await service.runResearch(runCommand(created.id, 1));
+    expect(result).toMatchObject({ expansion: "not_requested", state: "partial" });
+    expect(result.evidenceIds).toHaveLength(1);
+    expect(result.gaps).toEqual([{
+      url: failed,
+      reason: "acquisition_failed",
+      message: "fixture page failed",
+    }]);
+    expect(provider.hits).toEqual([seed, failed]);
   });
 });

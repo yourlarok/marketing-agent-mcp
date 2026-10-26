@@ -508,4 +508,70 @@ describe("content acquisition", () => {
       await removeTempDir(artifactRoot);
     }
   }, 20_000);
+
+  it("runs a real bounded multi-page session without requesting off-scope or duplicate links", async () => {
+    const hits: string[] = [];
+    const researchServer = createServer((request, response) => {
+      const path = new URL(request.url ?? "/", "http://fixture.local").pathname;
+      hits.push(path);
+      const port = (researchServer.address() as AddressInfo).port;
+      const links: Record<string, string> = {
+        "/research/start": `<a href="/research/child#first">child</a><a href="/research/start#cycle">cycle</a><a href="http://localhost:${port}/research/off-host">off host</a><a href="/outside">off path</a>`,
+        "/research/child": `<a href="/research/child#duplicate">duplicate</a><a href="/research/grand">grand</a>`,
+        "/research/grand": "leaf",
+        "/outside": "must not be acquired",
+      };
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end(`<html><head><title>${path}</title></head><body>${links[path] ?? "not found"}</body></html>`);
+    });
+    const researchBase = await serve(researchServer);
+    const store = openStore(":memory:");
+    const artifactRoot = await createTempDir();
+    let sequence = 0;
+    const service = new DataResearchService(
+      store,
+      { now: () => now },
+      { next: () => `bounded-${++sequence}` },
+      new ArtifactStore(artifactRoot),
+      undefined,
+      new AcquisitionRouter({ playwright: playwright() }),
+    );
+    try {
+      await store.transaction((repos) => repos.workspaces.insert({
+        id: "workspace-1", workspaceId: "workspace-1", version: 1,
+        createdAt: now, updatedAt: now, name: "Workspace",
+      }));
+      const created = await service.createResearchSession({
+        input: {
+          id: "bounded-session",
+          workspaceId: "workspace-1",
+          goal: "Inspect bounded public pages",
+          seeds: [`${researchBase}/research/start#seed`],
+          expansion: true,
+          scope: {
+            hosts: ["127.0.0.1"], pathPrefixes: ["/research"], maxDepth: 2,
+            maxPages: 2, maxDurationMs: 15_000, maxBytes: 25 * 1024 * 1024,
+          },
+        },
+        context: { actor: "agent-1", requestId: "request-bounded-create", idempotencyKey: "command-bounded-create" },
+      });
+      await service.setResearchPermission({
+        input: { id: created.id, workspaceId: "workspace-1", expectedVersion: 1, expansion: "allowed" },
+        context: { actor: "agent-1", requestId: "request-bounded-allow", idempotencyKey: "command-bounded-allow" },
+      });
+      const result = await service.runResearch({
+        input: { id: created.id, workspaceId: "workspace-1", expectedVersion: 2, limits: {} },
+        context: { actor: "agent-1", requestId: "request-bounded-run", idempotencyKey: "command-bounded-run" },
+      });
+
+      expect(result).toMatchObject({ state: "partial", stopReason: "max_pages" });
+      expect(result.evidenceIds).toHaveLength(2);
+      expect(hits).toEqual(["/research/start", "/research/child"]);
+    } finally {
+      store.close();
+      researchServer.closeAllConnections();
+      await new Promise<void>((resolveClose) => researchServer.close(() => resolveClose()));
+      await removeTempDir(artifactRoot);
+    }
+  }, 20_000);
 });

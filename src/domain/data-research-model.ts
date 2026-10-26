@@ -21,7 +21,57 @@ export interface IngestionBatch extends EntityRecord {
   failures: IngestionFileFailure[];
 }
 
+export const RESEARCH_EXPANSION_STATES = [
+  "not_requested",
+  "awaiting_permission",
+  "allowed",
+  "denied",
+] as const;
+export type ResearchExpansion = (typeof RESEARCH_EXPANSION_STATES)[number];
+
+export const RESEARCH_SESSION_STATES = [
+  "awaiting_permission",
+  "ready",
+  "completed",
+  "partial",
+  "blocked",
+] as const;
+export type ResearchSessionState = (typeof RESEARCH_SESSION_STATES)[number];
+
+export const RESEARCH_LIMIT_CEILINGS = {
+  maxDepth: 2,
+  maxPages: 20,
+  maxDurationMs: 60_000,
+  maxBytes: 25 * 1024 * 1024,
+} as const;
+
+export interface ResearchLimits {
+  maxDepth: number;
+  maxPages: number;
+  maxDurationMs: number;
+  maxBytes: number;
+}
+
+export interface ResearchScope extends ResearchLimits {
+  hosts: string[];
+  pathPrefixes: string[];
+}
+
+export interface ResearchGap {
+  url: string;
+  reason: string;
+  message: string;
+}
+
 export interface ResearchSession extends EntityRecord {
+  goal: string;
+  seeds: string[];
+  scope: ResearchScope;
+  limits: ResearchLimits;
+  expansion: ResearchExpansion;
+  state: ResearchSessionState;
+  stopReason: string | null;
+  gaps: ResearchGap[];
   evidenceIds: string[];
 }
 
