@@ -1,26 +1,12 @@
 import { z } from "zod";
+import { isSecretLikeKey } from "../domain/secrets.js";
+
+export { isSecretLikeKey } from "../domain/secrets.js";
 
 export const MAX_SERIALIZED_INPUT_BYTES = 64 * 1024;
 export const MAX_COLLECTION_ENTRIES = 1_000;
 export const MAX_KEY_LENGTH = 128;
 export const MAX_ID_LENGTH = 256;
-
-const secretKeyNames = [
-  "accesskey",
-  "apikey",
-  "authorization",
-  "cookie",
-  "credential",
-  "credentials",
-  "password",
-  "passwd",
-  "privatekey",
-  "secret",
-  "secretaccesskey",
-  "secretkey",
-  "secrets",
-  "token",
-] as const;
 
 export type JsonValue =
   | string
@@ -31,16 +17,6 @@ export type JsonValue =
   | { [key: string]: JsonValue };
 
 export type SerializedInput = Record<string, JsonValue>;
-
-export function isSecretLikeKey(key: string): boolean {
-  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-  return secretKeyNames.some(
-    (secretName) =>
-      normalized === secretName ||
-      normalized.endsWith(secretName) ||
-      normalized.endsWith(`${secretName}s`),
-  );
-}
 
 function checkObjectKeys(
   value: Record<string, unknown>,

@@ -5,7 +5,7 @@ import {
   type SafeErrorDetails,
   type SafeDetailValue,
 } from "../domain/errors.js";
-import { isSecretLikeKey } from "./schemas.js";
+import { isSecretLikeKey } from "../domain/secrets.js";
 
 const safeMessages = {
   INVALID_INPUT: "Invalid input",

@@ -1,5 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -72,8 +73,10 @@ describe("MCP server", () => {
     }
   });
 
-  it("creates and replays workspace and source commands through registered tools", async () => {
-    const store = openStore(":memory:");
+  it("creates and canonically replays commands without duplicate MCP writes", async () => {
+    const tempDir = await createTempDir();
+    const databasePath = join(tempDir, "store.db");
+    const store = openStore(databasePath);
     const service = new MarketingService(
       store,
       new SystemClock(),
@@ -93,20 +96,25 @@ describe("MCP server", () => {
         (await client.listTools()).tools.map((tool) => tool.name).sort(),
       ).toEqual(["source_register", "workspace_create"]);
 
-      const workspaceArguments = {
-        id: "workspace-1",
-        name: "Northwind",
-        actor: "agent-1",
-        requestId: "request-1",
-        idempotencyKey: "command-1",
-      };
       const first = await client.callTool({
         name: "workspace_create",
-        arguments: workspaceArguments,
+        arguments: {
+          id: "workspace-1",
+          name: "Northwind",
+          actor: "agent-1",
+          requestId: "request-1",
+          idempotencyKey: "command-1",
+        },
       });
       const replay = await client.callTool({
         name: "workspace_create",
-        arguments: workspaceArguments,
+        arguments: {
+          idempotencyKey: "command-1",
+          requestId: "request-1",
+          actor: "agent-1",
+          name: "Northwind",
+          id: "workspace-1",
+        },
       });
       expect(replay).toEqual(first);
       expect(first.content[0]).toMatchObject({ type: "text" });
@@ -137,9 +145,27 @@ describe("MCP server", () => {
         type: "manual",
         ownership: "owned",
       });
+
+      const raw = new DatabaseSync(databasePath);
+      try {
+        expect(
+          raw
+            .prepare(
+              `SELECT
+                (SELECT COUNT(*) FROM workspaces) AS workspaces,
+                (SELECT COUNT(*) FROM sources) AS sources,
+                (SELECT COUNT(*) FROM audit_records) AS audits,
+                (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
+            )
+            .get(),
+        ).toEqual({ workspaces: 1, sources: 1, audits: 2, idempotency: 2 });
+      } finally {
+        raw.close();
+      }
     } finally {
       await Promise.all([client.close(), server.close()]);
       store.close();
+      await removeTempDir(tempDir);
     }
   });
 });

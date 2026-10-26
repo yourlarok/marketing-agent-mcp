@@ -208,38 +208,88 @@ describe("MarketingService command pipeline", () => {
     expect(persisted).toEqual({ workspace: undefined, idempotency: undefined });
   });
 
-  it("redacts secret-like metadata before entity, audit, and idempotency persistence", async () => {
-    const workspace = await service.createWorkspace({
-      input: {
-        ...workspaceInput(),
-        metadata: {
-          safe: "visible",
-          credentials: { apiKey: "synthetic-api-secret" },
-          nested: [{ access_token: "synthetic-token-secret" }],
+  it("rejects secret-like metadata before canonicalization or any persistence", async () => {
+    await expect(
+      service.createWorkspace({
+        input: {
+          ...workspaceInput(),
+          metadata: { apiKey: "synthetic-api-secret" },
         },
-      },
-      context,
-    });
+        context,
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+
     const persisted = await store.transaction(async (repos) => ({
+      workspace: await repos.workspaces.get("workspace-1", "workspace-1"),
       audit: await repos.audit.get("audit-1", "workspace-1"),
       idempotency: await repos.idempotency.get("workspace-1", "command-1"),
     }));
+    expect(persisted).toEqual({
+      workspace: undefined,
+      audit: undefined,
+      idempotency: undefined,
+    });
+    expect(ids.calls).toBe(0);
+  });
 
-    expect(workspace.metadata).toEqual({
-      safe: "visible",
-      credentials: "[REDACTED]",
-      nested: [{ access_token: "[REDACTED]" }],
+  it("rejects nested secrets in direct source commands before any source writes", async () => {
+    await service.createWorkspace({ input: workspaceInput(), context });
+
+    await expect(
+      service.registerSource({
+        input: {
+          id: "source-1",
+          workspaceId: "workspace-1",
+          name: "Inline credentials",
+          type: "api",
+          ownership: "authorized",
+          metadata: {
+            nested: [{ credentials: { apiKey: "synthetic-api-secret" } }],
+            access_token: "synthetic-token-secret",
+          },
+        },
+        context: {
+          ...context,
+          requestId: "request-2",
+          idempotencyKey: "command-2",
+        },
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+
+    const persisted = await store.transaction(async (repos) => ({
+      source: await repos.sources.get("source-1", "workspace-1"),
+      audit: await repos.audit.get("audit-2", "workspace-1"),
+      idempotency: await repos.idempotency.get("workspace-1", "command-2"),
+    }));
+    expect(persisted).toEqual({
+      source: undefined,
+      audit: undefined,
+      idempotency: undefined,
     });
-    expect(persisted.audit?.details).toEqual({
-      input: {
-        ...workspaceInput(),
-        metadata: workspace.metadata,
-      },
+    expect(ids.calls).toBe(1);
+  });
+
+  it("scopes identical idempotency keys independently by workspace", async () => {
+    const first = await service.createWorkspace({
+      input: workspaceInput(),
+      context,
     });
-    expect(persisted.idempotency?.response).toEqual(workspace);
-    for (const value of [workspace, persisted.audit, persisted.idempotency]) {
-      expect(JSON.stringify(value)).not.toContain("synthetic-api-secret");
-      expect(JSON.stringify(value)).not.toContain("synthetic-token-secret");
-    }
+    const second = await service.createWorkspace({
+      input: { id: "workspace-2", name: "Contoso" },
+      context: { ...context, requestId: "request-2" },
+    });
+
+    expect(second).toMatchObject({
+      id: "workspace-2",
+      workspaceId: "workspace-2",
+      name: "Contoso",
+    });
+    expect(second).not.toEqual(first);
+    const persisted = await store.transaction(async (repos) => ({
+      first: await repos.idempotency.get("workspace-1", "command-1"),
+      second: await repos.idempotency.get("workspace-2", "command-1"),
+    }));
+    expect(persisted.first?.response).toEqual(first);
+    expect(persisted.second?.response).toEqual(second);
   });
 });

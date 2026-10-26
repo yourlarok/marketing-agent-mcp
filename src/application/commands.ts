@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { DomainError } from "../domain/errors.js";
 import type { SourceOwnership, SourceType } from "../domain/model.js";
+import { isSecretLikeKey } from "../domain/secrets.js";
 import { canonicalJson } from "../infrastructure/sqlite.js";
 import type {
   Clock,
@@ -50,31 +51,26 @@ export interface CommandPipeline {
   execute<T, R extends EntityRecord>(operation: WriteOperation<T, R>): Promise<R>;
 }
 
-const secretKeyNames = [
-  "accesskey",
-  "apikey",
-  "authorization",
-  "cookie",
-  "credential",
-  "credentials",
-  "password",
-  "passwd",
-  "privatekey",
-  "secret",
-  "secretaccesskey",
-  "secretkey",
-  "secrets",
-  "token",
-] as const;
-
-function isSecretLikeKey(key: string): boolean {
-  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-  return secretKeyNames.some(
-    (secretName) =>
-      normalized === secretName ||
-      normalized.endsWith(secretName) ||
-      normalized.endsWith(`${secretName}s`),
-  );
+function assertNoSecretLikeFields(value: unknown, seen = new Set<object>()): void {
+  if (value === null || typeof value !== "object" || seen.has(value)) {
+    return;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      assertNoSecretLikeFields(entry, seen);
+    }
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (isSecretLikeKey(key)) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "Secret-like fields are not allowed in command input",
+      );
+    }
+    assertNoSecretLikeFields(entry, seen);
+  }
 }
 
 function redact(value: unknown): JsonValue {
@@ -99,6 +95,7 @@ export class AuditableCommandPipeline implements CommandPipeline {
   ) {}
 
   async execute<T, R extends EntityRecord>(operation: WriteOperation<T, R>): Promise<R> {
+    assertNoSecretLikeFields(operation.input);
     const canonicalInput = canonicalJson({
       action: operation.action,
       input: operation.input,
