@@ -1,6 +1,12 @@
+import { createReadStream, symlinkSync, unlinkSync } from "node:fs";
 import { copyFile, mkdir, readFile, realpath, symlink, truncate, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, createReadStream: vi.fn(actual.createReadStream) };
+});
 import { loadConfig } from "../../src/config.js";
 import {
   DEFAULT_INGEST_LIMITS,
@@ -37,6 +43,7 @@ describe("bounded CSV/XLSX ingestion", () => {
   });
 
   afterEach(async () => {
+    vi.mocked(createReadStream).mockReset();
     if (originalRoot === undefined) {
       delete process.env.MARKETING_IMPORT_ROOT;
     } else {
@@ -47,6 +54,15 @@ describe("bounded CSV/XLSX ingestion", () => {
 
   function ingest(paths: string[], limits: IngestLimits = {}) {
     return ingestFiles(paths, limits);
+  }
+
+  async function ingestionError(paths: string[]): Promise<unknown> {
+    try {
+      await ingest(paths);
+      return undefined;
+    } catch (error) {
+      return error;
+    }
   }
 
   it("loads an optional import root without requiring it for non-import tools", () => {
@@ -233,5 +249,113 @@ describe("bounded CSV/XLSX ingestion", () => {
     await writeFile(join(root, "columns.csv"), `${headers}\n`);
 
     await expect(ingest(["columns.csv"])).rejects.toThrow("500 columns");
+  });
+
+  it("allocates globally unique repaired headers without overwriting data", async () => {
+    await writeFile(
+      join(root, "headers.csv"),
+      "a,a_2,a,,column_4,,column_6\n1,2,3,4,5,6,7\n",
+    );
+
+    const batch = await ingest(["headers.csv"]);
+    const dataset = batch.datasets[0]!;
+    expect(dataset.fields.map((field) => field.name)).toEqual([
+      "a",
+      "a_2",
+      "a_3",
+      "column_4",
+      "column_4_2",
+      "column_6",
+      "column_6_2",
+    ]);
+    expect(jsonl(dataset.rowsJsonl)).toEqual([
+      {
+        a: "1",
+        a_2: "2",
+        a_3: "3",
+        column_4: "4",
+        column_4_2: "5",
+        column_6: "6",
+        column_6_2: "7",
+      },
+    ]);
+  });
+
+  it("counts actual inflated bytes and rejects a ZIP entry above 64 MiB", async () => {
+    await copyFile(
+      resolve("tests/fixtures/xlsx/expanded-shared-strings.xlsx"),
+      join(root, "expanded-shared-strings.xlsx"),
+    );
+
+    expect(await ingestionError(["expanded-shared-strings.xlsx"])).toMatchObject({
+      message: expect.stringContaining("64 MiB uncompressed ZIP entry"),
+    });
+  }, 30_000);
+
+  it("rejects a workbook above 128 MiB cumulative inflated bytes", async () => {
+    await copyFile(
+      resolve("tests/fixtures/xlsx/expanded-workbook.xlsx"),
+      join(root, "expanded-workbook.xlsx"),
+    );
+
+    expect(await ingestionError(["expanded-workbook.xlsx"])).toMatchObject({
+      message: expect.stringContaining("128 MiB uncompressed workbook"),
+    });
+  }, 30_000);
+
+  it.each([
+    "truncated-workbook.xlsx",
+    "truncated-rels.xlsx",
+    "truncated-shared-strings.xlsx",
+    "truncated-styles.xlsx",
+  ])("rejects non-worksheet XML without a root close: %s", async (fileName) => {
+    await copyFile(resolve(`tests/fixtures/xlsx/${fileName}`), join(root, fileName));
+
+    expect(await ingestionError([fileName])).toBeInstanceOf(Error);
+  });
+
+  it("rejects normalized dataset JSONL above 25 MiB", async () => {
+    const header = "h".repeat(1024);
+    await writeFile(join(root, "jsonl.csv"), `${header}\n${"x\n".repeat(27000)}`);
+
+    expect(await ingestionError(["jsonl.csv"])).toMatchObject({
+      message: expect.stringContaining("25 MiB normalized JSONL"),
+    });
+  }, 30_000);
+
+  it("rejects normalized batch JSONL above 100 MiB before the row ceiling", async () => {
+    const header = "h".repeat(1100);
+    const contents = `${header}\n${"x\n".repeat(20000)}`;
+    const paths = Array.from({ length: 5 }, (_, index) => `jsonl-${index}.csv`);
+    for (const path of paths) {
+      await writeFile(join(root, path), contents);
+    }
+
+    expect(await ingestionError(paths)).toMatchObject({
+      message: expect.stringContaining("100 MiB normalized JSONL"),
+    });
+  }, 30_000);
+
+  it("does not read a symlink swapped in at the path-reopen boundary", async () => {
+    const path = join(root, "race.csv");
+    const replacement = join(outside, "replacement.csv");
+    await writeFile(path, "name\nsafe\n");
+    await writeFile(replacement, "name\nreplaced\n");
+    const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+    vi.mocked(createReadStream).mockImplementationOnce(((
+      requestedPath: string,
+      options?: { fd?: number },
+    ) => {
+      if (typeof options?.fd === "number") {
+        return actualFs.createReadStream(requestedPath, options);
+      }
+      unlinkSync(requestedPath);
+      symlinkSync(replacement, requestedPath);
+      return actualFs.createReadStream(requestedPath);
+    }) as typeof createReadStream);
+
+    const batch = await ingest(["race.csv"]);
+
+    expect(jsonl(batch.datasets[0]!.rowsJsonl)).toEqual([{ name: "safe" }]);
   });
 });

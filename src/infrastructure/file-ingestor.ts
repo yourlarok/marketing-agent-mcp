@@ -1,7 +1,8 @@
-import { createReadStream } from "node:fs";
-import { lstat, realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { constants, createReadStream } from "node:fs";
+import { open, realpath, stat, type FileHandle } from "node:fs/promises";
 import { basename, extname, relative, resolve, sep } from "node:path";
-import { Readable, Transform } from "node:stream";
+import { PassThrough, Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { parse } from "csv-parse";
 import ExcelJS from "exceljs";
@@ -21,6 +22,11 @@ export const DEFAULT_INGEST_LIMITS: Readonly<Required<IngestLimits>> = {
   maxRows: 100000,
   maxColumns: 500,
 };
+
+export const XLSX_MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+export const XLSX_MAX_WORKBOOK_BYTES = 128 * 1024 * 1024;
+export const MAX_DATASET_JSONL_BYTES = 25 * 1024 * 1024;
+export const MAX_BATCH_JSONL_BYTES = 100 * 1024 * 1024;
 
 export type DatasetFieldType =
   | "empty"
@@ -84,6 +90,8 @@ interface ValidatedFile {
   fileName: string;
   format: "csv" | "xlsx";
   sizeBytes: number;
+  handle: FileHandle;
+  pendingReads: Set<Promise<void>>;
 }
 
 interface WorkbookRelationship {
@@ -116,13 +124,37 @@ interface XlsxStreamingReader {
   }>;
 }
 
+class WorkbookInflationBudget {
+  private totalBytes = 0;
+
+  xml(entry: unzipper.File, label: string): Readable {
+    let entryBytes = 0;
+    return validatedXml(
+      entry.stream(),
+      label,
+      (bytes) => {
+        entryBytes += bytes;
+        this.totalBytes += bytes;
+        if (entryBytes > XLSX_MAX_ENTRY_BYTES) {
+          throw new Error(`XLSX entry ${label} exceeds 64 MiB uncompressed ZIP entry limit`);
+        }
+        if (this.totalBytes > XLSX_MAX_WORKBOOK_BYTES) {
+          throw new Error("XLSX exceeds 128 MiB uncompressed workbook limit");
+        }
+      },
+    );
+  }
+}
+
 class DatasetAccumulator {
   readonly issues: DatasetIssue[] = [];
   private names: string[] = [];
   private types: (Exclude<DatasetFieldType, "empty" | "mixed"> | "mixed" | undefined)[] =
     [];
-  private readonly rows: string[] = [];
-  private readonly uniqueRows = new Set<string>();
+  private rowsJsonl = "";
+  private rowCount = 0;
+  private jsonlBytes = 0;
+  private readonly uniqueRowHashes = new Set<string>();
   private duplicateRowCount = 0;
   private emptyRowCount = 0;
   private typeInconsistencyCount = 0;
@@ -131,11 +163,12 @@ class DatasetAccumulator {
     readonly source: ParsedSourceMetadata,
     private readonly limits: Required<IngestLimits>,
     private readonly consumeRow: () => void,
+    private readonly consumeJsonl: (bytes: number) => void,
   ) {}
 
   setHeaders(values: RowValues): void {
     this.assertColumnLimit(values.length);
-    const counts = new Map<string, number>();
+    const used = new Set<string>();
     this.names = values.map((value, index) => {
       const original = value === null ? "" : String(value).trim();
       const base = original || `column_${index + 1}`;
@@ -147,17 +180,22 @@ class DatasetAccumulator {
           columnNumber: index + 1,
         });
       }
-      const count = (counts.get(base) ?? 0) + 1;
-      counts.set(base, count);
-      if (count > 1) {
-        this.issues.push({
-          code: "DUPLICATE_HEADER",
-          message: `Duplicate header ${base} renamed`,
-          rowNumber: 1,
-          columnNumber: index + 1,
-        });
+      let name = base;
+      let suffix = 2;
+      while (used.has(name)) {
+        if (suffix === 2) {
+          this.issues.push({
+            code: "DUPLICATE_HEADER",
+            message: `Duplicate header ${base} renamed`,
+            rowNumber: 1,
+            columnNumber: index + 1,
+          });
+        }
+        name = `${base}_${suffix}`;
+        suffix += 1;
       }
-      return count === 1 ? base : `${base}_${count}`;
+      used.add(name);
+      return name;
     });
     this.types = this.names.map(() => undefined);
   }
@@ -188,7 +226,8 @@ class DatasetAccumulator {
       this.observeType(index, value, rowNumber);
     }
     const serialized = JSON.stringify(record);
-    if (this.uniqueRows.has(serialized)) {
+    const hash = createHash("sha256").update(serialized).digest("base64url");
+    if (this.uniqueRowHashes.has(hash)) {
       this.duplicateRowCount += 1;
       this.issues.push({
         code: "DUPLICATE_ROW",
@@ -196,12 +235,21 @@ class DatasetAccumulator {
         rowNumber,
       });
     } else {
-      this.uniqueRows.add(serialized);
+      this.uniqueRowHashes.add(hash);
     }
     if (empty) {
       this.emptyRowCount += 1;
     }
-    this.rows.push(serialized);
+
+    const line = `${serialized}\n`;
+    const bytes = Buffer.byteLength(line);
+    if (this.jsonlBytes + bytes > MAX_DATASET_JSONL_BYTES) {
+      throw new Error("Dataset exceeds 25 MiB normalized JSONL limit");
+    }
+    this.consumeJsonl(bytes);
+    this.jsonlBytes += bytes;
+    this.rowsJsonl += line;
+    this.rowCount += 1;
   }
 
   finish(): ParsedDataset {
@@ -212,9 +260,9 @@ class DatasetAccumulator {
         index,
         inferredType: this.types[index] ?? "empty",
       })),
-      rowsJsonl: this.rows.length ? `${this.rows.join("\n")}\n` : "",
+      rowsJsonl: this.rowsJsonl,
       quality: {
-        rowCount: this.rows.length,
+        rowCount: this.rowCount,
         columnCount: this.names.length,
         duplicateRowCount: this.duplicateRowCount,
         emptyRowCount: this.emptyRowCount,
@@ -282,14 +330,26 @@ export async function ingestFiles(
     }
     rowCount += 1;
   };
+  let jsonlBytes = 0;
+  const consumeJsonl = (bytes: number): void => {
+    if (jsonlBytes + bytes > MAX_BATCH_JSONL_BYTES) {
+      throw new Error("Batch exceeds 100 MiB normalized JSONL limit");
+    }
+    jsonlBytes += bytes;
+  };
 
   const datasets: ParsedDataset[] = [];
   for (const path of paths) {
     const file = await validateImportFile(root, path, resolvedLimits.maxFileBytes);
-    if (file.format === "csv") {
-      datasets.push(await parseCsv(file, resolvedLimits, consumeRow));
-    } else {
-      datasets.push(...(await parseXlsx(file, resolvedLimits, consumeRow)));
+    try {
+      if (file.format === "csv") {
+        datasets.push(await parseCsv(file, resolvedLimits, consumeRow, consumeJsonl));
+      } else {
+        datasets.push(...(await parseXlsx(file, resolvedLimits, consumeRow, consumeJsonl)));
+      }
+    } finally {
+      await Promise.all([...file.pendingReads]);
+      await file.handle.close();
     }
   }
   return { datasets };
@@ -346,17 +406,40 @@ async function validateImportFile(
   if (canonicalExtension !== extension) {
     throw new Error("Only .csv or .xlsx imports are supported");
   }
-  const metadata = await lstat(canonicalPath);
-  if (!metadata.isFile()) {
-    throw new Error(`Import path must be a regular file: ${path}`);
+  const handle = await open(
+    canonicalPath,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const [metadata, openedPath, openedMetadata] = await Promise.all([
+      handle.stat(),
+      realpath(canonicalPath),
+      stat(canonicalPath),
+    ]);
+    assertInsideRoot(root, openedPath);
+    if (
+      openedPath !== canonicalPath ||
+      metadata.dev !== openedMetadata.dev ||
+      metadata.ino !== openedMetadata.ino
+    ) {
+      throw new Error(`Import file changed while opening: ${path}`);
+    }
+    if (!metadata.isFile()) {
+      throw new Error(`Import path must be a regular file: ${path}`);
+    }
+    assertFileSize(metadata.size, maxFileBytes);
+    return {
+      path: canonicalPath,
+      fileName: basename(canonicalPath),
+      format: extension.slice(1) as "csv" | "xlsx",
+      sizeBytes: metadata.size,
+      handle,
+      pendingReads: new Set(),
+    };
+  } catch (error) {
+    await handle.close();
+    throw error;
   }
-  assertFileSize(metadata.size, maxFileBytes);
-  return {
-    path: canonicalPath,
-    fileName: basename(canonicalPath),
-    format: extension.slice(1) as "csv" | "xlsx",
-    sizeBytes: metadata.size,
-  };
 }
 
 function assertFileSize(size: number, maxFileBytes: number): void {
@@ -368,11 +451,15 @@ function assertFileSize(size: number, maxFileBytes: number): void {
 }
 
 async function* boundedFileBytes(
-  path: string,
+  handle: FileHandle,
   maxFileBytes: number,
 ): AsyncGenerator<Buffer> {
   let size = 0;
-  for await (const chunk of createReadStream(path)) {
+  for await (const chunk of createReadStream("", {
+    fd: handle.fd,
+    start: 0,
+    autoClose: false,
+  })) {
     const buffer = chunk as Buffer;
     size += buffer.length;
     assertFileSize(size, maxFileBytes);
@@ -384,16 +471,23 @@ async function parseCsv(
   file: ValidatedFile,
   limits: Required<IngestLimits>,
   consumeRow: () => void,
+  consumeJsonl: (bytes: number) => void,
 ): Promise<ParsedDataset> {
   const accumulator = new DatasetAccumulator(
-    { ...file },
+    {
+      path: file.path,
+      fileName: file.fileName,
+      format: file.format,
+      sizeBytes: file.sizeBytes,
+    },
     limits,
     consumeRow,
+    consumeJsonl,
   );
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const decoded = (async function* (): AsyncGenerator<string> {
     try {
-      for await (const chunk of boundedFileBytes(file.path, limits.maxFileBytes)) {
+      for await (const chunk of boundedFileBytes(file.handle, limits.maxFileBytes)) {
         yield decoder.decode(chunk, { stream: true });
       }
       const tail = decoder.decode();
@@ -436,9 +530,36 @@ async function parseXlsx(
   file: ValidatedFile,
   limits: Required<IngestLimits>,
   consumeRow: () => void,
+  consumeJsonl: (bytes: number) => void,
 ): Promise<ParsedDataset[]> {
-  const archive = await unzipper.Open.file(file.path);
+  const archive = await unzipper.Open.custom({
+    size: async () => {
+      const { size } = await file.handle.stat();
+      assertFileSize(size, limits.maxFileBytes);
+      return size;
+    },
+    stream: (offset, length) => {
+      const source = createReadStream("", {
+        fd: file.handle.fd,
+        start: offset,
+        end: length ? offset + length : undefined,
+        autoClose: false,
+      });
+      const completion = new Promise<void>((resolve) => {
+        source.once("end", resolve);
+        source.once("error", resolve);
+      });
+      file.pendingReads.add(completion);
+      void completion.then(() => file.pendingReads.delete(completion));
+      const output = new PassThrough();
+      source.once("error", (error) => output.destroy(error));
+      output.once("close", () => source.resume());
+      source.pipe(output);
+      return output;
+    },
+  });
   const entries = new Map(archive.files.map((entry) => [entry.path, entry]));
+  const budget = new WorkbookInflationBudget();
   const requiredEntry = (path: string): unzipper.File => {
     const entry = entries.get(path);
     if (!entry) {
@@ -448,12 +569,12 @@ async function parseXlsx(
   };
   const engine = new ExcelJS.Workbook().xlsx as unknown as XlsxStreamingEngine;
   const model = await engine.parseWorkbook(
-    requiredEntry("xl/workbook.xml").stream(),
+    budget.xml(requiredEntry("xl/workbook.xml"), "workbook"),
   );
   const relationships = await engine.parseRels(
-    requiredEntry("xl/_rels/workbook.xml.rels").stream(),
+    budget.xml(requiredEntry("xl/_rels/workbook.xml.rels"), "relationships"),
   );
-  const workbook = new ExcelJS.stream.xlsx.WorkbookReader(file.path, {
+  const workbook = new ExcelJS.stream.xlsx.WorkbookReader(Readable.from([]), {
     worksheets: "emit",
     sharedStrings: "cache",
     styles: "cache",
@@ -463,11 +584,12 @@ async function parseXlsx(
   workbook.properties = { model: model.properties };
   workbook.workbookRels = relationships;
   workbook.sharedStrings = entries.has("xl/sharedStrings.xml")
-    ? (await engine.parseSharedStrings(requiredEntry("xl/sharedStrings.xml").stream()))
-        .values
+    ? (await engine.parseSharedStrings(
+        budget.xml(requiredEntry("xl/sharedStrings.xml"), "sharedStrings"),
+      )).values
     : [];
   if (entries.has("xl/styles.xml")) {
-    await workbook._parseStyles(requiredEntry("xl/styles.xml").stream());
+    await workbook._parseStyles(budget.xml(requiredEntry("xl/styles.xml"), "styles"));
   }
 
   const datasets: ParsedDataset[] = [];
@@ -483,14 +605,21 @@ async function parseXlsx(
     const entryPath = target.startsWith("xl/") ? target : `xl/${target}`;
     const sheetNumber = /\/sheet(\d+)\.xml$/.exec(entryPath)?.[1] ?? String(sheet.id);
     for await (const { value: worksheet } of workbook._parseWorksheet(
-      validatedWorksheetXml(requiredEntry(entryPath).stream()),
+      budget.xml(requiredEntry(entryPath), `worksheet ${sheet.name}`),
       sheetNumber,
     )) {
       worksheet.name = sheet.name;
       const accumulator = new DatasetAccumulator(
-        { ...file, sheetName: sheet.name },
+        {
+          path: file.path,
+          fileName: file.fileName,
+          format: file.format,
+          sizeBytes: file.sizeBytes,
+          sheetName: sheet.name,
+        },
         limits,
         consumeRow,
+        consumeJsonl,
       );
       let rowNumber = 0;
       for await (const row of worksheet) {
@@ -521,12 +650,16 @@ async function parseXlsx(
   return datasets;
 }
 
-function validatedWorksheetXml(input: Readable): Readable {
+function validatedXml(
+  input: Readable,
+  label: string,
+  onBytes: (bytes: number) => void,
+): Readable {
   const parser = new SaxesParser();
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let failure: Error | undefined;
   parser.on("error", (error) => {
-    failure = new Error("Invalid or truncated worksheet XML", { cause: error });
+    failure = new Error(`Invalid or truncated ${label} XML`, { cause: error });
   });
   const validate = (operation: () => void): Error | undefined => {
     if (failure) {
@@ -535,13 +668,14 @@ function validatedWorksheetXml(input: Readable): Readable {
     try {
       operation();
     } catch (error) {
-      failure = error instanceof Error ? error : new Error("Invalid worksheet XML");
+      failure = error instanceof Error ? error : new Error(`Invalid ${label} XML`);
     }
     return failure;
   };
   const output = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       const error = validate(() => {
+        onBytes(chunk.length);
         parser.write(decoder.decode(chunk, { stream: true }));
       });
       callback(error, error ? undefined : chunk);
