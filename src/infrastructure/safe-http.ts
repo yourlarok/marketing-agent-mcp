@@ -92,10 +92,9 @@ export function isBlockedAddress(address: string): boolean {
     return true;
   }
   const first = parts[0]!;
-  const mappedIpv4 = parts.slice(0, 6).every((part, index) =>
-    index < 5 ? part === 0 : part === 0xffff
-  );
-  if (mappedIpv4) {
+  const embeddedIpv4 = parts.slice(0, 5).every((part) => part === 0) &&
+    (parts[5] === 0 || parts[5] === 0xffff);
+  if (embeddedIpv4) {
     const value = ((parts[6]! << 16) + parts[7]!) >>> 0;
     const address4 = [24, 16, 8, 0].map((shift) => (value >>> shift) & 0xff).join(".");
     return isBlockedAddress(address4);

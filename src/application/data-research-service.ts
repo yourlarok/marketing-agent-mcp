@@ -187,7 +187,7 @@ function csvCell(value: unknown): string {
     throw new Error("Temporary API JSON rows must contain only scalar values");
   }
   const text = value === null ? "" : String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  return text.length === 0 || /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 function jsonToCsv(body: Buffer): Buffer {
@@ -204,7 +204,7 @@ function jsonToCsv(body: Buffer): Buffer {
   const headers = [...new Set(rows.flatMap((row) => Object.keys(row)))];
   const lines = [headers.map(csvCell).join(",")];
   for (const row of rows) {
-    lines.push(headers.map((header) => csvCell(row[header])).join(","));
+    lines.push(headers.map((header) => csvCell(row[header] ?? null)).join(","));
   }
   return Buffer.from(`${lines.join("\n")}\n`);
 }

@@ -1206,6 +1206,69 @@ describe("DataResearchService atomic imports and evidence assets", () => {
     });
   });
 
+  it("normalizes missing keys to null across a union of flat JSON object keys", async () => {
+    await withApiServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end('[{"a":1},{"b":2}]');
+    }, async (url) => {
+      const batch = await apiService().ingestTemporaryApi(apiCommand("api-sparse-json", `${url}/data`));
+      const evidence = await store.transaction((repos) =>
+        repos.evidence.get(batch.evidenceIds[0]!, "workspace-1")
+      );
+      const dataset = await store.transaction((repos) =>
+        repos.datasets.get(batch.datasetIds[0]!, "workspace-1")
+      );
+      const normalized = (evidence?.assets as { id: string; kind: string }[])
+        .find((asset) => asset.kind === "normalized_jsonl")!;
+      const content = await apiService().getEvidenceAsset({
+        workspaceId: "workspace-1",
+        evidenceId: evidence!.id,
+        assetId: normalized.id,
+      });
+      expect(content.content.toString("utf8")).toBe('{"a":"1","b":""}\n{"a":"","b":"2"}\n');
+      expect(dataset?.quality).toMatchObject({ rowCount: 2, columnCount: 2, emptyRowCount: 0 });
+    });
+  });
+
+  it("accepts explicit null JSON values in empty-row quality statistics", async () => {
+    await withApiServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end('[{"a":1},{"a":null}]');
+    }, async (url) => {
+      const batch = await apiService().ingestTemporaryApi(apiCommand("api-null-json", `${url}/data`));
+      const evidence = await store.transaction((repos) =>
+        repos.evidence.get(batch.evidenceIds[0]!, "workspace-1")
+      );
+      const dataset = await store.transaction((repos) =>
+        repos.datasets.get(batch.datasetIds[0]!, "workspace-1")
+      );
+      const normalized = (evidence?.assets as { id: string; kind: string }[])
+        .find((asset) => asset.kind === "normalized_jsonl")!;
+      const content = await apiService().getEvidenceAsset({
+        workspaceId: "workspace-1",
+        evidenceId: evidence!.id,
+        assetId: normalized.id,
+      });
+      expect(content.content.toString("utf8")).toBe('{"a":"1"}\n{"a":""}\n');
+      expect(dataset?.quality).toMatchObject({ rowCount: 2, emptyRowCount: 1 });
+    });
+  });
+
+  it("continues to reject nested JSON objects and arrays", async () => {
+    for (const [id, payload] of [["object", { nested: true }], ["array", [1]]] as const) {
+      await withApiServer((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify([{ a: payload }]));
+      }, async (url) => {
+        await expect(apiService().ingestTemporaryApi(apiCommand(`api-nested-${id}`, `${url}/data`)))
+          .rejects.toThrow(/scalar values/i);
+        await expect(store.transaction((repos) =>
+          repos.ingestionBatches.get(`api-nested-${id}`, "workspace-1")
+        )).resolves.toBeUndefined();
+      });
+    }
+  });
+
   it("replays and detects conflicts before temporary API network or artifact I/O", async () => {
     let command: ReturnType<typeof apiCommand>;
     let first: IngestionBatch;

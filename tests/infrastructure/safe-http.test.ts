@@ -5,6 +5,7 @@ import { loadConfig } from "../../src/config.js";
 import {
   SafeHttpClient,
   SafeHttpError,
+  isBlockedAddress,
   type SafeHttpLookup,
 } from "../../src/infrastructure/safe-http.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
@@ -250,6 +251,25 @@ describe("SafeHttpClient", () => {
     ]) {
       await expect(http.get(request(url))).rejects.toThrow(/not allowed/i);
     }
+  });
+
+  it("rejects IPv4-compatible private destinations in dotted and URL-normalized hexadecimal forms", async () => {
+    const http = client({ allowlist: [], timeoutMs: 25 });
+    for (const url of [
+      "http://[::127.0.0.1]/data",
+      "http://[::10.0.0.1]/data",
+      "http://[::7f00:1]/data",
+      "http://[::a00:1]/data",
+      "http://[::a9fe:1]/data",
+    ]) {
+      await expect(http.get(request(url))).rejects.toThrow(/not allowed/i);
+    }
+  });
+
+  it("does not reject ordinary IPv6 or public IPv4-compatible addresses", () => {
+    expect(isBlockedAddress("2001:db8::1")).toBe(false);
+    expect(isBlockedAddress("::8.8.8.8")).toBe(false);
+    expect(isBlockedAddress("::808:808")).toBe(false);
   });
 
   it("rejects a hostname whose DNS answers change to a private address", async () => {
