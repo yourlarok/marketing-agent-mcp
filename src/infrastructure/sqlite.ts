@@ -32,7 +32,7 @@ function normalizeJson(value: unknown, seen: Set<object>): unknown {
     if (prototype !== Object.prototype && prototype !== null) {
       throw new TypeError("JSON objects must be plain objects");
     }
-    const output: Record<string, unknown> = {};
+    const output = Object.create(null) as Record<string, unknown>;
     for (const key of Object.keys(value).sort()) {
       output[key] = normalizeJson((value as Record<string, unknown>)[key], seen);
     }
@@ -58,8 +58,23 @@ export function assertUtcInstant(value: string): void {
 }
 
 export function openDatabase(path: string): DatabaseSync {
+  const migration = readFileSync(migrationPath, "utf8");
   const database = new DatabaseSync(path);
-  database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
-  database.exec(readFileSync(migrationPath, "utf8"));
-  return database;
+  try {
+    database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+    database.exec("BEGIN IMMEDIATE");
+    database.exec(migration);
+    database.exec("COMMIT");
+    return database;
+  } catch (error) {
+    if (database.isTransaction) {
+      try {
+        database.exec("ROLLBACK");
+      } catch {}
+    }
+    try {
+      database.close();
+    } catch {}
+    throw error;
+  }
 }

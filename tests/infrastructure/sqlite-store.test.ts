@@ -264,26 +264,171 @@ describe("transactional SQLite storage", () => {
     ).rejects.toMatchObject<DomainError>({ code: "IDEMPOTENCY_CONFLICT" });
   });
 
-  it("enforces lineage references and preserves evidence order", async () => {
-    const store = open();
-    await store.transaction(async (repos) => {
+  it("enforces lineage references and preserves evidence order after reopen", async () => {
+    const first = open();
+    await first.transaction(async (repos) => {
       await repos.workspaces.insert(entity("ws-1"));
       await repos.sources.insert(entity("source-1", "ws-1"));
       await repos.evidence.insert(entity("evidence-1", "ws-1"));
+      await repos.evidence.insert(entity("evidence-2", "ws-1"));
       await repos.findings.insert({
         ...entity("finding-1", "ws-1"),
-        evidenceIds: ["evidence-1"],
+        evidenceIds: ["evidence-2", "evidence-1"],
       });
     });
 
     await expect(
-      store.transaction((repos) =>
+      first.transaction((repos) =>
         repos.findings.insert({
           ...entity("finding-2", "ws-1"),
           evidenceIds: ["missing-evidence"],
         }),
       ),
     ).rejects.toThrow();
+    first.close();
+
+    const second = open();
+    expect(
+      await second.transaction((repos) =>
+        repos.findings.get("finding-1", "ws-1"),
+      ),
+    ).toMatchObject({ evidenceIds: ["evidence-2", "evidence-1"] });
+    const raw = new DatabaseSync(databasePath);
+    try {
+      expect(
+        raw
+          .prepare(
+            "SELECT evidence_id, position FROM finding_evidence WHERE finding_id = ? ORDER BY position",
+          )
+          .all("finding-1"),
+      ).toEqual([
+        { evidence_id: "evidence-2", position: 0 },
+        { evidence_id: "evidence-1", position: 1 },
+      ]);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("persists task dependency IDs and positions after reopen", async () => {
+    const first = open();
+    await first.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("ws-1"));
+      await repos.tasks.insert(entity("dependency-1", "ws-1"));
+      await repos.tasks.insert(entity("dependency-2", "ws-1"));
+      await repos.tasks.insert({
+        ...entity("task-1", "ws-1"),
+        dependencyIds: ["dependency-2", "dependency-1"],
+      });
+    });
+    first.close();
+
+    const second = open();
+    expect(
+      await second.transaction((repos) => repos.tasks.get("task-1", "ws-1")),
+    ).toMatchObject({ dependencyIds: ["dependency-2", "dependency-1"] });
+    const raw = new DatabaseSync(databasePath);
+    try {
+      expect(
+        raw
+          .prepare(
+            "SELECT dependency_id, position FROM task_dependencies WHERE task_id = ? ORDER BY position",
+          )
+          .all("task-1"),
+      ).toEqual([
+        { dependency_id: "dependency-2", position: 0 },
+        { dependency_id: "dependency-1", position: 1 },
+      ]);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("serializes asynchronous transactions across stores for the same database", async () => {
+    const first = open();
+    const second = open(join(tempDir, "nested", "..", "store.db"));
+    await first.transaction((repos) => repos.workspaces.insert(entity("ws-1")));
+
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const firstTransaction = first.transaction(async (repos) => {
+      await repos.sources.insert(entity("source-1", "ws-1"));
+      markStarted();
+      await firstGate;
+      await repos.audit.append({
+        id: "audit-1",
+        workspaceId: "ws-1",
+        requestId: "request-1",
+        actor: "actor-1",
+        action: "source.register",
+        entityType: "source",
+        entityId: "source-1",
+        details: {},
+        createdAt: now,
+      });
+    });
+    await started;
+    const secondTransaction = second.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("ws-2"));
+      await repos.idempotency.put({
+        workspaceId: "ws-2",
+        key: "command-2",
+        requestHash: "hash-2",
+        response: { id: "ws-2" },
+        createdAt: now,
+      });
+    });
+    const releaseTimer = setTimeout(releaseFirst, 50);
+
+    try {
+      await Promise.all([firstTransaction, secondTransaction]);
+    } finally {
+      clearTimeout(releaseTimer);
+      releaseFirst();
+    }
+
+    expect(
+      await second.transaction((repos) => repos.sources.get("source-1", "ws-1")),
+    ).toBeDefined();
+    expect(
+      await first.transaction((repos) => repos.workspaces.get("ws-2", "ws-2")),
+    ).toBeDefined();
+  }, 10_000);
+
+  it("rolls back a failed migration and opens successfully after repair", async () => {
+    const broken = new DatabaseSync(databasePath);
+    broken.exec("CREATE TABLE sources (broken TEXT)");
+    broken.close();
+
+    expect(() => open()).toThrow();
+    const afterFailure = new DatabaseSync(databasePath);
+    try {
+      expect(
+        afterFailure
+          .prepare("SELECT name FROM sqlite_master WHERE name = ?")
+          .get("workspaces"),
+      ).toBeUndefined();
+      expect(
+        afterFailure
+          .prepare("SELECT name FROM sqlite_master WHERE name = ?")
+          .get("schema_migrations"),
+      ).toBeUndefined();
+      afterFailure.exec("DROP TABLE sources");
+    } finally {
+      afterFailure.close();
+    }
+
+    const repaired = open();
+    await repaired.transaction((repos) => repos.workspaces.insert(entity("ws-1")));
+    expect(
+      await repaired.transaction((repos) => repos.workspaces.get("ws-1", "ws-1")),
+    ).toEqual(entity("ws-1"));
   });
 
   it("provides UTC system time and unique IDs", () => {
@@ -294,9 +439,43 @@ describe("transactional SQLite storage", () => {
     expect(ids.next()).not.toBe(ids.next());
   });
 
-  it("canonicalizes JSON object keys recursively", () => {
+  it("canonicalizes JSON object keys recursively without dropping __proto__", () => {
     expect(canonicalJson({ z: 1, a: [{ z: 2, a: 1 }] })).toBe(
       '{"a":[{"a":1,"z":2}],"z":1}',
     );
+    const input = JSON.parse(
+      '{"z":1,"__proto__":{"preserved":true},"a":2}',
+    ) as Record<string, unknown>;
+    expect(canonicalJson(input)).toBe(
+      '{"__proto__":{"preserved":true},"a":2,"z":1}',
+    );
+  });
+
+  it("persists __proto__ metadata without silent field loss", async () => {
+    const first = open();
+    const record = entity("ws-1");
+    record.metadata = JSON.parse(
+      '{"__proto__":{"preserved":true},"a":1}',
+    ) as Record<string, unknown>;
+    await first.transaction((repos) => repos.workspaces.insert(record));
+    first.close();
+
+    const second = open();
+    expect(
+      await second.transaction((repos) => repos.workspaces.get("ws-1", "ws-1")),
+    ).toEqual(record);
+    const raw = new DatabaseSync(databasePath);
+    try {
+      const row = raw
+        .prepare("SELECT payload FROM workspaces WHERE id = ?")
+        .get("ws-1") as { payload: string };
+      const payload = JSON.parse(row.payload) as {
+        metadata: Record<string, unknown>;
+      };
+      expect(Object.hasOwn(payload.metadata, "__proto__")).toBe(true);
+      expect(payload.metadata["__proto__"]).toEqual({ preserved: true });
+    } finally {
+      raw.close();
+    }
   });
 });

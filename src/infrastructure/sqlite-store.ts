@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DomainError } from "../domain/errors.js";
 import type {
@@ -11,6 +12,40 @@ import type {
   Store,
 } from "../application/ports.js";
 import { assertUtcInstant, canonicalJson, openDatabase } from "./sqlite.js";
+
+interface TransactionCoordinator {
+  queue: Promise<void>;
+  references: number;
+}
+
+const coordinators = new Map<string, TransactionCoordinator>();
+
+function acquireCoordinator(path: string): {
+  coordinator: TransactionCoordinator;
+  key?: string;
+} {
+  if (path === ":memory:") {
+    return { coordinator: { queue: Promise.resolve(), references: 1 } };
+  }
+  const key = resolve(path);
+  let coordinator = coordinators.get(key);
+  if (!coordinator) {
+    coordinator = { queue: Promise.resolve(), references: 0 };
+    coordinators.set(key, coordinator);
+  }
+  coordinator.references += 1;
+  return { coordinator, key };
+}
+
+function releaseCoordinator(key: string | undefined, coordinator: TransactionCoordinator): void {
+  if (!key) {
+    return;
+  }
+  coordinator.references -= 1;
+  if (coordinator.references === 0 && coordinators.get(key) === coordinator) {
+    coordinators.delete(key);
+  }
+}
 
 interface ReferenceTable {
   table: string;
@@ -367,16 +402,19 @@ class SqliteIdempotencyRepository implements IdempotencyRepository {
 
 class SqliteStore implements Store {
   private closed = false;
-  private queue: Promise<void> = Promise.resolve();
 
-  constructor(private readonly database: DatabaseSync) {}
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly coordinator: TransactionCoordinator,
+    private readonly coordinatorKey?: string,
+  ) {}
 
   transaction<T>(work: (repos: Repositories) => Promise<T>): Promise<T> {
     if (this.closed) {
       return Promise.reject(new Error("Store is closed"));
     }
-    const result = this.queue.then(() => this.execute(work));
-    this.queue = result.then(
+    const result = this.coordinator.queue.then(() => this.execute(work));
+    this.coordinator.queue = result.then(
       () => undefined,
       () => undefined,
     );
@@ -385,8 +423,12 @@ class SqliteStore implements Store {
 
   close(): void {
     if (!this.closed) {
-      this.database.close();
       this.closed = true;
+      try {
+        this.database.close();
+      } finally {
+        releaseCoordinator(this.coordinatorKey, this.coordinator);
+      }
     }
   }
 
@@ -429,5 +471,7 @@ class SqliteStore implements Store {
 }
 
 export function openStore(path: string): Store {
-  return new SqliteStore(openDatabase(path));
+  const database = openDatabase(path);
+  const { coordinator, key } = acquireCoordinator(path);
+  return new SqliteStore(database, coordinator, key);
 }
