@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { DataResearchService } from "./application/data-research-service.js";
 import { MarketingService } from "./application/marketing-service.js";
 import { loadConfig } from "./config.js";
 import { openStore } from "./infrastructure/sqlite-store.js";
@@ -13,12 +14,11 @@ async function run(): Promise<void> {
   const config = loadConfig(process.env);
   const store = openStore(join(config.dataDir, "marketing.db"));
   try {
-    const service = new MarketingService(
-      store,
-      new SystemClock(),
-      new SystemIdGenerator(),
-    );
-    const server = createMcpServer(service);
+    const clock = new SystemClock();
+    const ids = new SystemIdGenerator();
+    const service = new MarketingService(store, clock, ids);
+    const dataResearch = new DataResearchService(store, clock, ids);
+    const server = createMcpServer(service, dataResearch);
     const transport = new StdioServerTransport();
     let shutdown: Promise<void> | undefined;
 

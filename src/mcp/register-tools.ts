@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { MarketingService } from "../application/marketing-service.js";
+import { DomainError } from "../domain/errors.js";
 import { canonicalJson } from "../infrastructure/sqlite.js";
 import { toMcpError } from "./error-mapper.js";
 import {
@@ -18,8 +19,11 @@ import {
   transitionTaskInputSchema,
 } from "./schemas.js";
 
-function validateToolArguments<T>(arguments_: T): T {
-  serializedInputSchema.parse(arguments_);
+export function validateToolArguments<T>(arguments_: T): T {
+  const result = serializedInputSchema.safeParse(arguments_);
+  if (!result.success) {
+    throw new DomainError("INVALID_INPUT", "Tool input validation failed");
+  }
   return arguments_;
 }
 
@@ -28,7 +32,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "workspace_create",
     {
       description: "Create an auditable marketing workspace",
-      inputSchema: createWorkspaceInputSchema.shape,
+      inputSchema: createWorkspaceInputSchema,
     },
     async (arguments_) => {
       try {
@@ -51,7 +55,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "source_register",
     {
       description: "Register an auditable marketing data source",
-      inputSchema: registerSourceInputSchema.shape,
+      inputSchema: registerSourceInputSchema,
     },
     async (arguments_) => {
       try {
@@ -74,7 +78,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "capability_register",
     {
       description: "Register controlled tool metadata without installing or executing it",
-      inputSchema: registerCapabilityInputSchema.shape,
+      inputSchema: registerCapabilityInputSchema,
     },
     async (arguments_) => {
       try {
@@ -97,7 +101,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "capability_health_record",
     {
       description: "Record externally checked capability health and evidence",
-      inputSchema: recordCapabilityHealthInputSchema.shape,
+      inputSchema: recordCapabilityHealthInputSchema,
     },
     async (arguments_) => {
       try {
@@ -120,7 +124,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "capability_list",
     {
       description: "List workspace-scoped controlled tool capabilities",
-      inputSchema: capabilityListInputSchema.shape,
+      inputSchema: capabilityListInputSchema,
     },
     async (arguments_) => {
       try {
@@ -139,7 +143,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "dataset_register",
     {
       description: "Register dataset metadata and source provenance",
-      inputSchema: registerDatasetInputSchema.shape,
+      inputSchema: registerDatasetInputSchema,
     },
     async (arguments_) => {
       try {
@@ -162,7 +166,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "evidence_record",
     {
       description: "Record evidence metadata without fetching remote content",
-      inputSchema: recordEvidenceInputSchema.shape,
+      inputSchema: recordEvidenceInputSchema,
     },
     async (arguments_) => {
       try {
@@ -185,7 +189,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "finding_record",
     {
       description: "Record a fact, inference, or unknown with explicit truth boundaries",
-      inputSchema: recordFindingInputSchema.shape,
+      inputSchema: recordFindingInputSchema,
     },
     async (arguments_) => {
       try {
@@ -208,7 +212,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "recommendation_create",
     {
       description: "Create a finding-backed marketing recommendation",
-      inputSchema: createRecommendationInputSchema.shape,
+      inputSchema: createRecommendationInputSchema,
     },
     async (arguments_) => {
       try {
@@ -231,7 +235,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "task_create",
     {
       description: "Create an executable recommendation-backed draft task",
-      inputSchema: createTaskInputSchema.shape,
+      inputSchema: createTaskInputSchema,
     },
     async (arguments_) => {
       try {
@@ -254,7 +258,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "lineage_get",
     {
       description: "Read bounded workspace-scoped lineage and audit provenance",
-      inputSchema: lineageGetInputSchema.shape,
+      inputSchema: lineageGetInputSchema,
     },
     async (arguments_) => {
       try {
@@ -273,7 +277,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
     "task_transition",
     {
       description: "Transition a task with state and dependency safety checks",
-      inputSchema: transitionTaskInputSchema.shape,
+      inputSchema: transitionTaskInputSchema,
     },
     async (arguments_) => {
       try {
