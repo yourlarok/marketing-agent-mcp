@@ -1,9 +1,10 @@
 import { DomainError } from "../domain/errors.js";
-import type {
-  Dataset,
-  Evidence,
-  Source,
-  Workspace,
+import {
+  EVIDENCE_CLASSIFICATIONS,
+  type Dataset,
+  type Evidence,
+  type Source,
+  type Workspace,
 } from "../domain/model.js";
 import { assertUtcInstant } from "../infrastructure/sqlite.js";
 import {
@@ -146,6 +147,28 @@ export class MarketingService {
       context: command.context,
       write: async (repos, input, timestamp) => {
         const source = await requireSource(repos, input.workspaceId, input.sourceId);
+        if (
+          !(EVIDENCE_CLASSIFICATIONS as readonly string[]).includes(
+            input.classification,
+          )
+        ) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "classification must be a supported evidence classification",
+          );
+        }
+        if (
+          typeof input.sourceLocator !== "string" ||
+          input.sourceLocator.trim().length === 0
+        ) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "sourceLocator must not be empty",
+          );
+        }
+        if (typeof input.summary !== "string" || input.summary.trim().length === 0) {
+          throw new DomainError("INVALID_INPUT", "summary must not be empty");
+        }
         assertUtcInput(input.observedAt, "observedAt");
         if (!/^[0-9a-f]{64}$/i.test(input.contentHash)) {
           throw new DomainError(

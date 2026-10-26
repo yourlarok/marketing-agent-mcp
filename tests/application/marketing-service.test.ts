@@ -551,7 +551,7 @@ describe("MarketingService command pipeline", () => {
         ...evidenceInput(),
         id: "evidence-2",
         sourceId: "source-2",
-        sourceLocator: "https://example.test/research",
+        sourceLocator: "https://example.test/research?view=summary&keynote=public",
         summary: "Published market size observation",
         contentHash: "b".repeat(64),
         classification: "external_observation",
@@ -568,7 +568,7 @@ describe("MarketingService command pipeline", () => {
     expect(external).toMatchObject({
       id: "evidence-2",
       sourceId: "source-2",
-      sourceLocator: "https://example.test/research",
+      sourceLocator: "https://example.test/research?view=summary&keynote=public",
       classification: "external_observation",
     });
     const persisted = await store.transaction(async (repos) => ({
@@ -583,5 +583,124 @@ describe("MarketingService command pipeline", () => {
       entityType: "evidence",
       entityId: "evidence-2",
     });
+  });
+
+  it.each([
+    {
+      label: "URL userinfo",
+      sourceLocator: "https://user:synthetic-password@example.test/report",
+      secret: "synthetic-password",
+    },
+    {
+      label: "URL access token query",
+      sourceLocator: "https://example.test/report?access_token=synthetic-token",
+      secret: "synthetic-token",
+    },
+    {
+      label: "mixed-case URL API key query",
+      sourceLocator: "https://example.test/report?ApiKey=synthetic-api-key",
+      secret: "synthetic-api-key",
+    },
+    {
+      label: "mixed-case URL client secret query",
+      sourceLocator: "https://example.test/report?CLIENT_SECRET=synthetic-secret",
+      secret: "synthetic-secret",
+    },
+    {
+      label: "plain key query",
+      sourceLocator: "https://example.test/report?Key=synthetic-key",
+      secret: "synthetic-key",
+    },
+    {
+      label: "non-URL secret parameter",
+      sourceLocator: "warehouse/report?Token=synthetic-non-url-token",
+      secret: "synthetic-non-url-token",
+    },
+    {
+      label: "non-URL semicolon secret parameter",
+      sourceLocator: "warehouse/report;Password=synthetic-non-url-password",
+      secret: "synthetic-non-url-password",
+    },
+  ])("rejects $label before evidence persistence", async ({ sourceLocator, secret }) => {
+    await service.createWorkspace({ input: workspaceInput(), context });
+    await service.registerSource({
+      input: {
+        id: "source-1",
+        workspaceId: "workspace-1",
+        name: "Warehouse",
+        type: "database",
+        ownership: "owned",
+      },
+      context: { ...context, requestId: "request-2", idempotencyKey: "command-2" },
+    });
+
+    const error = await service.recordEvidence({
+      input: { ...evidenceInput(), sourceLocator },
+      context: { ...context, requestId: "request-3", idempotencyKey: "command-3" },
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toMatchObject({ code: "INVALID_INPUT" });
+    expect(String(error)).not.toContain(secret);
+    expect(JSON.stringify(error)).not.toContain(secret);
+    const persisted = await store.transaction(async (repos) => ({
+      evidence: await repos.evidence.get("evidence-1", "workspace-1"),
+      audit: await repos.audit.get("audit-3", "workspace-1"),
+      idempotency: await repos.idempotency.get("workspace-1", "command-3"),
+    }));
+    expect(persisted).toEqual({
+      evidence: undefined,
+      audit: undefined,
+      idempotency: undefined,
+    });
+    expect(ids.calls).toBe(2);
+  });
+
+  it.each([
+    {
+      label: "unsupported classification",
+      input: { ...evidenceInput(), classification: "unsupported" as never },
+    },
+    {
+      label: "blank source locator",
+      input: { ...evidenceInput(), sourceLocator: "   " },
+    },
+    {
+      label: "blank summary",
+      input: { ...evidenceInput(), summary: "\t\n" },
+    },
+  ])("rejects $label from a direct untrusted service call", async ({ input }) => {
+    await service.createWorkspace({ input: workspaceInput(), context });
+    await service.registerSource({
+      input: {
+        id: "source-1",
+        workspaceId: "workspace-1",
+        name: "Warehouse",
+        type: "database",
+        ownership: "owned",
+      },
+      context: { ...context, requestId: "request-2", idempotencyKey: "command-2" },
+    });
+
+    await expect(
+      service.recordEvidence({
+        input,
+        context: { ...context, requestId: "request-3", idempotencyKey: "command-3" },
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+
+    const persisted = await store.transaction(async (repos) => ({
+      evidence: await repos.evidence.get("evidence-1", "workspace-1"),
+      audit: await repos.audit.get("audit-3", "workspace-1"),
+      idempotency: await repos.idempotency.get("workspace-1", "command-3"),
+    }));
+    expect(persisted).toEqual({
+      evidence: undefined,
+      audit: undefined,
+      idempotency: undefined,
+    });
+    expect(ids.calls).toBe(2);
   });
 });

@@ -227,6 +227,102 @@ describe("MCP server", () => {
       await removeTempDir(tempDir);
     }
   });
+
+  it("rejects secret-bearing evidence locators without MCP persistence", async () => {
+    const tempDir = await createTempDir();
+    const databasePath = join(tempDir, "store.db");
+    const store = openStore(databasePath);
+    const service = new MarketingService(
+      store,
+      new SystemClock(),
+      new SystemIdGenerator(),
+    );
+    const server = createMcpServer(service);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([
+        client.connect(clientTransport),
+        server.connect(serverTransport),
+      ]);
+      await client.callTool({
+        name: "workspace_create",
+        arguments: {
+          id: "workspace-1",
+          name: "Northwind",
+          actor: "agent-1",
+          requestId: "request-1",
+          idempotencyKey: "command-1",
+        },
+      });
+      await client.callTool({
+        name: "source_register",
+        arguments: {
+          id: "source-1",
+          workspaceId: "workspace-1",
+          name: "Research",
+          type: "manual",
+          ownership: "owned",
+          actor: "agent-1",
+          requestId: "request-2",
+          idempotencyKey: "command-2",
+        },
+      });
+
+      const attempts = [
+        {
+          sourceLocator: "https://user:synthetic-mcp-password@example.test/report",
+          secret: "synthetic-mcp-password",
+        },
+        {
+          sourceLocator: "https://example.test/report?Access_Token=synthetic-mcp-token",
+          secret: "synthetic-mcp-token",
+        },
+      ];
+      for (const [index, attempt] of attempts.entries()) {
+        const result = await client.callTool({
+          name: "evidence_record",
+          arguments: {
+            id: `evidence-${index + 1}`,
+            workspaceId: "workspace-1",
+            sourceId: "source-1",
+            sourceLocator: attempt.sourceLocator,
+            observedAt: "2026-02-01T00:00:00.000Z",
+            summary: "A recorded operating observation",
+            contentHash: "a".repeat(64),
+            classification: "owned_operating",
+            actor: "agent-1",
+            requestId: `request-${index + 3}`,
+            idempotencyKey: `command-${index + 3}`,
+          },
+        });
+        expect(result).toMatchObject({ isError: true });
+        expect(JSON.stringify(result)).not.toContain(attempt.secret);
+      }
+
+      const raw = new DatabaseSync(databasePath);
+      try {
+        expect(
+          raw
+            .prepare(
+              `SELECT
+                (SELECT COUNT(*) FROM evidence) AS evidence,
+                (SELECT COUNT(*) FROM audit_records) AS audits,
+                (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
+            )
+            .get(),
+        ).toEqual({ evidence: 0, audits: 2, idempotency: 2 });
+      } finally {
+        raw.close();
+      }
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+      store.close();
+      await removeTempDir(tempDir);
+    }
+  });
 });
 
 describe("MCP input contracts", () => {

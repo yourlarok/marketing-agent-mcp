@@ -78,25 +78,67 @@ export interface CommandPipeline {
   execute<T, R extends EntityRecord>(operation: WriteOperation<T, R>): Promise<R>;
 }
 
-function assertNoSecretLikeFields(value: unknown, seen = new Set<object>()): void {
+function rejectSecretLikeInput(): never {
+  throw new DomainError(
+    "INVALID_INPUT",
+    "Secret-like fields are not allowed in command input",
+  );
+}
+
+function isSecretParameter(key: string): boolean {
+  let decoded = key;
+  try {
+    decoded = decodeURIComponent(key);
+  } catch {}
+  return decoded.trim().toLowerCase() === "key" || isSecretLikeKey(decoded);
+}
+
+function assertSafeSourceLocator(locator: string): void {
+  let url: URL | undefined;
+  try {
+    url = new URL(locator);
+  } catch {}
+  if (url) {
+    if (url.username || url.password) {
+      rejectSecretLikeInput();
+    }
+    for (const [key] of url.searchParams) {
+      if (isSecretParameter(key)) {
+        rejectSecretLikeInput();
+      }
+    }
+  }
+
+  for (const match of locator.matchAll(/(?:^|[?&#;\s])([^=&#;\s]+)=/g)) {
+    if (isSecretParameter(match[1]!)) {
+      rejectSecretLikeInput();
+    }
+  }
+}
+
+function assertNoSecretLikeFields(
+  value: unknown,
+  seen = new Set<object>(),
+  fieldName?: string,
+): void {
+  if (fieldName === "sourceLocator" && typeof value === "string") {
+    assertSafeSourceLocator(value);
+  }
   if (value === null || typeof value !== "object" || seen.has(value)) {
     return;
   }
   seen.add(value);
   if (Array.isArray(value)) {
     for (const entry of value) {
-      assertNoSecretLikeFields(entry, seen);
+      assertNoSecretLikeFields(entry, seen, fieldName);
     }
     return;
   }
   for (const [key, entry] of Object.entries(value)) {
     if (isSecretLikeKey(key)) {
-      throw new DomainError(
-        "INVALID_INPUT",
-        "Secret-like fields are not allowed in command input",
-      );
+      rejectSecretLikeInput();
     }
-    assertNoSecretLikeFields(entry, seen);
+    assertNoSecretLikeFields(entry, seen, key);
   }
 }
 
