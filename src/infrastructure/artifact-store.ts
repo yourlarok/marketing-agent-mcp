@@ -33,7 +33,7 @@ export class ArtifactStore {
           throw error;
         }
       }
-      await chmod(target, 0o600);
+      await this.verifyExisting(target, contentHash, bytes.length);
       return { contentHash, byteLength: bytes.length };
     } finally {
       await unlink(temporary);
@@ -64,6 +64,38 @@ export class ArtifactStore {
       }
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         throw new DomainError("NOT_FOUND", "Evidence asset not found");
+      }
+      throw error;
+    } finally {
+      await handle?.close();
+    }
+  }
+
+  private async verifyExisting(
+    target: string,
+    contentHash: string,
+    byteLength: number,
+  ): Promise<void> {
+    let handle;
+    try {
+      handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+      if (!(await handle.stat()).isFile()) {
+        throw new DomainError("CONFLICT", "Evidence artifact is not a regular file");
+      }
+      const content = await handle.readFile();
+      if (
+        content.length !== byteLength ||
+        createHash("sha256").update(content).digest("hex") !== contentHash
+      ) {
+        throw new DomainError("CONFLICT", "Existing evidence artifact content does not match");
+      }
+      await handle.chmod(0o600);
+    } catch (error) {
+      if (error instanceof DomainError) {
+        throw error;
+      }
+      if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+        throw new DomainError("CONFLICT", "Evidence artifact must not be a symbolic link");
       }
       throw error;
     } finally {

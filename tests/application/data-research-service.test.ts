@@ -1,8 +1,13 @@
 import { readFileSync } from "node:fs";
-import { copyFile, writeFile } from "node:fs/promises";
+import { copyFile, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, readFile: vi.fn(actual.readFile) };
+});
 import { MarketingService } from "../../src/application/marketing-service.js";
 import { DataResearchService } from "../../src/application/data-research-service.js";
 import type { CommandContext } from "../../src/application/commands.js";
@@ -793,6 +798,7 @@ describe("DataResearchService atomic imports and evidence assets", () => {
 
   afterEach(async () => {
     store.close();
+    vi.mocked(readFile).mockReset();
     if (originalImportRoot === undefined) {
       delete process.env.MARKETING_IMPORT_ROOT;
     } else {
@@ -884,6 +890,60 @@ describe("DataResearchService atomic imports and evidence assets", () => {
       evidenceId: batch.evidenceIds[0]!,
       assetId: "../../marketing.csv",
     })).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+  });
+
+  it("stores original bytes from the same safe import snapshot as normalized rows", async () => {
+    vi.mocked(readFile).mockResolvedValueOnce(Buffer.from("name\nForged replacement\n"));
+    const batch = await service.importFiles(importCommand("import-snapshot", ["marketing.csv"]));
+    const evidence = await store.transaction((repos) =>
+      repos.evidence.get(batch.evidenceIds[0]!, "workspace-1")
+    );
+    const assets = evidence!.assets as { id: string; kind: string }[];
+    const original = assets.find((asset) => asset.kind === "original")!;
+    const normalized = assets.find((asset) => asset.kind === "normalized_jsonl")!;
+
+    const originalContent = await service.getEvidenceAsset({
+      workspaceId: "workspace-1",
+      evidenceId: evidence!.id,
+      assetId: original.id,
+    });
+    const normalizedContent = await service.getEvidenceAsset({
+      workspaceId: "workspace-1",
+      evidenceId: evidence!.id,
+      assetId: normalized.id,
+    });
+    expect(originalContent.content).toEqual(readFileSync(join(importRoot, "marketing.csv")));
+    expect(normalizedContent.content.toString("utf8")).toContain("Acme, Inc");
+    expect(normalizedContent.content.toString("utf8")).not.toContain("Forged replacement");
+  });
+
+  it("replays without source or artifact I/O after the original files become unavailable", async () => {
+    const command = importCommand("replay-without-io", ["marketing.csv"]);
+    const first = await service.importFiles(command);
+    vi.mocked(readFile).mockClear();
+    await unlink(join(importRoot, "marketing.csv"));
+    process.env.MARKETING_IMPORT_ROOT = join(tempDir, "missing-import-root");
+    process.env.MARKETING_ARTIFACT_DIR = join(tempDir, "missing-artifact-root");
+
+    await expect(service.importFiles(command)).resolves.toEqual(first);
+    expect(readFile).not.toHaveBeenCalled();
+  });
+
+  it("rejects same-key different input before creating any artifact", async () => {
+    await writeFile(join(importRoot, "extra.csv"), "name\nExtra\n");
+    const command = importCommand("replay-conflict", ["marketing.csv"]);
+    await service.importFiles(command);
+    const conflictArtifacts = await createTempDir();
+    process.env.MARKETING_ARTIFACT_DIR = conflictArtifacts;
+    try {
+      await expect(service.importFiles({
+        ...command,
+        input: { ...command.input, paths: ["extra.csv"] },
+      })).rejects.toMatchObject<DomainError>({ code: "IDEMPOTENCY_CONFLICT" });
+      expect(await readdir(conflictArtifacts)).toEqual([]);
+    } finally {
+      await removeTempDir(conflictArtifacts);
+    }
   });
 
   it("persists successful files as partial and records a blocked batch when every file fails", async () => {

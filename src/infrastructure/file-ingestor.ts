@@ -82,6 +82,10 @@ export interface ParsedFileBatch {
   datasets: ParsedDataset[];
 }
 
+export interface IngestedFile extends ParsedFileBatch {
+  original: Buffer;
+}
+
 type JsonValue = string | number | boolean | null;
 type RowValues = JsonValue[];
 
@@ -355,6 +359,43 @@ export async function ingestFiles(
   return { datasets };
 }
 
+export async function ingestFileWithOriginal(
+  path: string,
+  limits: IngestLimits,
+): Promise<IngestedFile> {
+  const resolvedLimits = resolveLimits(limits);
+  const root = await canonicalImportRoot();
+  const file = await validateImportFile(root, path, resolvedLimits.maxFileBytes);
+  try {
+    const original = await readSnapshot(file.handle, resolvedLimits.maxFileBytes);
+    file.sizeBytes = original.length;
+    let rowCount = 0;
+    const consumeRow = (): void => {
+      if (rowCount >= resolvedLimits.maxRows) {
+        const detail = resolvedLimits.maxRows === DEFAULT_INGEST_LIMITS.maxRows
+          ? "100000 rows"
+          : "row limit";
+        throw new Error(`Import exceeds ${detail}`);
+      }
+      rowCount += 1;
+    };
+    let jsonlBytes = 0;
+    const consumeJsonl = (bytes: number): void => {
+      if (jsonlBytes + bytes > MAX_BATCH_JSONL_BYTES) {
+        throw new Error("Batch exceeds 100 MiB normalized JSONL limit");
+      }
+      jsonlBytes += bytes;
+    };
+    const datasets = file.format === "csv"
+      ? [await parseCsv(file, resolvedLimits, consumeRow, consumeJsonl, original)]
+      : await parseXlsx(file, resolvedLimits, consumeRow, consumeJsonl, original);
+    return { original, datasets };
+  } finally {
+    await Promise.all([...file.pendingReads]);
+    await file.handle.close();
+  }
+}
+
 function resolveLimits(limits: IngestLimits): Required<IngestLimits> {
   const result = { ...DEFAULT_INGEST_LIMITS };
   for (const key of Object.keys(result) as (keyof IngestLimits)[]) {
@@ -467,11 +508,20 @@ async function* boundedFileBytes(
   }
 }
 
+async function readSnapshot(handle: FileHandle, maxFileBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of boundedFileBytes(handle, maxFileBytes)) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
 async function parseCsv(
   file: ValidatedFile,
   limits: Required<IngestLimits>,
   consumeRow: () => void,
   consumeJsonl: (bytes: number) => void,
+  snapshot?: Buffer,
 ): Promise<ParsedDataset> {
   const accumulator = new DatasetAccumulator(
     {
@@ -487,7 +537,8 @@ async function parseCsv(
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const decoded = (async function* (): AsyncGenerator<string> {
     try {
-      for await (const chunk of boundedFileBytes(file.handle, limits.maxFileBytes)) {
+      const chunks = snapshot ? [snapshot] : boundedFileBytes(file.handle, limits.maxFileBytes);
+      for await (const chunk of chunks) {
         yield decoder.decode(chunk, { stream: true });
       }
       const tail = decoder.decode();
@@ -531,14 +582,20 @@ async function parseXlsx(
   limits: Required<IngestLimits>,
   consumeRow: () => void,
   consumeJsonl: (bytes: number) => void,
+  snapshot?: Buffer,
 ): Promise<ParsedDataset[]> {
   const archive = await unzipper.Open.custom({
     size: async () => {
-      const { size } = await file.handle.stat();
+      const size = snapshot?.length ?? (await file.handle.stat()).size;
       assertFileSize(size, limits.maxFileBytes);
       return size;
     },
     stream: (offset, length) => {
+      if (snapshot) {
+        const output = new PassThrough();
+        output.end(snapshot.subarray(offset, length ? offset + length + 1 : undefined));
+        return output;
+      }
       const source = createReadStream("", {
         fd: file.handle.fd,
         start: offset,

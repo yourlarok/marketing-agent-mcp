@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ArtifactStore } from "../../src/infrastructure/artifact-store.js";
@@ -39,5 +39,21 @@ describe("ArtifactStore", () => {
     await expect(store.read("../outside")).rejects.toMatchObject({ code: "NOT_FOUND" });
     await writeFile(join(root, stored.contentHash), "tampered");
     await expect(store.read(stored.contentHash)).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(store.put(Buffer.from("evidence"))).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("rejects an existing symlink without changing the outside target permissions", async () => {
+    const outside = await createTempDir();
+    const content = Buffer.from("linked evidence");
+    const contentHash = createHash("sha256").update(content).digest("hex");
+    const target = join(outside, "target");
+    await writeFile(target, content, { mode: 0o644 });
+    await symlink(target, join(root, contentHash));
+    try {
+      await expect(store.put(content)).rejects.toMatchObject({ code: "CONFLICT" });
+      expect((await stat(target)).mode & 0o777).toBe(0o644);
+    } finally {
+      await removeTempDir(outside);
+    }
   });
 });

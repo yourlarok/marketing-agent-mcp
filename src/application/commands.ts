@@ -138,7 +138,10 @@ interface WriteOperation<T, R extends EntityRecord> {
 
 export interface CommandPipeline {
   execute<T, R extends EntityRecord>(operation: WriteOperation<T, R>): Promise<R>;
-  executeBatch<T, R extends EntityRecord>(operation: WriteOperation<T, R>): Promise<R>;
+  executeBatch<T, R extends EntityRecord>(
+    operation: WriteOperation<T, R>,
+    prepare?: () => Promise<void>,
+  ): Promise<R>;
 }
 
 function assertNonEmptyString(value: unknown, field: string): void {
@@ -309,7 +312,10 @@ export class AuditableCommandPipeline implements CommandPipeline {
     return this.executeBatch(operation);
   }
 
-  async executeBatch<T, R extends EntityRecord>(operation: WriteOperation<T, R>): Promise<R> {
+  async executeBatch<T, R extends EntityRecord>(
+    operation: WriteOperation<T, R>,
+    prepare?: () => Promise<void>,
+  ): Promise<R> {
     assertCommandContext(operation.context);
     assertCommonCommandInput(operation.action, operation.input);
     if (operation.action === "evidence.record" && Object.hasOwn(operation.input as object, "assets")) {
@@ -321,6 +327,22 @@ export class AuditableCommandPipeline implements CommandPipeline {
       input: operation.input,
     });
     const requestHash = createHash("sha256").update(canonicalInput).digest("hex");
+
+    const previous = await this.store.transaction((repos) =>
+      repos.idempotency.get(operation.workspaceId, operation.context.idempotencyKey)
+    );
+    if (previous) {
+      if (previous.requestHash !== requestHash) {
+        throw new DomainError(
+          "IDEMPOTENCY_CONFLICT",
+          "Idempotency key was used with different input",
+          false,
+          { key: operation.context.idempotencyKey },
+        );
+      }
+      return previous.response as unknown as R;
+    }
+    await prepare?.();
 
     return this.store.transaction(async (repos) => {
       const previous = await repos.idempotency.get(

@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import {
   DATASET_FIELD_TYPES,
   PARSED_ISSUE_CODES,
@@ -20,7 +19,7 @@ import { ArtifactStore, type StoredArtifact } from "../infrastructure/artifact-s
 import {
   DEFAULT_INGEST_LIMITS,
   MAX_BATCH_JSONL_BYTES,
-  ingestFiles,
+  ingestFileWithOriginal,
   type ParsedDataset,
 } from "../infrastructure/file-ingestor.js";
 import {
@@ -211,7 +210,12 @@ export class DataResearchService {
     }
 
     const limits = input.limits ?? {};
-    await ingestFiles([], limits);
+    for (const key of ["maxFileBytes", "maxFiles", "maxRows", "maxColumns"] as const) {
+      const requested = limits[key];
+      if (requested !== undefined && (!Number.isSafeInteger(requested) || requested <= 0)) {
+        throw new Error(`${key} must be a positive integer`);
+      }
+    }
     const maxFiles = Math.min(
       DEFAULT_INGEST_LIMITS.maxFiles,
       limits.maxFiles ?? DEFAULT_INGEST_LIMITS.maxFiles,
@@ -223,53 +227,57 @@ export class DataResearchService {
       DEFAULT_INGEST_LIMITS.maxRows,
       limits.maxRows ?? DEFAULT_INGEST_LIMITS.maxRows,
     );
-    let remainingRows = maxRows;
-    let jsonlBytes = 0;
-    const files: PreparedFile[] = [];
-    const failures: IngestionFileFailure[] = [];
-    for (const path of input.paths) {
-      try {
-        const parsed = await ingestFiles([path], {
-          ...limits,
-          maxRows: Math.max(1, remainingRows),
-        });
-        const rowCount = parsed.datasets.reduce((sum, dataset) => sum + dataset.quality.rowCount, 0);
-        if (rowCount > remainingRows) {
-          throw new Error(`Import exceeds ${maxRows === DEFAULT_INGEST_LIMITS.maxRows ? "100000 rows" : "row limit"}`);
+    let files: PreparedFile[] = [];
+    let failures: IngestionFileFailure[] = [];
+    const prepare = async (): Promise<void> => {
+      let remainingRows = maxRows;
+      let jsonlBytes = 0;
+      files = [];
+      failures = [];
+      for (const path of input.paths) {
+        try {
+          const parsed = await ingestFileWithOriginal(path, {
+            ...limits,
+            maxRows: Math.max(1, remainingRows),
+          });
+          const rowCount = parsed.datasets.reduce((sum, dataset) => sum + dataset.quality.rowCount, 0);
+          if (rowCount > remainingRows) {
+            throw new Error(`Import exceeds ${maxRows === DEFAULT_INGEST_LIMITS.maxRows ? "100000 rows" : "row limit"}`);
+          }
+          const parsedBytes = parsed.datasets.reduce(
+            (sum, dataset) => sum + Buffer.byteLength(dataset.rowsJsonl),
+            0,
+          );
+          if (jsonlBytes + parsedBytes > MAX_BATCH_JSONL_BYTES) {
+            throw new Error("Batch exceeds 100 MiB normalized JSONL limit");
+          }
+          const first = parsed.datasets[0];
+          if (!first) {
+            throw new Error(`Import contains no datasets: ${path}`);
+          }
+          const original = await this.artifacts.put(parsed.original);
+          const qualityReports = createDataQualityReports(parsed, input.freshness);
+          const datasets: PreparedDataset[] = [];
+          for (let index = 0; index < parsed.datasets.length; index += 1) {
+            const dataset = parsed.datasets[index]!;
+            const qualityReport = qualityReports[index]!;
+            const [normalized, quality] = await Promise.all([
+              this.artifacts.put(Buffer.from(dataset.rowsJsonl)),
+              this.artifacts.put(Buffer.from(JSON.stringify(qualityReport))),
+            ]);
+            datasets.push({ parsed: dataset, normalized, quality, qualityReport });
+          }
+          files.push({ source: first.source, original, datasets });
+          remainingRows -= rowCount;
+          jsonlBytes += parsedBytes;
+        } catch (error) {
+          failures.push({
+            path,
+            message: error instanceof Error ? error.message : "File import failed",
+          });
         }
-        const parsedBytes = parsed.datasets.reduce(
-          (sum, dataset) => sum + Buffer.byteLength(dataset.rowsJsonl),
-          0,
-        );
-        if (jsonlBytes + parsedBytes > MAX_BATCH_JSONL_BYTES) {
-          throw new Error("Batch exceeds 100 MiB normalized JSONL limit");
-        }
-        const first = parsed.datasets[0];
-        if (!first) {
-          throw new Error(`Import contains no datasets: ${path}`);
-        }
-        const original = await this.artifacts.put(await readFile(first.source.path));
-        const qualityReports = createDataQualityReports(parsed, input.freshness);
-        const datasets: PreparedDataset[] = [];
-        for (let index = 0; index < parsed.datasets.length; index += 1) {
-          const dataset = parsed.datasets[index]!;
-          const qualityReport = qualityReports[index]!;
-          const [normalized, quality] = await Promise.all([
-            this.artifacts.put(Buffer.from(dataset.rowsJsonl)),
-            this.artifacts.put(Buffer.from(JSON.stringify(qualityReport))),
-          ]);
-          datasets.push({ parsed: dataset, normalized, quality, qualityReport });
-        }
-        files.push({ source: first.source, original, datasets });
-        remainingRows -= rowCount;
-        jsonlBytes += parsedBytes;
-      } catch (error) {
-        failures.push({
-          path,
-          message: error instanceof Error ? error.message : "File import failed",
-        });
       }
-    }
+    };
 
     return this.commands.executeBatch({
       workspaceId: input.workspaceId,
@@ -395,7 +403,7 @@ export class DataResearchService {
         };
         return repos.ingestionBatches.insert(batch) as Promise<IngestionBatch>;
       },
-    });
+    }, prepare);
   }
 
   async getEvidenceAsset(query: EvidenceAssetQuery): Promise<EvidenceAssetContent> {
