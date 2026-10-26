@@ -161,7 +161,12 @@ export const recordFindingInputSchema = z.strictObject({
   workspaceId: idSchema,
   kind: z.enum(["fact", "inference", "unknown"]),
   statement: z.string().trim().min(1).max(8_192),
-  evidenceIds: z.array(idSchema).max(MAX_COLLECTION_ENTRIES),
+  evidenceIds: z
+    .array(idSchema)
+    .max(MAX_COLLECTION_ENTRIES)
+    .refine((ids) => new Set(ids).size === ids.length, {
+      message: "Evidence IDs must not contain duplicates",
+    }),
   limitations: z.string().trim().min(1).max(8_192).optional(),
   unknownReason: z.string().trim().min(1).max(8_192).optional(),
   ...commandContextInput,

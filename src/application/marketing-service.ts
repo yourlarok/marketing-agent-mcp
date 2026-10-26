@@ -214,6 +214,27 @@ export class MarketingService {
       input: command.input,
       context: command.context,
       write: async (repos, input, timestamp) => {
+        if (typeof input.statement !== "string" || input.statement.trim().length === 0) {
+          throw new DomainError("INVALID_INPUT", "statement must not be empty");
+        }
+        if (
+          !Array.isArray(input.evidenceIds) ||
+          input.evidenceIds.some(
+            (evidenceId) =>
+              typeof evidenceId !== "string" || evidenceId.trim().length === 0,
+          )
+        ) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "evidenceIds must be an array of non-empty strings",
+          );
+        }
+        if (new Set(input.evidenceIds).size !== input.evidenceIds.length) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "evidenceIds must not contain duplicates",
+          );
+        }
         if (!(FINDING_KINDS as readonly string[]).includes(input.kind)) {
           throw new DomainError("INVALID_INPUT", "kind must be a supported finding kind");
         }

@@ -783,11 +783,16 @@ describe("MarketingService command pipeline", () => {
     await expect(
       service.recordFinding({ input, context }),
     ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
-    expect(
-      await store.transaction((repos) =>
-        repos.findings.get("finding-1", "workspace-1"),
-      ),
-    ).toBeUndefined();
+    const persisted = await store.transaction(async (repos) => ({
+      finding: await repos.findings.get("finding-1", "workspace-1"),
+      audit: await repos.audit.get("audit-1", "workspace-1"),
+      idempotency: await repos.idempotency.get("workspace-1", "command-1"),
+    }));
+    expect(persisted).toEqual({
+      finding: undefined,
+      audit: undefined,
+      idempotency: undefined,
+    });
   });
 
   it("rejects a finding unknown without a reason", async () => {
@@ -803,11 +808,16 @@ describe("MarketingService command pipeline", () => {
         context,
       }),
     ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
-    expect(
-      await store.transaction((repos) =>
-        repos.findings.get("finding-1", "workspace-1"),
-      ),
-    ).toBeUndefined();
+    const persisted = await store.transaction(async (repos) => ({
+      finding: await repos.findings.get("finding-1", "workspace-1"),
+      audit: await repos.audit.get("audit-1", "workspace-1"),
+      idempotency: await repos.idempotency.get("workspace-1", "command-1"),
+    }));
+    expect(persisted).toEqual({
+      finding: undefined,
+      audit: undefined,
+      idempotency: undefined,
+    });
   });
 
   it("rejects a finding that references evidence in another workspace", async () => {
@@ -867,9 +877,98 @@ describe("MarketingService command pipeline", () => {
         context: { ...context, requestId: "request-5", idempotencyKey: "command-5" },
       }),
     ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    const persisted = await store.transaction(async (repos) => ({
+      finding: await repos.findings.get("finding-1", "workspace-1"),
+      audit: await repos.audit.get("audit-5", "workspace-1"),
+      idempotency: await repos.idempotency.get("workspace-1", "command-5"),
+    }));
+    expect(persisted).toEqual({
+      finding: undefined,
+      audit: undefined,
+      idempotency: undefined,
+    });
+  });
+
+  it.each([
+    {
+      label: "a blank statement",
+      input: { ...findingInput(), statement: " \t\n" },
+    },
+    {
+      label: "null evidence IDs",
+      input: { ...findingInput(), evidenceIds: null as never },
+    },
+    {
+      label: "object evidence IDs",
+      input: { ...findingInput(), evidenceIds: { 0: "evidence-1" } as never },
+    },
+    {
+      label: "a non-string evidence ID",
+      input: { ...findingInput(), evidenceIds: [42] as never },
+    },
+    {
+      label: "a blank evidence ID",
+      input: { ...findingInput(), evidenceIds: [" \t"] },
+    },
+    {
+      label: "duplicate evidence IDs",
+      input: {
+        ...findingInput(),
+        evidenceIds: ["evidence-1", "evidence-1"],
+      },
+    },
+  ])("rejects a finding with $label without command residue", async ({ input }) => {
+    await recordEvidencePair();
+
+    await expect(
+      service.recordFinding({
+        input,
+        context: { ...context, requestId: "request-5", idempotencyKey: "command-5" },
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+
+    const persisted = await store.transaction(async (repos) => ({
+      finding: await repos.findings.get("finding-1", "workspace-1"),
+      audit: await repos.audit.get("audit-5", "workspace-1"),
+      idempotency: await repos.idempotency.get("workspace-1", "command-5"),
+    }));
+    expect(persisted).toEqual({
+      finding: undefined,
+      audit: undefined,
+      idempotency: undefined,
+    });
+  });
+
+  it("replays a finding without duplicate writes", async () => {
+    await recordEvidencePair();
+    const first = await service.recordFinding({
+      input: findingInput(),
+      context: { ...context, requestId: "request-5", idempotencyKey: "command-5" },
+    });
+    clock.set(secondNow);
+
+    const replay = await service.recordFinding({
+      input: {
+        statement: "January revenue growth was driven by repeat customers",
+        evidenceIds: ["evidence-2", "evidence-1"],
+        limitations: "Attribution is limited to the observed customer cohort",
+        kind: "inference",
+        workspaceId: "workspace-1",
+        id: "finding-1",
+      },
+      context: {
+        ...context,
+        requestId: "request-replay",
+        idempotencyKey: "command-5",
+      },
+    });
+
+    expect(replay).toEqual(first);
+    expect(replay.createdAt).toBe(firstNow);
+    expect(ids.calls).toBe(5);
     expect(
       await store.transaction((repos) =>
-        repos.findings.get("finding-1", "workspace-1"),
+        repos.audit.get("audit-6", "workspace-1"),
       ),
     ).toBeUndefined();
   });

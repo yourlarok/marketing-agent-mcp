@@ -15,6 +15,7 @@ import {
 import { toMcpError } from "../../src/mcp/error-mapper.js";
 import {
   MAX_SERIALIZED_INPUT_BYTES,
+  recordFindingInputSchema,
   resourceIdInputSchema,
   serializedInputSchema,
   timestampInputSchema,
@@ -357,6 +358,21 @@ describe("MCP input contracts", () => {
 
   it("rejects empty IDs", () => {
     expect(resourceIdInputSchema.safeParse({ id: "   " }).success).toBe(false);
+  });
+
+  it("rejects duplicate finding evidence IDs", () => {
+    expect(
+      recordFindingInputSchema.safeParse({
+        id: "finding-1",
+        workspaceId: "workspace-1",
+        kind: "fact",
+        statement: "A supported statement",
+        evidenceIds: ["evidence-1", "evidence-1"],
+        actor: "agent-1",
+        requestId: "request-1",
+        idempotencyKey: "command-1",
+      }).success,
+    ).toBe(false);
   });
 
   it("accepts UTC timestamps and rejects non-UTC timestamps", () => {
