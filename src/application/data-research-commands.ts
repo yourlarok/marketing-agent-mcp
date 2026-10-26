@@ -42,6 +42,19 @@ export interface ImportFiles {
   freshness?: FreshnessAssessment;
 }
 
+export interface IngestTemporaryApi {
+  id: string;
+  workspaceId: string;
+  url: string;
+  ownership: "owned" | "authorized";
+  expiresAt: string;
+  credentialRef?: string;
+  limits?: IngestLimits;
+  planId?: string;
+  expectedPlanVersion?: number;
+  freshness?: FreshnessAssessment;
+}
+
 export interface EvidenceAssetQuery {
   workspaceId: string;
   evidenceId: string;

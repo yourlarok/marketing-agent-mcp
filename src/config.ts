@@ -3,7 +3,13 @@ import { statSync } from "node:fs";
 export interface AppConfig {
   dataDir: string;
   importRoot?: string;
+  httpAllowlist?: string[];
+  httpCredentialAllowlist?: string[];
   logLevel: "error" | "warn" | "info";
+}
+
+export function parseCommaSeparatedList(value: string | undefined): string[] {
+  return value ? value.split(",").map((entry) => entry.trim()).filter(Boolean) : [];
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
@@ -41,5 +47,13 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     }
   }
 
-  return { dataDir, ...(importRoot ? { importRoot } : {}), logLevel: "info" };
+  const httpAllowlist = parseCommaSeparatedList(env.MARKETING_HTTP_ALLOWLIST);
+  const httpCredentialAllowlist = parseCommaSeparatedList(env.MARKETING_HTTP_CREDENTIAL_ALLOWLIST);
+  return {
+    dataDir,
+    ...(importRoot ? { importRoot } : {}),
+    ...(httpAllowlist.length > 0 ? { httpAllowlist } : {}),
+    ...(httpCredentialAllowlist.length > 0 ? { httpCredentialAllowlist } : {}),
+    logLevel: "info",
+  };
 }

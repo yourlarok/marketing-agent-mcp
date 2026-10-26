@@ -396,6 +396,36 @@ export async function ingestFileWithOriginal(
   }
 }
 
+export async function ingestCsvSnapshot(
+  path: string,
+  fileName: string,
+  snapshot: Buffer,
+  limits: IngestLimits = {},
+): Promise<IngestedFile> {
+  const resolvedLimits = resolveLimits(limits);
+  assertFileSize(snapshot.length, resolvedLimits.maxFileBytes);
+  let rowCount = 0;
+  let jsonlBytes = 0;
+  const dataset = await parseCsv(
+    { path, fileName, format: "csv", sizeBytes: snapshot.length },
+    resolvedLimits,
+    () => {
+      if (rowCount >= resolvedLimits.maxRows) {
+        throw new Error(`Import exceeds ${resolvedLimits.maxRows === DEFAULT_INGEST_LIMITS.maxRows ? "100000 rows" : "row limit"}`);
+      }
+      rowCount += 1;
+    },
+    (bytes) => {
+      if (jsonlBytes + bytes > MAX_BATCH_JSONL_BYTES) {
+        throw new Error("Batch exceeds 100 MiB normalized JSONL limit");
+      }
+      jsonlBytes += bytes;
+    },
+    snapshot,
+  );
+  return { original: snapshot, datasets: [dataset] };
+}
+
 function resolveLimits(limits: IngestLimits): Required<IngestLimits> {
   const result = { ...DEFAULT_INGEST_LIMITS };
   for (const key of Object.keys(result) as (keyof IngestLimits)[]) {
@@ -517,7 +547,7 @@ async function readSnapshot(handle: FileHandle, maxFileBytes: number): Promise<B
 }
 
 async function parseCsv(
-  file: ValidatedFile,
+  file: Omit<ValidatedFile, "handle" | "pendingReads"> & { handle?: FileHandle },
   limits: Required<IngestLimits>,
   consumeRow: () => void,
   consumeJsonl: (bytes: number) => void,
@@ -537,7 +567,7 @@ async function parseCsv(
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const decoded = (async function* (): AsyncGenerator<string> {
     try {
-      const chunks = snapshot ? [snapshot] : boundedFileBytes(file.handle, limits.maxFileBytes);
+      const chunks = snapshot ? [snapshot] : boundedFileBytes(file.handle!, limits.maxFileBytes);
       for await (const chunk of chunks) {
         yield decoder.decode(chunk, { stream: true });
       }

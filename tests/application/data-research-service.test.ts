@@ -1,5 +1,7 @@
 import { readFileSync } from "node:fs";
 import { copyFile, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +27,8 @@ import type {
   ResearchSession,
 } from "../../src/domain/data-research-model.js";
 import type { DomainError } from "../../src/domain/errors.js";
+import { ArtifactStore } from "../../src/infrastructure/artifact-store.js";
+import { SafeHttpClient } from "../../src/infrastructure/safe-http.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
 
@@ -1063,5 +1067,174 @@ describe("DataResearchService atomic imports and evidence assets", () => {
     await expect(
       store.transaction((repos) => repos.evidence.get("forged-evidence", "workspace-1")),
     ).resolves.toBeUndefined();
+  });
+
+  function apiCommand(id: string, url: string, extra: Record<string, unknown> = {}) {
+    return {
+      input: {
+        id,
+        workspaceId: "workspace-1",
+        url,
+        ownership: "owned" as const,
+        expiresAt: "2026-10-26T13:00:00.000Z",
+        ...extra,
+      },
+      context: commandContext(id),
+    };
+  }
+
+  function apiService(): DataResearchService {
+    return new DataResearchService(
+      store,
+      { now: () => now },
+      { next: () => `api-${++sequence}` },
+      new ArtifactStore(),
+      new SafeHttpClient({
+        allowlist: ["127.0.0.1"],
+        credentialAllowlist: ["TEMPORARY_API_TOKEN"],
+        env: { TEMPORARY_API_TOKEN: "database-secret-must-not-leak" },
+        now: () => now,
+      }),
+    );
+  }
+
+  async function withApiServer(
+    handler: (request: IncomingMessage, response: ServerResponse) => void,
+    run: (url: string, hits: () => number) => Promise<void>,
+  ): Promise<void> {
+    let hits = 0;
+    const server = createServer((request, response) => {
+      hits += 1;
+      handler(request, response);
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    const { port } = server.address() as AddressInfo;
+    try {
+      await run(`http://127.0.0.1:${port}`, () => hits);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  }
+
+  it("ingests JSON through real authenticated HTTP and atomically reconciles its quality graph", async () => {
+    const plan = await service.planDataRequests({
+      input: {
+        id: "api-plan",
+        workspaceId: "workspace-1",
+        objective: "Understand API performance",
+        questionTypes: ["content_performance"],
+        availableFields: [],
+      },
+      context: commandContext("api-plan"),
+    });
+    const payload = JSON.stringify([{
+      content_id: "content-1",
+      published_at: "2026-10-26T12:00:00.000Z",
+      impressions: 10,
+      clicks: 2,
+    }]);
+
+    await withApiServer((request, response) => {
+      expect(request.headers.authorization).toBe("Bearer database-secret-must-not-leak");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(payload);
+    }, async (url) => {
+      const batch = await apiService().ingestTemporaryApi(apiCommand("api-json", `${url}/metrics`, {
+        credentialRef: "env:TEMPORARY_API_TOKEN",
+        planId: plan.id,
+        expectedPlanVersion: 1,
+      }));
+      expect(batch).toMatchObject({ state: "completed", failures: [] });
+      expect(batch.sourceIds).toHaveLength(1);
+      expect(batch.datasetIds).toHaveLength(1);
+      expect(batch.evidenceIds).toHaveLength(1);
+
+      const graph = await store.transaction(async (repos) => ({
+        source: await repos.sources.get(batch.sourceIds[0]!, "workspace-1"),
+        dataset: await repos.datasets.get(batch.datasetIds[0]!, "workspace-1"),
+        evidence: await repos.evidence.get(batch.evidenceIds[0]!, "workspace-1"),
+        plan: await repos.dataRequestPlans.get(plan.id, "workspace-1"),
+        audit: await repos.audit.listForEntity("workspace-1", "ingestion_batch", batch.id),
+      }));
+      expect(graph.source).toMatchObject({ type: "api", ownership: "owned" });
+      expect(graph.dataset).toMatchObject({ name: "metrics.json", quality: { rowCount: 1, columnCount: 4 } });
+      expect(graph.plan).toMatchObject({ version: 2, round: 2, answerableQuestionTypes: ["content_performance"] });
+      expect(graph.plan?.qualityReports).toHaveLength(1);
+      expect(graph.audit).toHaveLength(1);
+      const assets = graph.evidence?.assets as { id: string; kind: string }[];
+      expect(assets.map((asset) => asset.kind)).toEqual(["api_response", "normalized_jsonl", "quality_report"]);
+      const original = assets.find((asset) => asset.kind === "api_response")!;
+      const content = await apiService().getEvidenceAsset({
+        workspaceId: "workspace-1",
+        evidenceId: batch.evidenceIds[0]!,
+        assetId: original.id,
+      });
+      expect(content.content.toString("utf8")).toBe(payload);
+
+      const raw = new DatabaseSync(join(tempDir, "store.db"));
+      try {
+        const persisted = [
+          ...raw.prepare("SELECT payload FROM sources").all(),
+          ...raw.prepare("SELECT payload FROM evidence").all(),
+          ...raw.prepare("SELECT details FROM audit_records").all(),
+        ];
+        expect(JSON.stringify(persisted)).not.toContain("database-secret-must-not-leak");
+      } finally {
+        raw.close();
+      }
+    });
+  });
+
+  it("ingests authorized CSV responses with normalized rows and quality artifacts", async () => {
+    await withApiServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/csv; charset=utf-8" });
+      response.end("name,amount\nAcme,12\nAcme,12\n");
+    }, async (url) => {
+      const batch = await apiService().ingestTemporaryApi(apiCommand("api-csv", `${url}/export.csv`, {
+        ownership: "authorized",
+      }));
+      const graph = await store.transaction(async (repos) => ({
+        source: await repos.sources.get(batch.sourceIds[0]!, "workspace-1"),
+        dataset: await repos.datasets.get(batch.datasetIds[0]!, "workspace-1"),
+      }));
+      expect(graph.source?.ownership).toBe("authorized");
+      expect(graph.dataset).toMatchObject({
+        name: "export.csv",
+        quality: { rowCount: 2, duplicateRowCount: 1 },
+      });
+    });
+  });
+
+  it("replays and detects conflicts before temporary API network or artifact I/O", async () => {
+    let command: ReturnType<typeof apiCommand>;
+    let first: IngestionBatch;
+    await withApiServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end('[{"name":"Acme"}]');
+    }, async (url, hits) => {
+      command = apiCommand("api-replay", `${url}/data`);
+      first = await apiService().ingestTemporaryApi(command);
+      expect(hits()).toBe(1);
+    });
+
+    process.env.MARKETING_ARTIFACT_DIR = join(tempDir, "missing-artifact-root");
+    await expect(apiService().ingestTemporaryApi(command!)).resolves.toEqual(first!);
+    await expect(apiService().ingestTemporaryApi({
+      ...command!,
+      input: { ...command!.input, url: "http://127.0.0.1:1/conflict" },
+    })).rejects.toMatchObject<DomainError>({ code: "IDEMPOTENCY_CONFLICT" });
+  });
+
+  it("rejects plaintext credentials and non-owned API sources before network I/O", async () => {
+    await withApiServer((_request, response) => response.end("unexpected"), async (url, hits) => {
+      await expect(apiService().ingestTemporaryApi(apiCommand("api-plaintext", `${url}/data`, {
+        credential: "database-secret-must-not-leak",
+      }) as never)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+      await expect(apiService().ingestTemporaryApi(apiCommand("api-public", `${url}/data`, {
+        ownership: "external_public",
+      }) as never)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+      expect(hits()).toBe(0);
+    });
   });
 });

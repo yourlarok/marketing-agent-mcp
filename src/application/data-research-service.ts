@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import {
   DATASET_FIELD_TYPES,
   PARSED_ISSUE_CODES,
@@ -19,9 +20,12 @@ import { ArtifactStore, type StoredArtifact } from "../infrastructure/artifact-s
 import {
   DEFAULT_INGEST_LIMITS,
   MAX_BATCH_JSONL_BYTES,
+  ingestCsvSnapshot,
   ingestFileWithOriginal,
+  type IngestLimits,
   type ParsedDataset,
 } from "../infrastructure/file-ingestor.js";
+import { SafeHttpClient } from "../infrastructure/safe-http.js";
 import {
   AuditableCommandPipeline,
   type Command,
@@ -33,6 +37,7 @@ import type {
   EvidenceAssetContent,
   EvidenceAssetQuery,
   ImportFiles,
+  IngestTemporaryApi,
   ReconcileDataRequestPlan,
 } from "./data-research-commands.js";
 import type {
@@ -171,6 +176,37 @@ interface PreparedFile {
   source: ParsedDataset["source"];
   original: StoredArtifact;
   datasets: PreparedDataset[];
+  artifactKind?: "original" | "api_response";
+  ownership?: "owned" | "authorized";
+  responseFormat?: "json" | "csv";
+}
+
+function csvCell(value: unknown): string {
+  if (value !== null && typeof value !== "string" && typeof value !== "boolean" &&
+    (typeof value !== "number" || !Number.isFinite(value))) {
+    throw new Error("Temporary API JSON rows must contain only scalar values");
+  }
+  const text = value === null ? "" : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function jsonToCsv(body: Buffer): Buffer {
+  let value: unknown;
+  try {
+    value = JSON.parse(body.toString("utf8"));
+  } catch {
+    throw new Error("Temporary API response is not valid JSON");
+  }
+  if (!Array.isArray(value) || value.some((row) => row === null || typeof row !== "object" || Array.isArray(row))) {
+    throw new Error("Temporary API JSON response must be an array of objects");
+  }
+  const rows = value as Record<string, unknown>[];
+  const headers = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+  const lines = [headers.map(csvCell).join(",")];
+  for (const row of rows) {
+    lines.push(headers.map((header) => csvCell(row[header])).join(","));
+  }
+  return Buffer.from(`${lines.join("\n")}\n`);
 }
 
 export class DataResearchService {
@@ -181,6 +217,7 @@ export class DataResearchService {
     clock: Clock,
     private readonly ids: IdGenerator,
     private readonly artifacts: ArtifactStore = new ArtifactStore(),
+    private readonly http: Pick<SafeHttpClient, "get"> = new SafeHttpClient(),
   ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
@@ -285,125 +322,222 @@ export class DataResearchService {
       entityType: "ingestion_batch",
       input,
       context: command.context,
-      write: async (repos, _input, timestamp) => {
-        await requireWorkspace(repos, input.workspaceId);
-        const sourceIds: string[] = [];
-        const datasetIds: string[] = [];
-        const evidenceIds: string[] = [];
-        for (const file of files) {
-          const { sheetName: _sheetName, ...sourceMetadata } = file.source;
-          const source: Source = {
-            id: this.ids.next(),
-            workspaceId: input.workspaceId,
-            version: 1,
-            createdAt: timestamp,
-            updatedAt: timestamp,
-            name: file.source.fileName,
-            type: "file",
-            ownership: "owned",
-            metadata: {
-              ...sourceMetadata,
-              originalContentHash: file.original.contentHash,
-              originalByteLength: file.original.byteLength,
-            },
-          };
-          await repos.sources.insert(source);
-          sourceIds.push(source.id);
-          for (const prepared of file.datasets) {
-            const { parsed } = prepared;
-            const dataset: Dataset = {
-              id: this.ids.next(),
-              workspaceId: input.workspaceId,
-              version: 1,
-              createdAt: timestamp,
-              updatedAt: timestamp,
-              sourceId: source.id,
-              name: `${parsed.source.fileName}${parsed.source.sheetName ? `#${parsed.source.sheetName}` : ""}`,
-              coverageStart: timestamp,
-              coverageEnd: timestamp,
-              fieldDefinitions: parsed.fields.map((field) => ({ ...field })),
-              metricDefinitions: [],
-              limitations: parsed.issues.map((issue) => issue.message),
-              quality: { ...parsed.quality },
-            };
-            await repos.datasets.insert(dataset);
-            datasetIds.push(dataset.id);
-            const evidence: Evidence = {
-              id: this.ids.next(),
-              workspaceId: input.workspaceId,
-              version: 1,
-              createdAt: timestamp,
-              updatedAt: timestamp,
-              sourceId: source.id,
-              sourceLocator: `${parsed.source.path}${parsed.source.sheetName ? `#${parsed.source.sheetName}` : ""}`,
-              observedAt: timestamp,
-              summary: `Imported ${dataset.name}`,
-              contentHash: prepared.normalized.contentHash,
-              classification: "owned_operating",
-              assets: [
-                { id: this.ids.next(), kind: "original", ...file.original },
-                { id: this.ids.next(), kind: "normalized_jsonl", ...prepared.normalized },
-                { id: this.ids.next(), kind: "quality_report", ...prepared.quality },
-              ],
-            };
-            await repos.evidence.insert(evidence);
-            evidenceIds.push(evidence.id);
-          }
-        }
+      write: (repos, _input, timestamp) =>
+        this.writeIngestionBatch(repos, input, files, failures, timestamp),
+    }, prepare);
+  }
 
-        if (input.planId !== undefined && files.length > 0) {
-          const stored = await repos.dataRequestPlans.get(input.planId, input.workspaceId);
-          if (!stored) {
-            throw new DomainError("NOT_FOUND", "Data request plan not found in workspace", false, {
-              planId: input.planId,
-              workspaceId: input.workspaceId,
-            });
-          }
-          const current = requirePlanDetails(stored);
-          if (current.version !== input.expectedPlanVersion) {
-            throw new DomainError("CONFLICT", "Data request plan version does not match", false, {
-              planId: input.planId,
-            });
-          }
-          const importedFields = files.flatMap((file) =>
-            file.datasets.flatMap((dataset) => dataset.parsed.fields.map((field) => field.name))
-          );
-          const availableFields = [...new Set([...current.availableFields, ...importedFields])];
-          const planned = planDataRequestRound(
-            current.questionTypes,
-            availableFields,
-            current.declinedQuestionTypes,
-          );
-          const round = current.round + 1;
-          await repos.dataRequestPlans.update({
-            ...current,
-            ...planned,
-            availableFields,
-            qualityReports: [
-              ...current.qualityReports,
-              ...files.flatMap((file) => file.datasets.map((dataset) => dataset.qualityReport)),
-            ],
-            round,
-            updatedAt: timestamp,
-            rounds: [...current.rounds, { round, ...planned }],
-          }, input.expectedPlanVersion!);
-        }
+  async ingestTemporaryApi(command: Command<IngestTemporaryApi>): Promise<IngestionBatch> {
+    const input = command.input;
+    assertNonEmptyString(input.url, "url");
+    assertNonEmptyString(input.expiresAt, "expiresAt");
+    if (input.ownership !== "owned" && input.ownership !== "authorized") {
+      invalid("ownership must be owned or authorized");
+    }
+    if ((input.planId === undefined) !== (input.expectedPlanVersion === undefined)) {
+      invalid("planId and expectedPlanVersion must be provided together");
+    }
+    if (input.planId !== undefined) {
+      assertNonEmptyString(input.planId, "planId");
+      if (!Number.isInteger(input.expectedPlanVersion) || input.expectedPlanVersion! < 1) {
+        invalid("expectedPlanVersion must be a positive integer");
+      }
+    }
+    if (input.freshness !== undefined &&
+      (input.freshness === null || typeof input.freshness !== "object" || Array.isArray(input.freshness))) {
+      invalid("freshness must be an object");
+    }
+    const limits: IngestLimits = input.limits ?? {};
+    for (const key of ["maxFileBytes", "maxRows", "maxColumns"] as const) {
+      const requested = limits[key];
+      if (requested !== undefined && (!Number.isSafeInteger(requested) || requested <= 0)) {
+        invalid(`${key} must be a positive integer`);
+      }
+    }
 
-        const batch: IngestionBatch = {
-          id: input.id,
+    let files: PreparedFile[] = [];
+    const prepare = async (): Promise<void> => {
+      files = [];
+      const response = await this.http.get({
+        url: input.url,
+        expiresAt: input.expiresAt,
+        ...(input.credentialRef === undefined ? {} : { credentialRef: input.credentialRef }),
+      });
+      const mime = response.contentType?.split(";", 1)[0]?.trim().toLowerCase();
+      const path = new URL(response.finalUrl).pathname.toLowerCase();
+      const format = mime === "application/json" || mime?.endsWith("+json") || path.endsWith(".json")
+        ? "json"
+        : mime === "text/csv" || mime === "application/csv" || path.endsWith(".csv")
+          ? "csv"
+          : undefined;
+      if (!format) {
+        throw new Error("Temporary API response must be JSON or CSV");
+      }
+      const baseName = basename(new URL(response.finalUrl).pathname) || "temporary-api";
+      const fileName = baseName.toLowerCase().endsWith(`.${format}`) ? baseName : `${baseName}.${format}`;
+      const snapshot = format === "json" ? jsonToCsv(response.body) : response.body;
+      const parsed = await ingestCsvSnapshot(input.url, fileName, snapshot, limits);
+      const first = parsed.datasets[0];
+      if (!first) {
+        throw new Error("Temporary API response contains no dataset");
+      }
+      const original = await this.artifacts.put(response.body);
+      const qualityReports = createDataQualityReports(parsed, input.freshness);
+      const datasets: PreparedDataset[] = [];
+      for (let index = 0; index < parsed.datasets.length; index += 1) {
+        const dataset = parsed.datasets[index]!;
+        const qualityReport = qualityReports[index]!;
+        const [normalized, quality] = await Promise.all([
+          this.artifacts.put(Buffer.from(dataset.rowsJsonl)),
+          this.artifacts.put(Buffer.from(JSON.stringify(qualityReport))),
+        ]);
+        datasets.push({ parsed: dataset, normalized, quality, qualityReport });
+      }
+      files = [{
+        source: first.source,
+        original,
+        datasets,
+        artifactKind: "api_response",
+        ownership: input.ownership,
+        responseFormat: format,
+      }];
+    };
+
+    return this.commands.executeBatch({
+      workspaceId: input.workspaceId,
+      action: "ingestion_batch.temporary_api",
+      entityType: "ingestion_batch",
+      input,
+      context: command.context,
+      write: (repos, _input, timestamp) =>
+        this.writeIngestionBatch(repos, input, files, [], timestamp),
+    }, prepare);
+  }
+
+  private async writeIngestionBatch(
+    repos: Repositories,
+    input: { id: string; workspaceId: string; planId?: string; expectedPlanVersion?: number },
+    files: PreparedFile[],
+    failures: IngestionFileFailure[],
+    timestamp: string,
+  ): Promise<IngestionBatch> {
+    await requireWorkspace(repos, input.workspaceId);
+    const sourceIds: string[] = [];
+    const datasetIds: string[] = [];
+    const evidenceIds: string[] = [];
+    for (const file of files) {
+      const { sheetName: _sheetName, ...sourceMetadata } = file.source;
+      const source: Source = {
+        id: this.ids.next(),
+        workspaceId: input.workspaceId,
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        name: file.source.fileName,
+        type: file.responseFormat ? "api" : "file",
+        ownership: file.ownership ?? "owned",
+        metadata: {
+          ...sourceMetadata,
+          format: file.responseFormat ?? sourceMetadata.format,
+          originalContentHash: file.original.contentHash,
+          originalByteLength: file.original.byteLength,
+        },
+      };
+      await repos.sources.insert(source);
+      sourceIds.push(source.id);
+      for (const prepared of file.datasets) {
+        const { parsed } = prepared;
+        const dataset: Dataset = {
+          id: this.ids.next(),
           workspaceId: input.workspaceId,
           version: 1,
           createdAt: timestamp,
           updatedAt: timestamp,
-          state: failures.length === 0 ? "completed" : files.length === 0 ? "blocked" : "partial",
-          sourceIds,
-          datasetIds,
-          evidenceIds,
-          failures,
+          sourceId: source.id,
+          name: `${parsed.source.fileName}${parsed.source.sheetName ? `#${parsed.source.sheetName}` : ""}`,
+          coverageStart: timestamp,
+          coverageEnd: timestamp,
+          fieldDefinitions: parsed.fields.map((field) => ({ ...field })),
+          metricDefinitions: [],
+          limitations: parsed.issues.map((issue) => issue.message),
+          quality: { ...parsed.quality },
         };
-        return repos.ingestionBatches.insert(batch) as Promise<IngestionBatch>;
-      },
-    }, prepare);
+        await repos.datasets.insert(dataset);
+        datasetIds.push(dataset.id);
+        const evidence: Evidence = {
+          id: this.ids.next(),
+          workspaceId: input.workspaceId,
+          version: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          sourceId: source.id,
+          sourceLocator: `${parsed.source.path}${parsed.source.sheetName ? `#${parsed.source.sheetName}` : ""}`,
+          observedAt: timestamp,
+          summary: `Imported ${dataset.name}`,
+          contentHash: prepared.normalized.contentHash,
+          classification: "owned_operating",
+          assets: [
+            { id: this.ids.next(), kind: file.artifactKind ?? "original", ...file.original },
+            { id: this.ids.next(), kind: "normalized_jsonl", ...prepared.normalized },
+            { id: this.ids.next(), kind: "quality_report", ...prepared.quality },
+          ],
+        };
+        await repos.evidence.insert(evidence);
+        evidenceIds.push(evidence.id);
+      }
+    }
+
+    if (input.planId !== undefined && files.length > 0) {
+      const stored = await repos.dataRequestPlans.get(input.planId, input.workspaceId);
+      if (!stored) {
+        throw new DomainError("NOT_FOUND", "Data request plan not found in workspace", false, {
+          planId: input.planId,
+          workspaceId: input.workspaceId,
+        });
+      }
+      const current = requirePlanDetails(stored);
+      if (current.version !== input.expectedPlanVersion) {
+        throw new DomainError("CONFLICT", "Data request plan version does not match", false, {
+          planId: input.planId,
+        });
+      }
+      const importedFields = files.flatMap((file) =>
+        file.datasets.flatMap((dataset) => dataset.parsed.fields.map((field) => field.name))
+      );
+      const availableFields = [...new Set([...current.availableFields, ...importedFields])];
+      const planned = planDataRequestRound(
+        current.questionTypes,
+        availableFields,
+        current.declinedQuestionTypes,
+      );
+      const round = current.round + 1;
+      await repos.dataRequestPlans.update({
+        ...current,
+        ...planned,
+        availableFields,
+        qualityReports: [
+          ...current.qualityReports,
+          ...files.flatMap((file) => file.datasets.map((dataset) => dataset.qualityReport)),
+        ],
+        round,
+        updatedAt: timestamp,
+        rounds: [...current.rounds, { round, ...planned }],
+      }, input.expectedPlanVersion!);
+    }
+
+    const batch: IngestionBatch = {
+      id: input.id,
+      workspaceId: input.workspaceId,
+      version: 1,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      state: failures.length === 0 ? "completed" : files.length === 0 ? "blocked" : "partial",
+      sourceIds,
+      datasetIds,
+      evidenceIds,
+      failures,
+    };
+    return repos.ingestionBatches.insert(batch) as Promise<IngestionBatch>;
   }
 
   async getEvidenceAsset(query: EvidenceAssetQuery): Promise<EvidenceAssetContent> {
