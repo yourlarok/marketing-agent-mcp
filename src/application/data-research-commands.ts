@@ -88,6 +88,27 @@ export interface RunResearch {
   limits?: Partial<ResearchLimits>;
 }
 
+export interface ConfirmCompetitor {
+  id: string;
+  workspaceId: string;
+  expectedVersion: number;
+  status: "confirmed" | "excluded";
+}
+
+export interface CompetitorSemanticConclusion {
+  dimension: string;
+  statement: string;
+  limitations: string;
+}
+
+export interface CreateCompetitorDiff {
+  id: string;
+  workspaceId: string;
+  competitorIds: [string, string];
+  dimensions: string[];
+  conclusions?: CompetitorSemanticConclusion[];
+}
+
 export interface EvidenceAssetQuery {
   workspaceId: string;
   evidenceId: string;

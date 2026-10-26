@@ -9,8 +9,12 @@ import {
   type DataRequestPlanDetails,
   type QuestionType,
 } from "../domain/data-preparation.js";
+import { compareCompetitorObservations } from "../domain/competitor-diff.js";
 import {
+  COMPETITOR_STATUSES,
   RESEARCH_LIMIT_CEILINGS,
+  type Competitor,
+  type CompetitorDiff,
   type DataRequestPlan,
   type IngestionBatch,
   type IngestionFileFailure,
@@ -20,7 +24,7 @@ import {
   type ResearchSession,
 } from "../domain/data-research-model.js";
 import { DomainError } from "../domain/errors.js";
-import type { Dataset, Evidence, Source } from "../domain/model.js";
+import type { Dataset, Evidence, Finding, Source } from "../domain/model.js";
 import { AcquisitionRouter, type AcquisitionProvider, type AcquiredPage } from "../infrastructure/acquisition-router.js";
 import {
   acquisitionPayloadBytes,
@@ -44,6 +48,8 @@ import {
   type CommandPipeline,
 } from "./commands.js";
 import type {
+  ConfirmCompetitor,
+  CreateCompetitorDiff,
   CreateDataRequestPlan,
   CreateResearchSession,
   DeclineDataRound,
@@ -662,6 +668,7 @@ export class DataResearchService {
         type: "link",
         ownership: "external_public",
         metadata: {
+          acquisition: "research",
           url: page.url,
           finalUrl: page.finalUrl,
           title: page.title,
@@ -981,6 +988,7 @@ export class DataResearchService {
         type: "link",
         ownership: "external_public",
         metadata: {
+          acquisition: "content_ingestion",
           url: page.url,
           finalUrl: page.finalUrl,
           title: page.title,
@@ -1157,6 +1165,188 @@ export class DataResearchService {
       failures,
     };
     return repos.ingestionBatches.insert(batch) as Promise<IngestionBatch>;
+  }
+
+  async confirmCompetitor(command: Command<ConfirmCompetitor>): Promise<Competitor> {
+    const input = command.input;
+    if (!(COMPETITOR_STATUSES as readonly string[]).includes(input.status)) {
+      invalid("status must be confirmed or excluded");
+    }
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
+      invalid("expectedVersion must be a positive integer");
+    }
+    return this.commands.execute({
+      workspaceId: input.workspaceId,
+      action: "competitor.confirm",
+      entityType: "competitor",
+      input,
+      context: command.context,
+      write: async (repos, current, timestamp) => {
+        const competitor = await repos.competitors.get(current.id, current.workspaceId);
+        if (!competitor) {
+          throw new DomainError("NOT_FOUND", "Competitor not found in workspace", false, {
+            id: current.id,
+            workspaceId: current.workspaceId,
+          });
+        }
+        if (competitor.version !== current.expectedVersion) {
+          throw new DomainError("CONFLICT", "Competitor version does not match", false, { id: current.id });
+        }
+        return repos.competitors.update({
+          ...competitor,
+          status: current.status,
+          updatedAt: timestamp,
+        }, current.expectedVersion);
+      },
+    });
+  }
+
+  async diffCompetitors(command: Command<CreateCompetitorDiff>): Promise<CompetitorDiff> {
+    const input = command.input;
+    if (
+      !Array.isArray(input.competitorIds) ||
+      input.competitorIds.length !== 2 ||
+      new Set(input.competitorIds).size !== 2
+    ) {
+      invalid("competitorIds must contain exactly two distinct competitors");
+    }
+    for (const competitorId of input.competitorIds) {
+      assertNonEmptyString(competitorId, "competitorIds");
+    }
+    if (!Array.isArray(input.dimensions) || input.dimensions.length === 0) {
+      invalid("dimensions must be a non-empty array");
+    }
+    for (const dimension of input.dimensions) {
+      assertNonEmptyString(dimension, "dimensions");
+    }
+    if (new Set(input.dimensions).size !== input.dimensions.length) {
+      invalid("dimensions must not contain duplicates");
+    }
+    const conclusions = input.conclusions ?? [];
+    if (!Array.isArray(conclusions)) {
+      invalid("conclusions must be an array");
+    }
+    for (const conclusion of conclusions) {
+      if (conclusion === null || typeof conclusion !== "object" || Array.isArray(conclusion)) {
+        invalid("conclusions must contain objects");
+      }
+      assertNonEmptyString(conclusion.dimension, "conclusion.dimension");
+      assertNonEmptyString(conclusion.statement, "conclusion.statement");
+      assertNonEmptyString(conclusion.limitations, "conclusion.limitations");
+      if (!input.dimensions.includes(conclusion.dimension)) {
+        invalid("conclusion.dimension must be included in dimensions");
+      }
+      const ownedConversion = `${conclusion.dimension} ${conclusion.statement}`;
+      if (/owned[_\s-]*conversion|our\s+(?:\w+\s+){0,3}conversion|自身.{0,12}转化|自有.{0,12}转化/i.test(ownedConversion)) {
+        invalid("Public observations cannot support owned-conversion conclusions");
+      }
+      if (/\b(?:caus(?:e|al|es)|effect|impact|improv(?:e|es|ed)|increas(?:e|es|ed)|decreas(?:e|es|ed)|driv(?:e|es)|because|lead(?:s)? to)\b|因为|因此|导致|提升|提高|增加|下降|影响/i.test(conclusion.statement)) {
+        invalid("Competitor observations cannot support effect or causal conclusions");
+      }
+    }
+
+    return this.commands.execute({
+      workspaceId: input.workspaceId,
+      action: "competitor_diff.create",
+      entityType: "competitor_diff",
+      input,
+      context: command.context,
+      write: async (repos, current, timestamp) => {
+        const observations = [];
+        for (const competitorId of current.competitorIds) {
+          const competitor = await repos.competitors.get(competitorId, current.workspaceId);
+          if (!competitor) {
+            throw new DomainError("NOT_FOUND", "Competitor not found in workspace", false, {
+              id: competitorId,
+              workspaceId: current.workspaceId,
+            });
+          }
+          if (competitor.status !== "confirmed") {
+            throw new DomainError("CONFLICT", "Only confirmed competitors can be compared", false, {
+              id: competitorId,
+              status: competitor.status,
+            });
+          }
+          for (const evidenceId of competitor.evidenceIds) {
+            const evidence = await repos.evidence.get(evidenceId, current.workspaceId) as Evidence | undefined;
+            if (!evidence) {
+              throw new DomainError("NOT_FOUND", "Competitor evidence not found in workspace", false, {
+                evidenceId,
+                workspaceId: current.workspaceId,
+              });
+            }
+            const source = await repos.sources.get(evidence.sourceId, current.workspaceId) as Source | undefined;
+            const metadata = source?.metadata;
+            if (
+              !source ||
+              source.type !== "link" ||
+              source.ownership !== "external_public" ||
+              evidence.classification !== "external_observation" ||
+              !evidence.assets?.some((asset) => asset.kind === "page_text") ||
+              metadata === null ||
+              typeof metadata !== "object" ||
+              Array.isArray(metadata)
+            ) {
+              continue;
+            }
+            const acquired = metadata as Record<string, unknown>;
+            if (acquired.acquisition !== "research" && acquired.acquisition !== "content_ingestion") {
+              continue;
+            }
+            const fields = acquired.fields;
+            if (
+              fields === null ||
+              typeof fields !== "object" ||
+              Array.isArray(fields) ||
+              !Object.values(fields).every((value) => typeof value === "string")
+            ) {
+              continue;
+            }
+            observations.push({
+              competitorId,
+              evidenceId,
+              fields: fields as Record<string, string>,
+            });
+          }
+        }
+        const entries = compareCompetitorObservations(
+          [...current.competitorIds],
+          [...current.dimensions],
+          observations,
+        );
+        const findingIds: string[] = [];
+        for (const conclusion of current.conclusions ?? []) {
+          const entry = entries.find((candidate) => candidate.dimension === conclusion.dimension)!;
+          if (entry.evidenceIds.length === 0) {
+            invalid("Semantic conclusions require supporting observation evidence");
+          }
+          const finding: Finding = {
+            id: this.ids.next(),
+            workspaceId: current.workspaceId,
+            version: 1,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            kind: "inference",
+            statement: conclusion.statement,
+            evidenceIds: [...entry.evidenceIds],
+            limitations: conclusion.limitations,
+          };
+          await repos.findings.insert(finding);
+          findingIds.push(finding.id);
+        }
+        const diff: CompetitorDiff = {
+          id: current.id,
+          workspaceId: current.workspaceId,
+          version: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          competitorIds: [...current.competitorIds],
+          entries,
+          findingIds,
+        };
+        return repos.competitorDiffs.insert(diff);
+      },
+    });
   }
 
   async getEvidenceAsset(query: EvidenceAssetQuery): Promise<EvidenceAssetContent> {

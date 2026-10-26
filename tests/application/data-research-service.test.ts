@@ -87,11 +87,20 @@ function researchSession(id = "session-1"): ResearchSession {
 }
 
 function competitor(id = "competitor-1"): Competitor {
-  return { ...entity(id), evidenceIds: ["evidence-2", "evidence-1"] };
+  return {
+    ...entity(id),
+    status: "confirmed",
+    evidenceIds: ["evidence-2", "evidence-1"],
+  };
 }
 
 function competitorDiff(id = "diff-1"): CompetitorDiff {
-  return { ...entity(id), findingIds: ["finding-2", "finding-1"] };
+  return {
+    ...entity(id),
+    competitorIds: ["competitor-1", "competitor-2"],
+    entries: [],
+    findingIds: ["finding-2", "finding-1"],
+  };
 }
 
 async function insertBaseEntities(repos: Repositories): Promise<void> {
@@ -1718,5 +1727,262 @@ describe("DataResearchService permission-bounded research", () => {
       message: "fixture page failed",
     }]);
     expect(provider.hits).toEqual([seed, failed]);
+  });
+});
+
+describe("DataResearchService confirmed competitor diffs", () => {
+  let store: Store;
+  let service: DataResearchService;
+  let sequence: number;
+
+  const context = (suffix: string): CommandContext => ({
+    actor: "agent-1",
+    requestId: `request-${suffix}`,
+    idempotencyKey: `command-${suffix}`,
+  });
+
+  beforeEach(async () => {
+    store = openStore(":memory:");
+    sequence = 0;
+    service = new DataResearchService(
+      store,
+      { now: () => now },
+      { next: () => `competitor-generated-${++sequence}` },
+    );
+    await store.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("workspace-1"));
+      await repos.workspaces.insert(entity("workspace-2", "workspace-2"));
+    });
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  async function addCompetitor(
+    id: string,
+    evidenceIds: string[] = [],
+    status: "confirmed" | "excluded" = "confirmed",
+    workspaceId = "workspace-1",
+  ): Promise<void> {
+    await store.transaction((repos) => repos.competitors.insert({
+      ...entity(id, workspaceId),
+      status,
+      evidenceIds,
+    }));
+  }
+
+  async function addObservation(
+    id: string,
+    fields: Record<string, string>,
+    options: {
+      acquisition?: "research" | "content_ingestion" | null;
+      classification?: "owned_operating" | "owned_conversion" | "external_observation";
+      ownership?: "owned" | "authorized" | "external_public";
+      type?: "file" | "link" | "api" | "manual" | "database";
+      generatedAssets?: boolean;
+    } = {},
+  ): Promise<void> {
+    await store.transaction(async (repos) => {
+      await repos.sources.insert({
+        ...entity(`source-${id}`),
+        type: options.type ?? "link",
+        ownership: options.ownership ?? "external_public",
+        metadata: {
+          ...(options.acquisition === null
+            ? {}
+            : { acquisition: options.acquisition ?? "research" }),
+          fields,
+        },
+      });
+      await repos.evidence.insert({
+        ...entity(id),
+        sourceId: `source-${id}`,
+        sourceLocator: `https://example.com/${id}`,
+        observedAt: now,
+        summary: "Structured public observation",
+        contentHash: id.padStart(64, "0").slice(0, 64),
+        classification: options.classification ?? "external_observation",
+        assets: options.generatedAssets === false ? [] : [
+          { id: `text-${id}`, kind: "page_text", contentHash: "a".repeat(64), byteLength: 1 },
+          { id: `screenshot-${id}`, kind: "screenshot", contentHash: "b".repeat(64), byteLength: 1 },
+        ],
+      });
+    });
+  }
+
+  function diffCommand(id: string, extra: Record<string, unknown> = {}) {
+    return {
+      input: {
+        id,
+        workspaceId: "workspace-1",
+        competitorIds: ["left", "right"],
+        dimensions: ["price"],
+        ...extra,
+      },
+      context: context(id),
+    };
+  }
+
+  it("confirms or excludes a competitor through the audited command pipeline", async () => {
+    const legacy = { ...competitor("legacy"), evidenceIds: [] } as Record<string, unknown>;
+    delete legacy.status;
+    await store.transaction((repos) => repos.competitors.insert(legacy as Competitor));
+    const command = {
+      input: {
+        id: "legacy",
+        workspaceId: "workspace-1",
+        expectedVersion: 1,
+        status: "confirmed" as const,
+      },
+      context: context("confirm"),
+    };
+
+    const confirmed = await service.confirmCompetitor(command);
+    expect(confirmed).toMatchObject({ id: "legacy", status: "confirmed", version: 2 });
+    await expect(service.confirmCompetitor(command)).resolves.toEqual(confirmed);
+    const excluded = await service.confirmCompetitor({
+      input: {
+        id: "legacy",
+        workspaceId: "workspace-1",
+        expectedVersion: 2,
+        status: "excluded",
+      },
+      context: context("exclude"),
+    });
+    expect(excluded).toMatchObject({ status: "excluded", version: 3 });
+    await expect(store.transaction((repos) =>
+      repos.audit.listForEntity("workspace-1", "competitor", "legacy")
+    )).resolves.toMatchObject([
+      { action: "competitor.confirm" },
+      { action: "competitor.confirm" },
+    ]);
+  });
+
+  it("persists deterministic entries and evidence-backed inference findings", async () => {
+    await addObservation("evidence-z", { price: "20", cta: "Buy" });
+    await addObservation("evidence-duplicate", { price: "20" });
+    await addObservation("evidence-a", { price: "20", cta: "Start" });
+    await addCompetitor("left", ["evidence-z", "evidence-duplicate"]);
+    await addCompetitor("right", ["evidence-a"]);
+
+    const diff = await service.diffCompetitors(diffCommand("diff-complete", {
+      dimensions: ["price", "cta", "shipping"],
+      conclusions: [{
+        dimension: "price",
+        statement: "Both competitors publicly display the same price.",
+        limitations: "Only the cited public pages were observed; no causal effect is inferred.",
+      }],
+    }));
+
+    expect(diff).toMatchObject({
+      id: "diff-complete",
+      competitorIds: ["left", "right"],
+      entries: [
+        { dimension: "price", result: "same", evidenceIds: ["evidence-a", "evidence-duplicate", "evidence-z"] },
+        { dimension: "cta", result: "different", evidenceIds: ["evidence-a", "evidence-z"] },
+        { dimension: "shipping", result: "unknown", evidenceIds: [] },
+      ],
+    });
+    expect(diff.findingIds).toHaveLength(1);
+    const persisted = await store.transaction(async (repos) => ({
+      diff: await repos.competitorDiffs.get("diff-complete", "workspace-1"),
+      finding: await repos.findings.get(diff.findingIds[0]!, "workspace-1"),
+      audits: await repos.audit.listForEntity("workspace-1", "competitor_diff", "diff-complete"),
+    }));
+    expect(persisted.diff).toEqual(diff);
+    expect(persisted.finding).toMatchObject({
+      kind: "inference",
+      statement: "Both competitors publicly display the same price.",
+      evidenceIds: ["evidence-a", "evidence-duplicate", "evidence-z"],
+      limitations: "Only the cited public pages were observed; no causal effect is inferred.",
+    });
+    expect(persisted.audits).toHaveLength(1);
+  });
+
+  it("rejects unconfirmed, excluded, and cross-workspace competitors without a diff", async () => {
+    const legacy = { ...competitor("unconfirmed"), evidenceIds: [] } as Record<string, unknown>;
+    delete legacy.status;
+    await store.transaction((repos) => repos.competitors.insert(legacy as Competitor));
+    await addCompetitor("confirmed");
+    await addCompetitor("excluded", [], "excluded");
+    await addCompetitor("other-workspace", [], "confirmed", "workspace-2");
+    const cases = [
+      ["diff-unconfirmed", ["unconfirmed", "confirmed"]],
+      ["diff-excluded", ["excluded", "confirmed"]],
+      ["diff-cross-workspace", ["confirmed", "other-workspace"]],
+    ] as const;
+
+    for (const [id, competitorIds] of cases) {
+      await expect(service.diffCompetitors(diffCommand(id, { competitorIds: [...competitorIds] })))
+        .rejects.toMatchObject<DomainError>({ code: id === "diff-cross-workspace" ? "NOT_FOUND" : "CONFLICT" });
+      await expect(store.transaction((repos) =>
+        repos.competitorDiffs.get(id, "workspace-1")
+      )).resolves.toBeUndefined();
+    }
+  });
+
+  it("ignores observations that did not come from research or content ingestion", async () => {
+    await addObservation("research-valid", { price: "20" });
+    await addObservation("content-valid", { price: "20" }, { acquisition: "content_ingestion" });
+    await addObservation("manual-forged", { price: "999", ownedOnly: "100" }, {
+      acquisition: null,
+    });
+    await addObservation("forged-provenance", { price: "999" }, { generatedAssets: false });
+    await addObservation("owned-metrics", { price: "999", ownedOnly: "100" }, {
+      classification: "owned_operating",
+      ownership: "owned",
+      type: "api",
+    });
+    await addCompetitor("left", ["research-valid", "manual-forged", "forged-provenance"]);
+    await addCompetitor("right", ["content-valid", "owned-metrics"]);
+
+    const diff = await service.diffCompetitors(diffCommand("diff-qualified", {
+      dimensions: ["price", "ownedOnly"],
+    }));
+    expect(diff.entries).toEqual([
+      { dimension: "price", result: "same", evidenceIds: ["content-valid", "research-valid"] },
+      { dimension: "ownedOnly", result: "unknown", evidenceIds: [] },
+    ]);
+  });
+
+  it("rejects owned-conversion conclusions and malformed direct JavaScript input", async () => {
+    await addObservation("evidence-left", { price: "20" });
+    await addObservation("evidence-right", { price: "21" });
+    await addCompetitor("left", ["evidence-left"]);
+    await addCompetitor("right", ["evidence-right"]);
+    const invalidCommands = [
+      diffCommand("diff-owned-conversion", {
+        dimensions: ["price", "owned_conversion"],
+        conclusions: [{
+          dimension: "owned_conversion",
+          statement: "Our conversion rate will improve because of the competitor price.",
+          limitations: "Public observation only.",
+        }],
+      }),
+      diffCommand("diff-malformed-status", { competitorIds: ["left", "left"] }),
+      diffCommand("diff-malformed-dimensions", { dimensions: ["price", "price"] }),
+      diffCommand("diff-malformed-conclusion", {
+        conclusions: [{ dimension: "price", statement: "Different", limitations: "" }],
+      }),
+    ];
+
+    for (const command of invalidCommands) {
+      await expect(service.diffCompetitors(command as never))
+        .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+      await expect(store.transaction((repos) =>
+        repos.competitorDiffs.get(command.input.id, "workspace-1")
+      )).resolves.toBeUndefined();
+    }
+    await addCompetitor("bad-status");
+    await expect(service.confirmCompetitor({
+      input: {
+        id: "bad-status",
+        workspaceId: "workspace-1",
+        expectedVersion: 1,
+        status: "perhaps",
+      },
+      context: context("bad-status"),
+    } as never)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
   });
 });

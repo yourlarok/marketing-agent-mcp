@@ -85,10 +85,25 @@ export interface ResearchSession extends EntityRecord {
   elapsedMs: number;
 }
 
+export const COMPETITOR_STATUSES = ["confirmed", "excluded"] as const;
+export type CompetitorStatus = (typeof COMPETITOR_STATUSES)[number];
+
+export const COMPETITOR_DIFF_RESULTS = ["same", "different", "unknown"] as const;
+export type CompetitorDiffResult = (typeof COMPETITOR_DIFF_RESULTS)[number];
+
+export interface CompetitorDiffEntry {
+  dimension: string;
+  result: CompetitorDiffResult;
+  evidenceIds: string[];
+}
+
 export interface Competitor extends EntityRecord {
+  status: CompetitorStatus;
   evidenceIds: string[];
 }
 
 export interface CompetitorDiff extends EntityRecord {
+  competitorIds: string[];
+  entries: CompetitorDiffEntry[];
   findingIds: string[];
 }
