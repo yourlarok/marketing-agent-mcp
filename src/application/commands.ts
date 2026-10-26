@@ -2,12 +2,12 @@ import { createHash } from "node:crypto";
 import { DomainError } from "../domain/errors.js";
 import type {
   CapabilityAdapterKind,
-  CapabilityOrigin,
   EvidenceClassification,
   FindingKind,
   SourceOwnership,
   SourceType,
   TaskState,
+  ToolHealthEvidence,
 } from "../domain/model.js";
 import { isSecretLikeKey } from "../domain/secrets.js";
 import { canonicalJson } from "../infrastructure/sqlite.js";
@@ -67,6 +67,7 @@ export interface RecordEvidence {
   summary: string;
   contentHash: string;
   classification: EvidenceClassification;
+  toolHealth?: ToolHealthEvidence;
 }
 
 export interface RecordFinding {
@@ -111,7 +112,7 @@ export interface RegisterCapability {
   workspaceId: string;
   name: string;
   adapterKind: CapabilityAdapterKind;
-  origin: CapabilityOrigin;
+  origin: "user_extension";
   configuration?: JsonValue;
 }
 
@@ -155,11 +156,14 @@ function isSecretParameter(key: string): boolean {
 }
 
 function assertNoEmbeddedSecrets(value: string): void {
-  let url: URL | undefined;
-  try {
-    url = new URL(value);
-  } catch {}
-  if (url) {
+  for (const match of value.matchAll(/[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi)) {
+    let url: URL | undefined;
+    try {
+      url = new URL(match[0]);
+    } catch {}
+    if (!url) {
+      continue;
+    }
     if (url.username || url.password) {
       rejectSecretLikeInput();
     }

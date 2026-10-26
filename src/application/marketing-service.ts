@@ -1,7 +1,6 @@
 import { DomainError } from "../domain/errors.js";
 import {
   CAPABILITY_ADAPTER_KINDS,
-  CAPABILITY_ORIGINS,
   CAPABILITY_STATES,
   EVIDENCE_CLASSIFICATIONS,
   FINDING_KINDS,
@@ -15,6 +14,7 @@ import {
   type Source,
   type Task,
   type ToolCapability,
+  type ToolHealthEvidence,
   type Workspace,
 } from "../domain/model.js";
 import {
@@ -127,6 +127,28 @@ function assertNonEmptyString(value: unknown, field: string): asserts value is s
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new DomainError("INVALID_INPUT", `${field} must not be empty`);
   }
+}
+
+function assertToolHealthInput(
+  value: unknown,
+): asserts value is ToolHealthEvidence | undefined {
+  if (value === undefined) {
+    return;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new DomainError("INVALID_INPUT", "toolHealth must be a structured health check");
+  }
+  const health = value as Record<string, unknown>;
+  if (health.purpose !== "tool_health") {
+    throw new DomainError("INVALID_INPUT", "toolHealth purpose must be tool_health");
+  }
+  assertNonEmptyString(health.capabilityId, "toolHealth.capabilityId");
+  if (typeof health.healthy !== "boolean") {
+    throw new DomainError("INVALID_INPUT", "toolHealth.healthy must be a boolean");
+  }
+  assertNonEmptyString(health.checkedAt, "toolHealth.checkedAt");
+  assertUtcInput(health.checkedAt, "toolHealth.checkedAt");
+  assertNonEmptyString(health.toolVersion, "toolHealth.toolVersion");
 }
 
 function assertStringArray(
@@ -320,6 +342,7 @@ export class MarketingService {
           throw new DomainError("INVALID_INPUT", "summary must not be empty");
         }
         assertUtcInput(input.observedAt, "observedAt");
+        assertToolHealthInput(input.toolHealth);
         if (!/^[0-9a-f]{64}$/i.test(input.contentHash)) {
           throw new DomainError(
             "INVALID_INPUT",
@@ -347,6 +370,7 @@ export class MarketingService {
           summary: input.summary,
           contentHash: input.contentHash,
           classification: input.classification,
+          ...(input.toolHealth === undefined ? {} : { toolHealth: input.toolHealth }),
         };
         return repos.evidence.insert(evidence) as Promise<Evidence>;
       },
@@ -567,10 +591,10 @@ export class MarketingService {
             "adapterKind must be a supported capability adapter kind",
           );
         }
-        if (!(CAPABILITY_ORIGINS as readonly string[]).includes(input.origin)) {
+        if (input.origin !== "user_extension") {
           throw new DomainError(
             "INVALID_INPUT",
-            "origin must identify the controlled catalog or an explicit user extension",
+            "Public capability registration requires an explicit user extension",
           );
         }
         const capability: ToolCapability = {
@@ -641,6 +665,20 @@ export class MarketingService {
               "Capability health evidence not found in workspace",
               false,
               { evidenceId: input.evidenceId, workspaceId: input.workspaceId },
+            );
+          }
+          const health = (evidence as Evidence).toolHealth;
+          if (
+            !health ||
+            health.purpose !== "tool_health" ||
+            health.capabilityId !== current.id ||
+            health.healthy !== true ||
+            health.checkedAt !== input.checkedAt ||
+            health.toolVersion !== input.toolVersion
+          ) {
+            throw new DomainError(
+              "INVALID_INPUT",
+              "Evidence does not match this capability health verification",
             );
           }
           updated.toolVersion = input.toolVersion;

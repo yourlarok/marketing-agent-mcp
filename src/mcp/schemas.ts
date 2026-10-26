@@ -132,7 +132,7 @@ export const registerCapabilityInputSchema = z.strictObject({
   workspaceId: idSchema,
   name: z.string().trim().min(1).max(1_024),
   adapterKind: z.enum(["mcp", "api_cli", "script_adapter", "temporary_connector"]),
-  origin: z.enum(["controlled_catalog", "user_extension"]),
+  origin: z.literal("user_extension"),
   configuration: jsonValueSchema.optional(),
   ...commandContextInput,
 });
@@ -183,6 +183,15 @@ export const recordEvidenceInputSchema = z.strictObject({
     "owned_conversion",
     "external_observation",
   ]),
+  toolHealth: z
+    .strictObject({
+      purpose: z.literal("tool_health"),
+      capabilityId: idSchema,
+      healthy: z.boolean(),
+      checkedAt: utcTimestampSchema,
+      toolVersion: z.string().trim().min(1).max(1_024),
+    })
+    .optional(),
   ...commandContextInput,
 });
 

@@ -305,7 +305,7 @@ describe("MCP server", () => {
           workspaceId: "workspace-1",
           name: "Approved analytics adapter",
           adapterKind: "api_cli",
-          origin: "controlled_catalog",
+          origin: "user_extension",
           actor: "agent-1",
           requestId: "request-9",
           idempotencyKey: "command-9",
@@ -314,6 +314,21 @@ describe("MCP server", () => {
       expect(
         JSON.parse((registeredCapability.content[0] as { text: string }).text),
       ).toMatchObject({ id: "capability-1", state: "registered" });
+
+      const rejectedCatalog = await client.callTool({
+        name: "capability_register",
+        arguments: {
+          id: "capability-catalog",
+          workspaceId: "workspace-1",
+          name: "Self-asserted catalog adapter",
+          adapterKind: "api_cli",
+          origin: "controlled_catalog",
+          actor: "agent-1",
+          requestId: "request-catalog",
+          idempotencyKey: "command-catalog",
+        },
+      });
+      expect(rejectedCatalog).toMatchObject({ isError: true });
 
       const unavailableCapability = await client.callTool({
         name: "capability_health_record",
@@ -333,6 +348,36 @@ describe("MCP server", () => {
         JSON.parse((unavailableCapability.content[0] as { text: string }).text),
       ).toMatchObject({ state: "unavailable", version: 2 });
 
+      const healthEvidence = await client.callTool({
+        name: "evidence_record",
+        arguments: {
+          id: "evidence-health",
+          workspaceId: "workspace-1",
+          sourceId: "source-1",
+          sourceLocator: "research/tool-health-1",
+          observedAt: "2026-10-26T12:30:00.000Z",
+          summary: "An externally recorded tool health check",
+          contentHash: "c".repeat(64),
+          classification: "owned_operating",
+          toolHealth: {
+            purpose: "tool_health",
+            capabilityId: "capability-1",
+            healthy: true,
+            checkedAt: "2026-10-26T12:30:00.000Z",
+            toolVersion: "2.4.1",
+          },
+          actor: "agent-1",
+          requestId: "request-11",
+          idempotencyKey: "command-11",
+        },
+      });
+      expect(
+        JSON.parse((healthEvidence.content[0] as { text: string }).text),
+      ).toMatchObject({
+        id: "evidence-health",
+        toolHealth: { purpose: "tool_health", capabilityId: "capability-1" },
+      });
+
       const verifiedCapability = await client.callTool({
         name: "capability_health_record",
         arguments: {
@@ -342,15 +387,15 @@ describe("MCP server", () => {
           healthy: true,
           checkedAt: "2026-10-26T12:30:00.000Z",
           toolVersion: "2.4.1",
-          evidenceId: "evidence-1",
+          evidenceId: "evidence-health",
           actor: "agent-1",
-          requestId: "request-11",
-          idempotencyKey: "command-11",
+          requestId: "request-12",
+          idempotencyKey: "command-12",
         },
       });
       expect(
         JSON.parse((verifiedCapability.content[0] as { text: string }).text),
-      ).toMatchObject({ state: "verified", version: 3, evidenceId: "evidence-1" });
+      ).toMatchObject({ state: "verified", version: 3, evidenceId: "evidence-health" });
 
       const capabilities = await client.callTool({
         name: "capability_list",
@@ -382,14 +427,110 @@ describe("MCP server", () => {
           workspaces: 1,
           sources: 1,
           datasets: 1,
-          evidence: 1,
+          evidence: 2,
           findings: 1,
           recommendations: 1,
           tasks: 1,
           capabilities: 1,
-          audits: 11,
-          idempotency: 11,
+          audits: 12,
+          idempotency: 12,
         });
+      } finally {
+        raw.close();
+      }
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+      store.close();
+      await removeTempDir(tempDir);
+    }
+  });
+
+  it("rejects embedded URL credentials in capability health without MCP residue", async () => {
+    const tempDir = await createTempDir();
+    const databasePath = join(tempDir, "store.db");
+    const store = openStore(databasePath);
+    const service = new MarketingService(
+      store,
+      new SystemClock(),
+      new SystemIdGenerator(),
+    );
+    const server = createMcpServer(service);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const secret = "synthetic-mcp-embedded-secret";
+
+    try {
+      await Promise.all([
+        client.connect(clientTransport),
+        server.connect(serverTransport),
+      ]);
+      await client.callTool({
+        name: "workspace_create",
+        arguments: {
+          id: "workspace-1",
+          name: "Northwind",
+          actor: "agent-1",
+          requestId: "request-1",
+          idempotencyKey: "command-1",
+        },
+      });
+      await client.callTool({
+        name: "capability_register",
+        arguments: {
+          id: "capability-1",
+          workspaceId: "workspace-1",
+          name: "User extension",
+          adapterKind: "api_cli",
+          origin: "user_extension",
+          actor: "agent-1",
+          requestId: "request-2",
+          idempotencyKey: "command-2",
+        },
+      });
+
+      const result = await client.callTool({
+        name: "capability_health_record",
+        arguments: {
+          id: "capability-1",
+          workspaceId: "workspace-1",
+          expectedVersion: 1,
+          healthy: false,
+          checkedAt: "2026-10-26T12:29:00.000Z",
+          reason: `Health failed; see https://alice:${secret}@example.test`,
+          actor: "agent-1",
+          requestId: "request-3",
+          idempotencyKey: "command-3",
+        },
+      });
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).not.toContain(secret);
+      expect(JSON.stringify(result)).not.toContain("alice");
+
+      const raw = new DatabaseSync(databasePath);
+      try {
+        expect(
+          raw.prepare(
+            `SELECT
+              (SELECT COUNT(*) FROM audit_records) AS audits,
+              (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
+          ).get(),
+        ).toEqual({ audits: 2, idempotency: 2 });
+        expect(
+          raw.prepare(
+            "SELECT payload FROM capabilities WHERE id = ? AND workspace_id = ?",
+          ).get("capability-1", "workspace-1"),
+        ).toMatchObject({
+          payload: expect.not.stringContaining(secret),
+        });
+        expect(
+          JSON.parse(
+            (
+              raw.prepare(
+                "SELECT payload FROM capabilities WHERE id = ? AND workspace_id = ?",
+              ).get("capability-1", "workspace-1") as { payload: string }
+            ).payload,
+          ),
+        ).toMatchObject({ state: "registered", version: 1 });
       } finally {
         raw.close();
       }

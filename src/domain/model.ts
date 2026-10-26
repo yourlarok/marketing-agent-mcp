@@ -35,6 +35,14 @@ export const EVIDENCE_CLASSIFICATIONS = [
 ] as const;
 export type EvidenceClassification = (typeof EVIDENCE_CLASSIFICATIONS)[number];
 
+export interface ToolHealthEvidence {
+  purpose: "tool_health";
+  capabilityId: string;
+  healthy: boolean;
+  checkedAt: string;
+  toolVersion: string;
+}
+
 export interface Evidence extends EntityRecord {
   sourceId: string;
   sourceLocator: string;
@@ -42,6 +50,7 @@ export interface Evidence extends EntityRecord {
   summary: string;
   contentHash: string;
   classification: EvidenceClassification;
+  toolHealth?: ToolHealthEvidence;
 }
 
 export const FINDING_KINDS = ["fact", "inference", "unknown"] as const;
