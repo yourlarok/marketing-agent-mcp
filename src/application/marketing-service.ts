@@ -217,17 +217,20 @@ export class MarketingService {
         if (typeof input.statement !== "string" || input.statement.trim().length === 0) {
           throw new DomainError("INVALID_INPUT", "statement must not be empty");
         }
-        if (
-          !Array.isArray(input.evidenceIds) ||
-          input.evidenceIds.some(
-            (evidenceId) =>
-              typeof evidenceId !== "string" || evidenceId.trim().length === 0,
-          )
-        ) {
+        if (!Array.isArray(input.evidenceIds)) {
           throw new DomainError(
             "INVALID_INPUT",
             "evidenceIds must be an array of non-empty strings",
           );
+        }
+        for (let index = 0; index < input.evidenceIds.length; index += 1) {
+          const evidenceId = input.evidenceIds[index];
+          if (typeof evidenceId !== "string" || evidenceId.trim().length === 0) {
+            throw new DomainError(
+              "INVALID_INPUT",
+              "evidenceIds must be an array of non-empty strings",
+            );
+          }
         }
         if (new Set(input.evidenceIds).size !== input.evidenceIds.length) {
           throw new DomainError(

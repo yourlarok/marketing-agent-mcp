@@ -907,6 +907,10 @@ describe("MarketingService command pipeline", () => {
       input: { ...findingInput(), evidenceIds: [42] as never },
     },
     {
+      label: "sparse evidence IDs",
+      input: { ...findingInput(), evidenceIds: new Array(1) as never },
+    },
+    {
       label: "a blank evidence ID",
       input: { ...findingInput(), evidenceIds: [" \t"] },
     },
