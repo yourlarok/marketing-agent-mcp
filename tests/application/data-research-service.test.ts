@@ -26,9 +26,9 @@ import type {
   IngestionBatch,
   ResearchSession,
 } from "../../src/domain/data-research-model.js";
-import type { DomainError } from "../../src/domain/errors.js";
+import { DomainError } from "../../src/domain/errors.js";
 import { ArtifactStore } from "../../src/infrastructure/artifact-store.js";
-import type { AcquiredPage, AcquisitionProvider } from "../../src/infrastructure/acquisition-router.js";
+import { AcquisitionRouter, type AcquiredPage, type AcquisitionProvider } from "../../src/infrastructure/acquisition-router.js";
 import { SafeHttpClient } from "../../src/infrastructure/safe-http.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
@@ -1623,6 +1623,54 @@ describe("DataResearchService permission-bounded research", () => {
     expect(result.evidenceIds).toHaveLength(1);
     expect(result.gaps[0]).toMatchObject({ url: second, reason: "max_bytes" });
     expect(provider.hits).toEqual([seed, second]);
+  });
+
+  it("includes a failed MCP candidate and successful fallback in session candidateBytes", async () => {
+    const mcp: AcquisitionProvider = {
+      acquire: async () => {
+        throw new DomainError("CAPABILITY_UNAVAILABLE", "MCP failed after reading", false, { payloadBytes: 40 });
+      },
+    };
+    const fallback: AcquisitionProvider = {
+      acquire: async () => ({
+        url: seed, finalUrl: seed, title: "Fallback", text: "ok", fields: {},
+        screenshot: Buffer.from("12345"), provider: "playwright", toolVersion: "fake",
+      }),
+    };
+    service = new DataResearchService(
+      store, { now: () => now }, { next: () => `router-${++sequence}` }, artifacts, undefined,
+      new AcquisitionRouter({ mcp, playwright: fallback }),
+    );
+    const created = await create("router-fallback-bytes", { expansion: false });
+
+    const result = await service.runResearch(runCommand(created.id, 1));
+    expect(result).toMatchObject({ state: "completed", candidateBytes: 47 });
+    expect(result.evidenceIds).toHaveLength(1);
+  });
+
+  it("preserves failed MCP and timed-out fallback candidate bytes in session candidateBytes", async () => {
+    const mcp: AcquisitionProvider = {
+      acquire: async () => {
+        throw new DomainError("CAPABILITY_UNAVAILABLE", "MCP failed after reading", false, { payloadBytes: 40 });
+      },
+    };
+    const fallback: AcquisitionProvider = {
+      acquire: async () => {
+        throw new DomainError("CAPABILITY_UNAVAILABLE", "Fallback timed out after reading", false, {
+          reason: "max_duration", payloadBytes: 5,
+        });
+      },
+    };
+    service = new DataResearchService(
+      store, { now: () => now }, { next: () => `timeout-${++sequence}` }, artifacts, undefined,
+      new AcquisitionRouter({ mcp, playwright: fallback }),
+    );
+    const created = await create("router-timeout-bytes", { expansion: false });
+
+    const result = await service.runResearch(runCommand(created.id, 1));
+    expect(result).toMatchObject({ state: "blocked", stopReason: "max_duration", candidateBytes: 45 });
+    expect(result.evidenceIds).toEqual([]);
+    expect(result.gaps[0]).toMatchObject({ url: seed, reason: "max_duration" });
   });
 
   it("rejects encoded separators and decoded dot segments in scope and seed paths", async () => {

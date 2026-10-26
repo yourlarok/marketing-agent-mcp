@@ -34,6 +34,7 @@ export interface AcquiredPage {
   fields: Record<string, string>;
   links?: string[];
   screenshot: Buffer;
+  payloadBytes?: number;
   provider: "mcp" | "playwright";
   toolVersion: string;
 }

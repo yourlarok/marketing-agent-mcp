@@ -112,9 +112,10 @@ export function assertAcquisitionPayloadBudget(payload: AcquisitionPayload, maxB
   return bytes;
 }
 
-export function acquisitionDeadlineError(): DomainError {
+export function acquisitionDeadlineError(payloadBytes?: number): DomainError {
   return new DomainError("CAPABILITY_UNAVAILABLE", "Research acquisition deadline reached", false, {
     reason: "max_duration",
+    ...(payloadBytes !== undefined && payloadBytes > 0 ? { payloadBytes } : {}),
   });
 }
 

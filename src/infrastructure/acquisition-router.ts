@@ -1,6 +1,6 @@
 import { parseCommaSeparatedList, parseContentMcpArguments } from "../config.js";
 import { DomainError } from "../domain/errors.js";
-import { acquisitionDeadlineError, raceWithAcquisitionAbort } from "./acquisition-policy.js";
+import { acquisitionDeadlineError, acquisitionPayloadBytes, raceWithAcquisitionAbort } from "./acquisition-policy.js";
 import { McpAcquisitionProvider } from "./mcp-acquisition.js";
 import {
   PlaywrightAcquisitionProvider,
@@ -44,31 +44,38 @@ export class AcquisitionRouter implements AcquisitionProvider {
 
   async acquire(request: AcquireRequest): Promise<AcquiredPage> {
     let lastError: unknown;
+    let candidateBytes = 0;
     const acquire = (provider: AcquisitionProvider): Promise<AcquiredPage> => {
       const timeoutMs = remainingAcquisitionTimeout(request);
       return raceWithAcquisitionAbort(provider.acquire({ ...request, timeoutMs }), request.signal);
     };
+    const complete = (page: AcquiredPage): AcquiredPage => ({
+      ...page,
+      payloadBytes: candidateBytes + (page.payloadBytes ?? acquisitionPayloadBytes(page)),
+    });
     if (this.mcp) {
       try {
-        return await acquire(this.mcp);
+        return complete(await acquire(this.mcp));
       } catch (error) {
+        candidateBytes += reportedPayloadBytes(error);
         if (request.signal?.aborted || (error instanceof DomainError && error.details?.reason === "max_duration")) {
-          throw acquisitionDeadlineError();
+          throw acquisitionDeadlineError(candidateBytes);
         }
         if (isAccessGap(error) || isResearchBoundary(error)) {
-          throw error;
+          throw withPayloadBytes(error, candidateBytes);
         }
         lastError = error;
       }
     }
     try {
-      return await acquire(this.playwright);
+      return complete(await acquire(this.playwright));
     } catch (error) {
+      candidateBytes += reportedPayloadBytes(error);
       if (request.signal?.aborted || (error instanceof DomainError && error.details?.reason === "max_duration")) {
-        throw acquisitionDeadlineError();
+        throw acquisitionDeadlineError(candidateBytes);
       }
       if (error instanceof DomainError) {
-        throw error;
+        throw withPayloadBytes(error, candidateBytes);
       }
       lastError = error;
     }
@@ -79,6 +86,21 @@ export class AcquisitionRouter implements AcquisitionProvider {
       { reason: lastError instanceof DomainError ? String(lastError.details?.reason ?? "provider_unavailable") : "provider_unavailable" },
     );
   }
+}
+
+function reportedPayloadBytes(error: unknown): number {
+  const bytes = error instanceof DomainError ? error.details?.payloadBytes : undefined;
+  return typeof bytes === "number" && Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+}
+
+function withPayloadBytes(error: unknown, payloadBytes: number): unknown {
+  if (!(error instanceof DomainError) || payloadBytes === 0) {
+    return error;
+  }
+  return new DomainError(error.code, error.message, error.retryable, {
+    ...error.details,
+    payloadBytes,
+  });
 }
 
 function isResearchBoundary(error: unknown): boolean {

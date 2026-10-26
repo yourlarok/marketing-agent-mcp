@@ -531,7 +531,7 @@ export class DataResearchService {
           break;
         }
 
-        candidateBytes += acquisitionPayloadBytes(page);
+        candidateBytes += page.payloadBytes ?? acquisitionPayloadBytes(page);
         if (expired()) {
           gaps.push({ url: current.url, reason: "max_duration", message: "Research acquisition deadline reached" });
           stopReason = "max_duration";
