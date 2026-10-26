@@ -1,9 +1,7 @@
-import { lookup as dnsLookup } from "node:dns/promises";
-import { isIPv4, isIPv6 } from "node:net";
 import { chromium, type Browser, type Page } from "playwright";
 import { parseCommaSeparatedList } from "../config.js";
 import { DomainError } from "../domain/errors.js";
-import { isBlockedAddress } from "./safe-http.js";
+import { DestinationPinningProxy, DestinationValidator } from "./destination-proxy.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024;
@@ -30,11 +28,12 @@ export interface AcquisitionProvider {
 
 export interface PlaywrightAcquisitionOptions {
   allowlist?: string[];
-  browser?: Browser;
   env?: NodeJS.ProcessEnv;
   lookup?: (hostname: string) => Promise<string[]>;
   timeoutMs?: number;
+  ignoreHTTPSErrors?: boolean;
   captureScreenshot?: (page: Page) => Promise<Uint8Array>;
+  launchBrowser?: (proxyUrl: string) => Promise<Browser>;
 }
 
 export function validateAcquireRequest(request: AcquireRequest): void {
@@ -77,28 +76,19 @@ export function validateAcquireRequest(request: AcquireRequest): void {
   }
 }
 
-function normalizedHostname(hostname: string): string {
-  return hostname.replace(/^\[|\]$/g, "").toLowerCase().replace(/\.$/, "");
-}
-
 function unavailable(reason: string, message: string): DomainError {
   return new DomainError("CAPABILITY_UNAVAILABLE", message, false, { reason });
 }
 
 export class PlaywrightAcquisitionProvider implements AcquisitionProvider {
-  private readonly allowlist: Set<string>;
-  private readonly lookup: (hostname: string) => Promise<string[]>;
+  private readonly validator: DestinationValidator;
   private readonly timeoutMs: number;
   private readonly captureScreenshot: (page: Page) => Promise<Uint8Array>;
 
   constructor(private readonly options: PlaywrightAcquisitionOptions = {}) {
-    this.allowlist = new Set(
-      (options.allowlist ?? parseCommaSeparatedList(options.env?.MARKETING_HTTP_ALLOWLIST ?? process.env.MARKETING_HTTP_ALLOWLIST))
-        .map(normalizedHostname),
-    );
-    this.lookup = options.lookup ?? (async (hostname) => {
-      const addresses = await dnsLookup(hostname, { all: true, verbatim: true });
-      return addresses.map((entry) => entry.address);
+    this.validator = new DestinationValidator({
+      allowlist: options.allowlist ?? parseCommaSeparatedList(options.env?.MARKETING_HTTP_ALLOWLIST ?? process.env.MARKETING_HTTP_ALLOWLIST),
+      ...(options.lookup ? { lookup: options.lookup } : {}),
     });
     this.timeoutMs = Math.min(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
     this.captureScreenshot = options.captureScreenshot ?? ((page) => page.screenshot({ type: "png" }));
@@ -109,26 +99,26 @@ export class PlaywrightAcquisitionProvider implements AcquisitionProvider {
     if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0) {
       throw new DomainError("INVALID_INPUT", "Acquisition timeout must be positive");
     }
-    await this.validateDestination(request.url);
-    const ownedBrowser = !this.options.browser;
-    const browser = this.options.browser ?? await chromium.launch({ headless: true });
+    const proxy = await DestinationPinningProxy.start(this.validator, this.timeoutMs);
+    let browser: Browser | undefined;
     let context;
     try {
-      context = await browser.newContext({ acceptDownloads: false });
+      const launch = this.options.launchBrowser ?? ((proxyUrl: string) => chromium.launch({
+        headless: true,
+        proxy: { server: proxyUrl, bypass: "<-loopback>" },
+      }));
+      browser = await launch(proxy.url);
+      context = await browser.newContext({
+        acceptDownloads: false,
+        serviceWorkers: "block",
+        ignoreHTTPSErrors: this.options.ignoreHTTPSErrors ?? false,
+      });
       const page = await context.newPage();
       page.setDefaultTimeout(this.timeoutMs);
       let downloadDenied = false;
       page.on("download", (download) => {
         downloadDenied = true;
         void download.cancel().catch(() => undefined);
-      });
-      await page.route("**/*", async (route) => {
-        try {
-          await this.validateDestination(route.request().url());
-          await route.continue();
-        } catch {
-          await route.abort("blockedbyclient");
-        }
       });
       for (const selector of Object.values(request.fields ?? {})) {
         try {
@@ -191,42 +181,14 @@ export class PlaywrightAcquisitionProvider implements AcquisitionProvider {
       if (error instanceof DomainError) {
         throw error;
       }
-      if (!browser.isConnected() || /(?:target|browser|context).*(?:closed|crash)|browser.*disconnect/i.test(String(error))) {
+      if (browser && (!browser.isConnected() || /(?:target|browser|context).*(?:closed|crash)|browser.*disconnect/i.test(String(error)))) {
         throw unavailable("browser_unavailable", "Content acquisition browser is unavailable");
       }
       throw unavailable("acquisition_failed", "Content acquisition through Chromium failed");
     } finally {
       await context?.close().catch(() => undefined);
-      if (ownedBrowser) {
-        await browser.close().catch(() => undefined);
-      }
-    }
-  }
-
-  private async validateDestination(raw: string): Promise<void> {
-    let url: URL;
-    try {
-      url = new URL(raw);
-    } catch {
-      throw unavailable("destination_denied", "Content acquisition destination is invalid");
-    }
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw unavailable("destination_denied", "Content acquisition destination must use HTTP or HTTPS");
-    }
-    if (url.username || url.password) {
-      throw unavailable("destination_denied", "Content acquisition destination userinfo is not allowed");
-    }
-    const hostname = normalizedHostname(url.hostname);
-    let addresses: string[];
-    try {
-      addresses = isIPv4(hostname) || isIPv6(hostname) ? [hostname] : await this.lookup(hostname);
-    } catch {
-      throw unavailable("destination_denied", "Content acquisition destination could not be resolved");
-    }
-    if (addresses.length === 0 || addresses.some((address) => isBlockedAddress(address))) {
-      if (!this.allowlist.has(hostname)) {
-        throw unavailable("destination_denied", "Content acquisition destination is not allowed");
-      }
+      await browser?.close().catch(() => undefined);
+      await proxy.close();
     }
   }
 }

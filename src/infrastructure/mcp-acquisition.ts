@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { PNG } from "pngjs";
 import { z } from "zod";
 import { DomainError } from "../domain/errors.js";
 import type { CapabilityState } from "../domain/model.js";
@@ -19,10 +20,19 @@ const acquiredPageSchema = z.object({
   screenshotBase64: z.string().max(14_000_000),
 });
 
+const accessGapSchema = z.object({
+  error: z.object({
+    code: z.literal("ACCESS_GAP"),
+    reason: z.enum(["http_401", "http_403", "http_429", "access_gate"]),
+    message: z.string().max(1_000),
+  }),
+});
+
 export interface McpAcquisitionOptions {
   command: string;
   args?: string[];
   env?: NodeJS.ProcessEnv;
+  envAllowlist?: string[];
   cwd?: string;
   timeoutMs?: number;
 }
@@ -39,9 +49,14 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
   async acquire(request: AcquireRequest): Promise<AcquiredPage> {
     validateAcquireRequest(request);
     const client = new Client({ name: "marketing-content-acquisition", version: "1.0.0" });
-    const environment = Object.fromEntries(
-      Object.entries(optionsEnvironment(this.options.env)).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
-    );
+    const sourceEnvironment = this.options.env ?? process.env;
+    const environment = getDefaultEnvironment();
+    for (const name of new Set(this.options.envAllowlist ?? [])) {
+      const value = sourceEnvironment[name];
+      if (/^[A-Z_][A-Z0-9_]*$/i.test(name) && typeof value === "string") {
+        environment[name] = value;
+      }
+    }
     const transport = new StdioClientTransport({
       command: this.options.command,
       args: this.options.args ?? [],
@@ -56,27 +71,31 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
         arguments: { url: request.url, fields: request.fields ?? {} },
       }, undefined, { timeout: this.options.timeoutMs ?? 15_000 });
       if (result.isError) {
+        const gap = accessGapSchema.safeParse(result.structuredContent);
+        if (gap.success) {
+          throw new DomainError("CAPABILITY_UNAVAILABLE", gap.data.error.message, false, {
+            kind: "ACCESS_GAP",
+            reason: gap.data.error.reason,
+          });
+        }
         throw new Error("Professional MCP acquisition failed");
       }
-      const parsed = acquiredPageSchema.parse(result.structuredContent);
-      const screenshot = Buffer.from(parsed.screenshotBase64, "base64");
-      if (screenshot.length === 0 || screenshot.length > 10 * 1024 * 1024 ||
-        !screenshot.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
-        throw new Error("Professional MCP screenshot is invalid");
-      }
+      const parsed = parseSuccess(result.structuredContent, request);
       this.state = "verified";
       return {
-        url: parsed.url,
-        finalUrl: parsed.finalUrl,
-        title: parsed.title,
-        text: parsed.text,
-        fields: parsed.fields,
-        screenshot,
+        ...parsed,
         provider: "mcp",
         toolVersion: client.getServerVersion()?.version ?? "unknown",
       };
-    } catch {
+    } catch (error) {
+      if (isAccessGap(error)) {
+        this.state = "verified";
+        throw error;
+      }
       this.state = "unavailable";
+      if (error instanceof DomainError && error.details?.reason === "mcp_invalid_response") {
+        throw error;
+      }
       throw new DomainError(
         "CAPABILITY_UNAVAILABLE",
         "Professional MCP content acquisition is unavailable",
@@ -89,6 +108,54 @@ export class McpAcquisitionProvider implements AcquisitionProvider {
   }
 }
 
-function optionsEnvironment(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
-  return env ?? process.env;
+function parseSuccess(content: unknown, request: AcquireRequest): Omit<AcquiredPage, "provider" | "toolVersion"> {
+  try {
+    const parsed = acquiredPageSchema.parse(content);
+    const requestUrl = new URL(request.url);
+    const responseUrl = new URL(parsed.url);
+    const finalUrl = new URL(parsed.finalUrl);
+    if (responseUrl.href !== requestUrl.href || finalUrl.origin !== requestUrl.origin ||
+      (finalUrl.protocol !== "http:" && finalUrl.protocol !== "https:")) {
+      throw new Error("Professional MCP response URL does not match the request origin");
+    }
+    const requestedFields = Object.keys(request.fields ?? {}).sort();
+    const returnedFields = Object.keys(parsed.fields).sort();
+    if (requestedFields.length !== returnedFields.length ||
+      requestedFields.some((name, index) => name !== returnedFields[index])) {
+      throw new Error("Professional MCP response fields do not match the request");
+    }
+    const screenshot = Buffer.from(parsed.screenshotBase64, "base64");
+    if (screenshot.length < 24 || screenshot.length > 10 * 1024 * 1024) {
+      throw new Error("Professional MCP screenshot size is invalid");
+    }
+    const declaredWidth = screenshot.readUInt32BE(16);
+    const declaredHeight = screenshot.readUInt32BE(20);
+    if (declaredWidth === 0 || declaredHeight === 0 || declaredWidth > 10_000 || declaredHeight > 10_000) {
+      throw new Error("Professional MCP screenshot dimensions are invalid");
+    }
+    const decoded = PNG.sync.read(screenshot);
+    if (decoded.width !== declaredWidth || decoded.height !== declaredHeight ||
+      decoded.data.length !== decoded.width * decoded.height * 4) {
+      throw new Error("Professional MCP screenshot did not decode completely");
+    }
+    return {
+      url: parsed.url,
+      finalUrl: parsed.finalUrl,
+      title: parsed.title,
+      text: parsed.text,
+      fields: parsed.fields,
+      screenshot,
+    };
+  } catch (error) {
+    throw new DomainError(
+      "CAPABILITY_UNAVAILABLE",
+      `Professional MCP returned an invalid acquisition response: ${error instanceof Error ? error.message : "unknown error"}`,
+      false,
+      { reason: "mcp_invalid_response" },
+    );
+  }
+}
+
+function isAccessGap(error: unknown): boolean {
+  return error instanceof DomainError && error.details?.kind === "ACCESS_GAP";
 }

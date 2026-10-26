@@ -1,9 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import type { AddressInfo } from "node:net";
 import { join, resolve } from "node:path";
-import { chromium, type Browser } from "playwright";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { chromium } from "playwright";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { CommandContext } from "../../src/application/commands.js";
 import { DataResearchService } from "../../src/application/data-research-service.js";
 import type { Store } from "../../src/application/ports.js";
@@ -27,24 +28,21 @@ async function serve(server: Server): Promise<string> {
 }
 
 describe("content acquisition", () => {
-  let browser: Browser;
   let server: Server;
   let baseUrl: string;
   let documentHits: number;
   let privateHits: number;
+  let redirectHits: number;
+  let serviceWorkerHits: number;
+  let webSocketHits: number;
   let cookies: (string | undefined)[];
-
-  beforeAll(async () => {
-    browser = await chromium.launch({ headless: true });
-  });
-
-  afterAll(async () => {
-    await browser.close();
-  });
 
   beforeEach(async () => {
     documentHits = 0;
     privateHits = 0;
+    redirectHits = 0;
+    serviceWorkerHits = 0;
+    webSocketHits = 0;
     cookies = [];
     server = createServer((request, response) => {
       const path = new URL(request.url ?? "/", "http://fixture.local").pathname;
@@ -71,6 +69,29 @@ describe("content acquisition", () => {
         response.end("<html><body><h1>CAPTCHA verification required</h1></body></html>");
         return;
       }
+      if (path === "/redirect") {
+        response.writeHead(302, { location: `http://localhost:${(server.address() as AddressInfo).port}/redirect-target` });
+        response.end();
+        return;
+      }
+      if (path === "/redirect-target") {
+        redirectHits += 1;
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end("<html><body>Redirect target reached</body></html>");
+        return;
+      }
+      if (path === "/channels") {
+        const port = (server.address() as AddressInfo).port;
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(`<html><body>Channel fixture<script>navigator.serviceWorker.register("http://127.0.0.1:${port}/sw.js").catch(() => {}); new WebSocket("ws://127.0.0.1:${port}/socket");</script></body></html>`);
+        return;
+      }
+      if (path === "/sw.js") {
+        serviceWorkerHits += 1;
+        response.writeHead(200, { "content-type": "text/javascript" });
+        response.end("self.addEventListener('fetch', () => {});");
+        return;
+      }
       if (path === "/dynamic") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end("<!doctype html><html><head><title>Initial title</title></head><body><h1 id=\"headline\">Loading</h1><p class=\"price\"></p><div id=\"client-content\"></div><script src=\"/app.js\"></script></body></html>");
@@ -90,6 +111,10 @@ describe("content acquisition", () => {
         response.end(content);
       });
     });
+    server.on("upgrade", (_request, socket) => {
+      webSocketHits += 1;
+      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    });
     baseUrl = await serve(server);
   });
 
@@ -100,7 +125,6 @@ describe("content acquisition", () => {
 
   function playwright(extra: { allowlist?: string[] } = {}): PlaywrightAcquisitionProvider {
     return new PlaywrightAcquisitionProvider({
-      browser,
       allowlist: extra.allowlist ?? ["127.0.0.1"],
     });
   }
@@ -141,10 +165,11 @@ describe("content acquisition", () => {
       command: process.execPath,
       args: [fixtureCommand],
       env: { ...process.env, MCP_FIXTURE_MARKER: marker },
+      envAllowlist: ["MCP_FIXTURE_MARKER"],
     });
     const router = new AcquisitionRouter({
       mcp,
-      playwright: new PlaywrightAcquisitionProvider({ browser: closedBrowser }),
+      playwright: new PlaywrightAcquisitionProvider({ launchBrowser: async () => closedBrowser }),
     });
     try {
       expect(mcp.state).toBe("configured");
@@ -176,12 +201,64 @@ describe("content acquisition", () => {
     expect(mcp.state).toBe("unavailable");
   }, 20_000);
 
+  it.each(["401", "403", "429", "login", "captcha"])("does not fall back after MCP %s access gaps", async (gap) => {
+    const markerRoot = await createTempDir();
+    const marker = join(markerRoot, "gap.log");
+    const mcp = new McpAcquisitionProvider({
+      command: process.execPath,
+      args: [fixtureCommand],
+      env: { ...process.env, MCP_FIXTURE_MARKER: marker },
+      envAllowlist: ["MCP_FIXTURE_MARKER"],
+    });
+    const router = new AcquisitionRouter({ mcp, playwright: playwright() });
+    try {
+      await expect(router.acquire({ url: `${baseUrl}/mcp-${gap}` })).rejects.toMatchObject({
+        code: "CAPABILITY_UNAVAILABLE",
+        details: { reason: ["401", "403", "429"].includes(gap) ? `http_${gap}` : "access_gate" },
+      });
+      expect(await readFile(marker, "utf8")).toBe(`${baseUrl}/mcp-${gap}\n`);
+    } finally {
+      await removeTempDir(markerRoot);
+    }
+  }, 20_000);
+
+  it.each(["fake-png", "wrong-url", "wrong-fields"])("rejects invalid MCP success payload: %s", async (mode) => {
+    const mcp = new McpAcquisitionProvider({
+      command: process.execPath,
+      args: [fixtureCommand],
+      env: { ...process.env, MCP_FIXTURE_MODE: mode },
+      envAllowlist: ["MCP_FIXTURE_MODE"],
+    });
+
+    await expect(mcp.acquire({ url: `${baseUrl}/dynamic`, fields: { headline: "#headline" } }))
+      .rejects.toMatchObject({
+        code: "CAPABILITY_UNAVAILABLE",
+        details: { reason: "mcp_invalid_response" },
+      });
+  }, 20_000);
+
+  it("does not inherit unrelated secrets into the MCP child process", async () => {
+    const mcp = new McpAcquisitionProvider({
+      command: process.execPath,
+      args: [fixtureCommand],
+      env: {
+        ...process.env,
+        MCP_FIXTURE_MODE: "environment",
+        UNRELATED_SECRET: "must-not-enter-child",
+      },
+      envAllowlist: ["MCP_FIXTURE_MODE"],
+    });
+
+    const page = await mcp.acquire({ url: `${baseUrl}/dynamic` });
+    expect(page.text).toBe("secret-absent");
+  }, 20_000);
+
   it("fails explicitly when neither professional MCP nor Chromium can acquire", async () => {
     const closedBrowser = await chromium.launch({ headless: true });
     await closedBrowser.close();
     const router = new AcquisitionRouter({
       mcp: new McpAcquisitionProvider({ command: join(fixtureRoot, "missing-provider"), args: [] }),
-      playwright: new PlaywrightAcquisitionProvider({ browser: closedBrowser }),
+      playwright: new PlaywrightAcquisitionProvider({ launchBrowser: async () => closedBrowser }),
     });
 
     await expect(router.acquire({ url: `${baseUrl}/dynamic` })).rejects.toMatchObject({
@@ -209,7 +286,7 @@ describe("content acquisition", () => {
     const disconnected = new Promise<void>((resolveDisconnected) => crashedBrowser.once("disconnected", resolveDisconnected));
     void session.send("Browser.crash").catch(() => undefined);
     await disconnected;
-    const provider = new PlaywrightAcquisitionProvider({ browser: crashedBrowser, allowlist: ["127.0.0.1"] });
+    const provider = new PlaywrightAcquisitionProvider({ launchBrowser: async () => crashedBrowser, allowlist: ["127.0.0.1"] });
 
     await expect(provider.acquire({ url: `${baseUrl}/dynamic` })).rejects.toMatchObject({
       code: "CAPABILITY_UNAVAILABLE",
@@ -219,7 +296,6 @@ describe("content acquisition", () => {
 
   it("reports screenshot failure without returning partial page evidence", async () => {
     const provider = new PlaywrightAcquisitionProvider({
-      browser,
       allowlist: ["127.0.0.1"],
       captureScreenshot: async () => { throw new Error("injected screenshot failure"); },
     });
@@ -246,6 +322,72 @@ describe("content acquisition", () => {
     expect(page.text).not.toContain("Private subrequest executed");
     expect(privateHits).toBe(0);
   }, 20_000);
+
+  it("fails closed when browser DNS differs from the validated address", async () => {
+    const provider = new PlaywrightAcquisitionProvider({
+      lookup: async () => ["192.0.2.1"],
+      timeoutMs: 1_000,
+    });
+
+    await expect(provider.acquire({ url: `${baseUrl.replace("127.0.0.1", "localhost")}/dynamic` }))
+      .rejects.toMatchObject({ code: "CAPABILITY_UNAVAILABLE" });
+    expect(documentHits).toBe(0);
+  }, 20_000);
+
+  it("pins and validates every redirect hop instead of trusting Chromium DNS", async () => {
+    const provider = new PlaywrightAcquisitionProvider({
+      allowlist: ["127.0.0.1"],
+      lookup: async () => ["192.0.2.1"],
+      timeoutMs: 1_000,
+    });
+
+    await expect(provider.acquire({ url: `${baseUrl}/redirect` }))
+      .rejects.toMatchObject({ code: "CAPABILITY_UNAVAILABLE" });
+    expect(redirectHits).toBe(0);
+  }, 20_000);
+
+  it("blocks service workers and WebSocket upgrades before private endpoints are hit", async () => {
+    const page = await playwright({ allowlist: ["localhost"] }).acquire({
+      url: `${baseUrl.replace("127.0.0.1", "localhost")}/channels`,
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+
+    expect(page.text).toContain("Channel fixture");
+    expect(serviceWorkerHits).toBe(0);
+    expect(webSocketHits).toBe(0);
+  }, 20_000);
+
+  it("acquires local HTTPS through a destination-validating CONNECT tunnel", async () => {
+    const httpsServer: HttpsServer = createHttpsServer({
+      key: await readFile(join(fixtureRoot, "localhost-key.pem")),
+      cert: await readFile(join(fixtureRoot, "localhost-cert.pem")),
+    }, (_request, response) => {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end("<html><body><h1>Secure pinned content</h1></body></html>");
+    });
+    await new Promise<void>((resolveListen) => httpsServer.listen(0, resolveListen));
+    const { port } = httpsServer.address() as AddressInfo;
+    try {
+      const provider = new PlaywrightAcquisitionProvider({
+          allowlist: ["localhost"],
+        ignoreHTTPSErrors: true,
+      });
+      const page = await provider.acquire({ url: `https://localhost:${port}/secure` });
+      expect(page.text).toContain("Secure pinned content");
+    } finally {
+      httpsServer.closeAllConnections();
+      await new Promise<void>((resolveClose) => httpsServer.close(() => resolveClose()));
+    }
+  }, 20_000);
+
+  it("declares Playwright as a runtime dependency", async () => {
+    const manifest = JSON.parse(await readFile(resolve("package.json"), "utf8")) as {
+      dependencies: Record<string, string>;
+      devDependencies: Record<string, string>;
+    };
+    expect(manifest.dependencies.playwright).toBe("^1.64.1");
+    expect(manifest.devDependencies.playwright).toBeUndefined();
+  });
 
   it("rejects caller scripts and non-CSS selector input before navigation", async () => {
     const before = documentHits;
