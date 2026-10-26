@@ -1,4 +1,5 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { ZodError } from "zod";
 import {
   DomainError,
   type DomainErrorCode,
@@ -38,6 +39,13 @@ function safeDetails(
 }
 
 export function toMcpError(error: unknown): McpError {
+  if (error instanceof ZodError) {
+    return new McpError(
+      ErrorCode.InvalidParams,
+      "Input validation error",
+      { code: "INVALID_INPUT", retryable: false },
+    );
+  }
   if (!(error instanceof DomainError) || error.code === "INTERNAL_ERROR") {
     return new McpError(
       ErrorCode.InternalError,

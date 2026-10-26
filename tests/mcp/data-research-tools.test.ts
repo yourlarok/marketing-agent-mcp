@@ -466,20 +466,20 @@ describe("data research MCP tools", () => {
     await writeFile(join(tempDir, "overflow.csv"), "name,amount\nAcme,12\n");
 
     const padding = " ".repeat(MAX_SERIALIZED_INPUT_BYTES);
-    const workspaceId = `${padding}workspace-1`;
+    const paddedText = `${padding}Overflow`;
     const calls = [
-      ["data_request_plan", { id: "overflow-new-plan", workspaceId, objective: "Overflow", questionTypes: ["conversion"], availableFields: [], ...context("overflow-new-plan") }],
-      ["data_request_decline", { planId: plan.id, workspaceId, expectedPlanVersion: 1, questionType: "conversion", reason: "Overflow", ...context("overflow-decline") }],
-      ["ingest_files", { id: "overflow-files", workspaceId, paths: ["overflow.csv"], ...context("overflow-files") }],
-      ["ingest_temporary_api", { id: "overflow-api", workspaceId, url: "https://example.com/metrics.csv", ownership: "authorized", expiresAt: "2026-10-26T13:00:00.000Z", ...context("overflow-api") }],
-      ["ingest_content_links", { id: "overflow-links", workspaceId, links: [{ url: "https://example.com/research" }], ...context("overflow-links") }],
-      ["research_session_create", { id: "overflow-session", workspaceId, goal: "Overflow", seeds: ["https://example.com/research"], expansion: false, scope, ...context("overflow-session") }],
-      ["research_permission_set", { id: "overflow-permission", workspaceId, expectedVersion: 1, expansion: "denied", ...context("overflow-set-permission") }],
-      ["research_session_run", { id: "overflow-run", workspaceId, expectedVersion: 1, ...context("overflow-run-research") }],
-      ["competitor_confirm", { id: "overflow-confirm", workspaceId, expectedVersion: 1, status: "confirmed", ...context("overflow-confirm-competitor") }],
-      ["competitor_diff_create", { id: "overflow-diff", workspaceId, competitorIds: ["overflow-left", "overflow-right"], dimensions: ["price"], ...context("overflow-diff-create") }],
-      ["data_research_get", { entityType: "data_request_plan", id: plan.id, workspaceId }],
-      ["evidence_asset_get", { workspaceId, evidenceId: assetBatch.evidenceIds[0]!, assetId }],
+      ["data_request_plan", { id: "overflow-new-plan", workspaceId: "workspace-1", objective: `${" ".repeat(MAX_SERIALIZED_INPUT_BYTES - 128)}Overflow`, questionTypes: ["conversion"], availableFields: [], ...context("overflow-new-plan") }],
+      ["data_request_decline", { planId: plan.id, workspaceId: "workspace-1", expectedPlanVersion: 1, questionType: "conversion", reason: paddedText, ...context("overflow-decline") }],
+      ["ingest_files", { id: "overflow-files", workspaceId: "workspace-1", paths: [`${padding}overflow.csv`], ...context("overflow-files") }],
+      ["ingest_temporary_api", { id: "overflow-api", workspaceId: "workspace-1", url: `${padding}https://example.com/metrics.csv`, ownership: "authorized", expiresAt: "2026-10-26T13:00:00.000Z", ...context("overflow-api") }],
+      ["ingest_content_links", { id: "overflow-links", workspaceId: "workspace-1", links: [{ url: `${padding}https://example.com/research` }], ...context("overflow-links") }],
+      ["research_session_create", { id: "overflow-session", workspaceId: "workspace-1", goal: paddedText, seeds: ["https://example.com/research"], expansion: false, scope, ...context("overflow-session") }],
+      ["research_permission_set", { id: "overflow-permission", workspaceId: `${padding}workspace-1`, expectedVersion: 1, expansion: "denied", ...context("overflow-set-permission") }],
+      ["research_session_run", { id: "overflow-run", workspaceId: `${padding}workspace-1`, expectedVersion: 1, ...context("overflow-run-research") }],
+      ["competitor_confirm", { id: "overflow-confirm", workspaceId: `${padding}workspace-1`, expectedVersion: 1, status: "confirmed", ...context("overflow-confirm-competitor") }],
+      ["competitor_diff_create", { id: "overflow-diff", workspaceId: "workspace-1", competitorIds: ["overflow-left", "overflow-right"], dimensions: [paddedText], ...context("overflow-diff-create") }],
+      ["data_research_get", { entityType: "data_request_plan", id: plan.id, workspaceId: `${padding}workspace-1` }],
+      ["evidence_asset_get", { workspaceId: `${padding}workspace-1`, evidenceId: assetBatch.evidenceIds[0]!, assetId }],
     ] as const;
 
     const raw = new DatabaseSync(join(tempDir, "store.db"));
@@ -499,11 +499,39 @@ describe("data research MCP tools", () => {
         expect(Buffer.byteLength(JSON.stringify(arguments_), "utf8"), name).toBeGreaterThan(MAX_SERIALIZED_INPUT_BYTES);
         const result = await client.callTool({ name, arguments: arguments_ });
         expect(result, name).toMatchObject({ isError: true });
+        expect(JSON.stringify(result), name).toContain("Invalid input");
       }
       expect(residue()).toEqual(before);
     } finally {
       raw.close();
     }
+  });
+
+  it("preserves trim-before-length boundaries for legal prior and new inputs", async () => {
+    const trimmedId = "w".repeat(256);
+    const workspaceArguments = {
+      id: ` \n${trimmedId}\t `,
+      name: "Boundary workspace",
+      ...context("legal-trim-workspace"),
+    };
+    expect(Buffer.byteLength(JSON.stringify(workspaceArguments), "utf8")).toBeLessThan(MAX_SERIALIZED_INPUT_BYTES);
+    const workspace = await client.callTool({ name: "workspace_create", arguments: workspaceArguments });
+    expect(workspace).not.toMatchObject({ isError: true });
+    expect(JSON.parse((workspace.content[0] as { text: string }).text)).toMatchObject({ id: trimmedId });
+    expect(await client.callTool({ name: "workspace_create", arguments: workspaceArguments })).toEqual(workspace);
+
+    const trimmedField = "f".repeat(8_192);
+    const planArguments = {
+      id: "legal-trim-plan",
+      workspaceId: "workspace-1",
+      objective: "Legal trim boundary",
+      questionTypes: ["conversion"],
+      availableFields: [` \n${trimmedField}\t `],
+      ...context("legal-trim-plan"),
+    };
+    expect(Buffer.byteLength(JSON.stringify(planArguments), "utf8")).toBeLessThan(MAX_SERIALIZED_INPUT_BYTES);
+    const plan = await call("data_request_plan", planArguments);
+    expect(plan).toMatchObject({ id: "legal-trim-plan", availableFields: [trimmedField] });
   });
 
   it("maps expired temporary API failures to safe MCP errors", async () => {
