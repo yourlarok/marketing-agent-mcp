@@ -127,6 +127,36 @@ export const registerSourceInputSchema = z.strictObject({
   ...commandContextInput,
 });
 
+export const registerCapabilityInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  name: z.string().trim().min(1).max(1_024),
+  adapterKind: z.enum(["mcp", "api_cli", "script_adapter", "temporary_connector"]),
+  origin: z.enum(["controlled_catalog", "user_extension"]),
+  configuration: jsonValueSchema.optional(),
+  ...commandContextInput,
+});
+
+export const recordCapabilityHealthInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: z.number().int().positive(),
+  healthy: z.boolean(),
+  checkedAt: utcTimestampSchema,
+  toolVersion: z.string().trim().min(1).max(1_024).optional(),
+  evidenceId: idSchema.optional(),
+  reason: z.string().trim().min(1).max(8_192).optional(),
+  ...commandContextInput,
+});
+
+export const capabilityListInputSchema = z.strictObject({
+  workspaceId: idSchema,
+  adapterKind: z
+    .enum(["mcp", "api_cli", "script_adapter", "temporary_connector"])
+    .optional(),
+  state: z.enum(["registered", "configured", "verified", "unavailable"]).optional(),
+});
+
 export const registerDatasetInputSchema = z.strictObject({
   id: idSchema,
   workspaceId: idSchema,

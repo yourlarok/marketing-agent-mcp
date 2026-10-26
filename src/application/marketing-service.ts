@@ -1,14 +1,20 @@
 import { DomainError } from "../domain/errors.js";
 import {
+  CAPABILITY_ADAPTER_KINDS,
+  CAPABILITY_ORIGINS,
+  CAPABILITY_STATES,
   EVIDENCE_CLASSIFICATIONS,
   FINDING_KINDS,
   TASK_STATES,
+  type CapabilityAdapterKind,
+  type CapabilityState,
   type Dataset,
   type Evidence,
   type Finding,
   type Recommendation,
   type Source,
   type Task,
+  type ToolCapability,
   type Workspace,
 } from "../domain/model.js";
 import {
@@ -23,8 +29,10 @@ import {
   type CreateRecommendation,
   type CreateTask,
   type CreateWorkspace,
+  type RecordCapabilityHealth,
   type RecordEvidence,
   type RecordFinding,
+  type RegisterCapability,
   type RegisterDataset,
   type RegisterSource,
   type TransitionTask,
@@ -44,6 +52,12 @@ import type {
 } from "./ports.js";
 
 const MAX_LINEAGE_ENTITIES = 1_000;
+
+export interface CapabilityQuery {
+  workspaceId: string;
+  adapterKind?: CapabilityAdapterKind;
+  state?: CapabilityState;
+}
 
 const lineageEntityTypes: Record<LineageEntityType, keyof Repositories> = {
   source: "sources",
@@ -109,7 +123,7 @@ function assertUtcInput(value: string, field: string): void {
   }
 }
 
-function assertNonEmptyString(value: unknown, field: string): void {
+function assertNonEmptyString(value: unknown, field: string): asserts value is string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new DomainError("INVALID_INPUT", `${field} must not be empty`);
   }
@@ -531,6 +545,142 @@ export class MarketingService {
         await assertWorkspaceDependencyGraph(repos, task);
         return repos.tasks.insert(task) as Promise<Task>;
       },
+    });
+  }
+
+  registerCapability(
+    command: Command<RegisterCapability>,
+  ): Promise<ToolCapability> {
+    return this.commands.execute({
+      workspaceId: command.input.workspaceId,
+      action: "capability.register",
+      entityType: "capability",
+      input: command.input,
+      context: command.context,
+      write: async (repos, input, timestamp) => {
+        assertNonEmptyString(input.id, "id");
+        assertNonEmptyString(input.workspaceId, "workspaceId");
+        assertNonEmptyString(input.name, "name");
+        if (!(CAPABILITY_ADAPTER_KINDS as readonly string[]).includes(input.adapterKind)) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "adapterKind must be a supported capability adapter kind",
+          );
+        }
+        if (!(CAPABILITY_ORIGINS as readonly string[]).includes(input.origin)) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "origin must identify the controlled catalog or an explicit user extension",
+          );
+        }
+        const capability: ToolCapability = {
+          id: input.id,
+          workspaceId: input.workspaceId,
+          version: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          name: input.name,
+          adapterKind: input.adapterKind,
+          origin: input.origin,
+          state: input.configuration === undefined ? "registered" : "configured",
+          ...(input.configuration === undefined
+            ? {}
+            : { configuration: input.configuration }),
+        };
+        return repos.capabilities.insert(capability) as Promise<ToolCapability>;
+      },
+    });
+  }
+
+  recordCapabilityHealth(
+    command: Command<RecordCapabilityHealth>,
+  ): Promise<ToolCapability> {
+    return this.commands.execute({
+      workspaceId: command.input.workspaceId,
+      action: "capability.health.record",
+      entityType: "capability",
+      input: command.input,
+      context: command.context,
+      write: async (repos, input, timestamp) => {
+        if (!Number.isInteger(input.expectedVersion) || input.expectedVersion < 1) {
+          throw new DomainError(
+            "INVALID_INPUT",
+            "expectedVersion must be a positive integer",
+          );
+        }
+        if (typeof input.healthy !== "boolean") {
+          throw new DomainError("INVALID_INPUT", "healthy must be a boolean");
+        }
+        assertUtcInput(input.checkedAt, "checkedAt");
+        const capability = await repos.capabilities.get(input.id, input.workspaceId);
+        if (!capability) {
+          throw new DomainError(
+            "NOT_FOUND",
+            "Capability not found in workspace",
+            false,
+            { capabilityId: input.id, workspaceId: input.workspaceId },
+          );
+        }
+        const current = capability as ToolCapability;
+        const updated: ToolCapability = {
+          ...current,
+          state: input.healthy ? "verified" : "unavailable",
+          checkedAt: input.checkedAt,
+          updatedAt: timestamp,
+        };
+        delete updated.toolVersion;
+        delete updated.evidenceId;
+        delete updated.unavailableReason;
+        if (input.healthy) {
+          assertNonEmptyString(input.toolVersion, "toolVersion");
+          assertNonEmptyString(input.evidenceId, "evidenceId");
+          const evidence = await repos.evidence.get(input.evidenceId, input.workspaceId);
+          if (!evidence) {
+            throw new DomainError(
+              "NOT_FOUND",
+              "Capability health evidence not found in workspace",
+              false,
+              { evidenceId: input.evidenceId, workspaceId: input.workspaceId },
+            );
+          }
+          updated.toolVersion = input.toolVersion;
+          updated.evidenceId = input.evidenceId;
+        } else {
+          assertNonEmptyString(input.reason, "reason");
+          updated.unavailableReason = input.reason;
+        }
+        return repos.capabilities.update(
+          updated,
+          input.expectedVersion,
+        ) as Promise<ToolCapability>;
+      },
+    });
+  }
+
+  listCapabilities(query: CapabilityQuery): Promise<ToolCapability[]> {
+    return this.store.transaction(async (repos) => {
+      assertNonEmptyString(query.workspaceId, "workspaceId");
+      if (
+        query.adapterKind !== undefined &&
+        !(CAPABILITY_ADAPTER_KINDS as readonly string[]).includes(query.adapterKind)
+      ) {
+        throw new DomainError(
+          "INVALID_INPUT",
+          "adapterKind must be a supported capability adapter kind",
+        );
+      }
+      if (
+        query.state !== undefined &&
+        !(CAPABILITY_STATES as readonly string[]).includes(query.state)
+      ) {
+        throw new DomainError("INVALID_INPUT", "state must be a supported capability state");
+      }
+      const capabilities = await repos.capabilities.list(query.workspaceId);
+      return capabilities.filter(
+        (capability) =>
+          (query.adapterKind === undefined || capability.adapterKind === query.adapterKind) &&
+          (query.state === undefined || capability.state === query.state),
+      ) as ToolCapability[];
     });
   }
 

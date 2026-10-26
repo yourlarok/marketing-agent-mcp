@@ -4,6 +4,7 @@ import { DomainError } from "../domain/errors.js";
 import type {
   AuditRecord,
   AuditRepository,
+  CapabilityRepository,
   EntityRecord,
   EntityRepository,
   IdempotencyRecord,
@@ -252,6 +253,20 @@ class SqliteEntityRepository implements EntityRepository {
   }
 }
 
+class SqliteCapabilityRepository
+  extends SqliteEntityRepository
+  implements CapabilityRepository
+{
+  async list(workspaceId: string): Promise<EntityRecord[]> {
+    const rows = this.database
+      .prepare(
+        "SELECT payload FROM capabilities WHERE workspace_id = ? ORDER BY created_at, id",
+      )
+      .all(workspaceId) as unknown as { payload: string }[];
+    return rows.map((row) => JSON.parse(row.payload) as EntityRecord);
+  }
+}
+
 class SqliteTaskRepository extends SqliteEntityRepository {
   override async insert(record: EntityRecord): Promise<EntityRecord> {
     const inserted = await super.insert(record);
@@ -477,7 +492,10 @@ class SqliteStore implements Store {
       findings: repository("findings"),
       recommendations: repository("recommendations"),
       tasks: repository("tasks"),
-      capabilities: repository("capabilities"),
+      capabilities: new SqliteCapabilityRepository(
+        this.database,
+        entityConfigs.capabilities!,
+      ),
       audit: new SqliteAuditRepository(this.database),
       idempotency: new SqliteIdempotencyRepository(this.database),
     };

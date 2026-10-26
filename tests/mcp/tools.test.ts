@@ -96,6 +96,9 @@ describe("MCP server", () => {
       expect(
         (await client.listTools()).tools.map((tool) => tool.name).sort(),
       ).toEqual([
+        "capability_health_record",
+        "capability_list",
+        "capability_register",
         "dataset_register",
         "evidence_record",
         "finding_record",
@@ -295,6 +298,68 @@ describe("MCP server", () => {
         ],
       });
 
+      const registeredCapability = await client.callTool({
+        name: "capability_register",
+        arguments: {
+          id: "capability-1",
+          workspaceId: "workspace-1",
+          name: "Approved analytics adapter",
+          adapterKind: "api_cli",
+          origin: "controlled_catalog",
+          actor: "agent-1",
+          requestId: "request-9",
+          idempotencyKey: "command-9",
+        },
+      });
+      expect(
+        JSON.parse((registeredCapability.content[0] as { text: string }).text),
+      ).toMatchObject({ id: "capability-1", state: "registered" });
+
+      const unavailableCapability = await client.callTool({
+        name: "capability_health_record",
+        arguments: {
+          id: "capability-1",
+          workspaceId: "workspace-1",
+          expectedVersion: 1,
+          healthy: false,
+          checkedAt: "2026-10-26T12:29:00.000Z",
+          reason: "The approved health check did not pass",
+          actor: "agent-1",
+          requestId: "request-10",
+          idempotencyKey: "command-10",
+        },
+      });
+      expect(
+        JSON.parse((unavailableCapability.content[0] as { text: string }).text),
+      ).toMatchObject({ state: "unavailable", version: 2 });
+
+      const verifiedCapability = await client.callTool({
+        name: "capability_health_record",
+        arguments: {
+          id: "capability-1",
+          workspaceId: "workspace-1",
+          expectedVersion: 2,
+          healthy: true,
+          checkedAt: "2026-10-26T12:30:00.000Z",
+          toolVersion: "2.4.1",
+          evidenceId: "evidence-1",
+          actor: "agent-1",
+          requestId: "request-11",
+          idempotencyKey: "command-11",
+        },
+      });
+      expect(
+        JSON.parse((verifiedCapability.content[0] as { text: string }).text),
+      ).toMatchObject({ state: "verified", version: 3, evidenceId: "evidence-1" });
+
+      const capabilities = await client.callTool({
+        name: "capability_list",
+        arguments: { workspaceId: "workspace-1", state: "verified" },
+      });
+      expect(JSON.parse((capabilities.content[0] as { text: string }).text)).toEqual([
+        expect.objectContaining({ id: "capability-1", state: "verified" }),
+      ]);
+
       const raw = new DatabaseSync(databasePath);
       try {
         expect(
@@ -308,6 +373,7 @@ describe("MCP server", () => {
                 (SELECT COUNT(*) FROM findings) AS findings,
                 (SELECT COUNT(*) FROM recommendations) AS recommendations,
                 (SELECT COUNT(*) FROM tasks) AS tasks,
+                (SELECT COUNT(*) FROM capabilities) AS capabilities,
                 (SELECT COUNT(*) FROM audit_records) AS audits,
                 (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
             )
@@ -320,8 +386,9 @@ describe("MCP server", () => {
           findings: 1,
           recommendations: 1,
           tasks: 1,
-          audits: 8,
-          idempotency: 8,
+          capabilities: 1,
+          audits: 11,
+          idempotency: 11,
         });
       } finally {
         raw.close();

@@ -24,6 +24,10 @@ export interface EntityRepository<T extends EntityRecord = EntityRecord> {
   update(record: T, expectedVersion: number): Promise<T>;
 }
 
+export interface CapabilityRepository extends EntityRepository {
+  list(workspaceId: Id): Promise<EntityRecord[]>;
+}
+
 export interface AuditRecord {
   id: Id;
   workspaceId: Id;
@@ -96,7 +100,7 @@ export interface Repositories {
   findings: EntityRepository;
   recommendations: EntityRepository;
   tasks: EntityRepository;
-  capabilities: EntityRepository;
+  capabilities: CapabilityRepository;
   audit: AuditRepository;
   idempotency: IdempotencyRepository;
 }

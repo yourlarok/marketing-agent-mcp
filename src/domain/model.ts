@@ -80,3 +80,34 @@ export interface Task extends EntityRecord {
   acceptanceCriteria: string[];
   state: TaskState;
 }
+
+export const CAPABILITY_ADAPTER_KINDS = [
+  "mcp",
+  "api_cli",
+  "script_adapter",
+  "temporary_connector",
+] as const;
+export type CapabilityAdapterKind = (typeof CAPABILITY_ADAPTER_KINDS)[number];
+
+export const CAPABILITY_STATES = [
+  "registered",
+  "configured",
+  "verified",
+  "unavailable",
+] as const;
+export type CapabilityState = (typeof CAPABILITY_STATES)[number];
+
+export const CAPABILITY_ORIGINS = ["controlled_catalog", "user_extension"] as const;
+export type CapabilityOrigin = (typeof CAPABILITY_ORIGINS)[number];
+
+export interface ToolCapability extends EntityRecord {
+  name: string;
+  adapterKind: CapabilityAdapterKind;
+  origin: CapabilityOrigin;
+  state: CapabilityState;
+  configuration?: JsonValue;
+  checkedAt?: string;
+  toolVersion?: string;
+  evidenceId?: string;
+  unavailableReason?: string;
+}

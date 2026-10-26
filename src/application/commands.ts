@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { DomainError } from "../domain/errors.js";
 import type {
+  CapabilityAdapterKind,
+  CapabilityOrigin,
   EvidenceClassification,
   FindingKind,
   SourceOwnership,
@@ -104,6 +106,26 @@ export interface TransitionTask {
   expectedVersion: number;
 }
 
+export interface RegisterCapability {
+  id: string;
+  workspaceId: string;
+  name: string;
+  adapterKind: CapabilityAdapterKind;
+  origin: CapabilityOrigin;
+  configuration?: JsonValue;
+}
+
+export interface RecordCapabilityHealth {
+  id: string;
+  workspaceId: string;
+  expectedVersion: number;
+  healthy: boolean;
+  checkedAt: string;
+  toolVersion?: string;
+  evidenceId?: string;
+  reason?: string;
+}
+
 interface WriteOperation<T, R extends EntityRecord> {
   workspaceId: string;
   action: string;
@@ -132,10 +154,10 @@ function isSecretParameter(key: string): boolean {
   return decoded.trim().toLowerCase() === "key" || isSecretLikeKey(decoded);
 }
 
-function assertSafeSourceLocator(locator: string): void {
+function assertNoEmbeddedSecrets(value: string): void {
   let url: URL | undefined;
   try {
-    url = new URL(locator);
+    url = new URL(value);
   } catch {}
   if (url) {
     if (url.username || url.password) {
@@ -148,7 +170,7 @@ function assertSafeSourceLocator(locator: string): void {
     }
   }
 
-  for (const match of locator.matchAll(/(?:^|[?&#;\s])([^=&#;\s]+)=/g)) {
+  for (const match of value.matchAll(/(?:^|[?&#;\s])([^=&#;\s]+)=/g)) {
     if (isSecretParameter(match[1]!)) {
       rejectSecretLikeInput();
     }
@@ -160,8 +182,8 @@ function assertNoSecretLikeFields(
   seen = new Set<object>(),
   fieldName?: string,
 ): void {
-  if (fieldName === "sourceLocator" && typeof value === "string") {
-    assertSafeSourceLocator(value);
+  if (typeof value === "string") {
+    assertNoEmbeddedSecrets(value);
   }
   if (value === null || typeof value !== "object" || seen.has(value)) {
     return;

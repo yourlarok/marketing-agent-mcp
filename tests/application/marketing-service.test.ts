@@ -1562,3 +1562,332 @@ describe("MarketingService recommendations and tasks", () => {
     },
   );
 });
+
+describe("MarketingService capability registry", () => {
+  let store: Store;
+  let clock: TestClock;
+  let ids: TestIds;
+  let service: MarketingService;
+  let commandSequence: number;
+
+  beforeEach(async () => {
+    store = openStore(":memory:");
+    clock = new TestClock();
+    ids = new TestIds(Array.from({ length: 100 }, (_, index) => `audit-${index + 1}`));
+    service = new MarketingService(store, clock, ids);
+    commandSequence = 0;
+    await service.createWorkspace({ input: workspaceInput(), context: nextContext() });
+  });
+
+  afterEach(() => {
+    store.close();
+  });
+
+  function nextContext(): CommandContext {
+    commandSequence += 1;
+    return {
+      actor: "agent-1",
+      requestId: `capability-request-${commandSequence}`,
+      idempotencyKey: `capability-command-${commandSequence}`,
+    };
+  }
+
+  function capabilityInput() {
+    return {
+      id: "capability-1",
+      workspaceId: "workspace-1",
+      name: "Approved analytics adapter",
+      adapterKind: "api_cli" as const,
+      origin: "controlled_catalog" as const,
+    };
+  }
+
+  async function registerCapability() {
+    return service.registerCapability({
+      input: capabilityInput(),
+      context: nextContext(),
+    });
+  }
+
+  it("capability registration is registered rather than verified and is auditable", async () => {
+    const capability = await registerCapability();
+
+    expect(capability).toEqual({
+      ...capabilityInput(),
+      state: "registered",
+      version: 1,
+      createdAt: firstNow,
+      updatedAt: firstNow,
+    });
+    const persisted = await store.transaction(async (repos) => ({
+      capability: await repos.capabilities.get("capability-1", "workspace-1"),
+      audit: await repos.audit.get("audit-2", "workspace-1"),
+      idempotency: await repos.idempotency.get(
+        "workspace-1",
+        "capability-command-2",
+      ),
+    }));
+    expect(persisted.capability).toEqual(capability);
+    expect(persisted.audit).toMatchObject({
+      action: "capability.register",
+      entityType: "capability",
+      entityId: "capability-1",
+    });
+    expect(persisted.idempotency?.response).toEqual(capability);
+  });
+
+  it("capability configuration marks an explicit user extension configured", async () => {
+    const capability = await service.registerCapability({
+      input: {
+        ...capabilityInput(),
+        id: "capability-extension",
+        origin: "user_extension",
+        configuration: { endpoint: "https://example.test/health" },
+      },
+      context: nextContext(),
+    });
+
+    expect(capability).toMatchObject({
+      id: "capability-extension",
+      origin: "user_extension",
+      state: "configured",
+      configuration: { endpoint: "https://example.test/health" },
+    });
+  });
+
+  it("capability health failure stores a safe reason and unavailable state", async () => {
+    await registerCapability();
+    clock.set(secondNow);
+
+    const capability = await service.recordCapabilityHealth({
+      input: {
+        id: "capability-1",
+        workspaceId: "workspace-1",
+        expectedVersion: 1,
+        healthy: false,
+        checkedAt: "2026-10-26T12:29:00.000Z",
+        reason: "The approved health check did not pass",
+      },
+      context: nextContext(),
+    });
+
+    expect(capability).toEqual({
+      ...capabilityInput(),
+      state: "unavailable",
+      checkedAt: "2026-10-26T12:29:00.000Z",
+      unavailableReason: "The approved health check did not pass",
+      version: 2,
+      createdAt: firstNow,
+      updatedAt: secondNow,
+    });
+    expect(
+      await store.transaction((repos) =>
+        repos.capabilities.get("capability-1", "workspace-1"),
+      ),
+    ).toEqual(capability);
+  });
+
+  it("capability health success requires real-check evidence and enables verified", async () => {
+    await service.registerSource({
+      input: {
+        id: "source-1",
+        workspaceId: "workspace-1",
+        name: "Health check evidence",
+        type: "manual",
+        ownership: "owned",
+      },
+      context: nextContext(),
+    });
+    await service.recordEvidence({
+      input: evidenceInput(),
+      context: nextContext(),
+    });
+    await registerCapability();
+    clock.set(secondNow);
+
+    const capability = await service.recordCapabilityHealth({
+      input: {
+        id: "capability-1",
+        workspaceId: "workspace-1",
+        expectedVersion: 1,
+        healthy: true,
+        checkedAt: "2026-10-26T12:29:00.000Z",
+        toolVersion: "2.4.1",
+        evidenceId: "evidence-1",
+      },
+      context: nextContext(),
+    });
+
+    expect(capability).toEqual({
+      ...capabilityInput(),
+      state: "verified",
+      checkedAt: "2026-10-26T12:29:00.000Z",
+      toolVersion: "2.4.1",
+      evidenceId: "evidence-1",
+      version: 2,
+      createdAt: firstNow,
+      updatedAt: secondNow,
+    });
+    expect(await service.listCapabilities({ workspaceId: "workspace-1" })).toEqual([
+      capability,
+    ]);
+  });
+
+  it.each(["checkedAt", "toolVersion", "evidenceId"] as const)(
+    "capability verification rejects missing %s without changing state",
+    async (field) => {
+      await registerCapability();
+      const input = {
+        id: "capability-1",
+        workspaceId: "workspace-1",
+        expectedVersion: 1,
+        healthy: true,
+        checkedAt: "2026-10-26T12:29:00.000Z",
+        toolVersion: "2.4.1",
+        evidenceId: "evidence-1",
+      };
+      const missingInput: Partial<typeof input> = { ...input };
+      delete missingInput[field];
+      const attemptContext = nextContext();
+
+      await expect(
+        service.recordCapabilityHealth({
+          input: missingInput as typeof input,
+          context: attemptContext,
+        }),
+      ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+      const persisted = await store.transaction(async (repos) => ({
+        capability: await repos.capabilities.get("capability-1", "workspace-1"),
+        idempotency: await repos.idempotency.get(
+          "workspace-1",
+          attemptContext.idempotencyKey,
+        ),
+      }));
+      expect(persisted.capability).toMatchObject({ state: "registered", version: 1 });
+      expect(persisted.idempotency).toBeUndefined();
+    },
+  );
+
+  it("capability verification rejects evidence outside the workspace", async () => {
+    await registerCapability();
+
+    await expect(
+      service.recordCapabilityHealth({
+        input: {
+          id: "capability-1",
+          workspaceId: "workspace-1",
+          expectedVersion: 1,
+          healthy: true,
+          checkedAt: "2026-10-26T12:29:00.000Z",
+          toolVersion: "2.4.1",
+          evidenceId: "evidence-other",
+        },
+        context: nextContext(),
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    expect(
+      await store.transaction((repos) =>
+        repos.capabilities.get("capability-1", "workspace-1"),
+      ),
+    ).toMatchObject({ state: "registered", version: 1 });
+  });
+
+  it("capability listing returns an empty list for unknown capabilities and scopes reads", async () => {
+    await registerCapability();
+
+    expect(
+      await service.listCapabilities({ workspaceId: "workspace-1", state: "verified" }),
+    ).toEqual([]);
+    expect(await service.listCapabilities({ workspaceId: "workspace-unknown" })).toEqual(
+      [],
+    );
+  });
+
+  it("capability commands reject secrets before entity, audit, or idempotency persistence", async () => {
+    const secret = "synthetic-capability-secret";
+    const attemptContext = nextContext();
+
+    const error = await service.registerCapability({
+      input: {
+        ...capabilityInput(),
+        configuration: { nested: { apiKey: secret } },
+      },
+      context: attemptContext,
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toMatchObject({ code: "INVALID_INPUT" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    const persisted = await store.transaction(async (repos) => ({
+      capability: await repos.capabilities.get("capability-1", "workspace-1"),
+      audit: await repos.audit.get("audit-2", "workspace-1"),
+      idempotency: await repos.idempotency.get(
+        "workspace-1",
+        attemptContext.idempotencyKey,
+      ),
+    }));
+    expect(persisted).toEqual({
+      capability: undefined,
+      audit: undefined,
+      idempotency: undefined,
+    });
+    expect(ids.calls).toBe(1);
+  });
+
+  it("capability registration rejects secret-bearing configuration locators", async () => {
+    const secret = "synthetic-capability-url-secret";
+    const attemptContext = nextContext();
+
+    const error = await service.registerCapability({
+      input: {
+        ...capabilityInput(),
+        configuration: {
+          endpoint: `https://example.test/health?apiKey=${secret}`,
+        },
+      },
+      context: attemptContext,
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toMatchObject({ code: "INVALID_INPUT" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(
+      await store.transaction((repos) =>
+        repos.capabilities.get("capability-1", "workspace-1"),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("capability health rejects secret-bearing failure reasons without state changes", async () => {
+    await registerCapability();
+    const secret = "synthetic-capability-reason-secret";
+    const attemptContext = nextContext();
+
+    const error = await service.recordCapabilityHealth({
+      input: {
+        id: "capability-1",
+        workspaceId: "workspace-1",
+        expectedVersion: 1,
+        healthy: false,
+        checkedAt: "2026-10-26T12:29:00.000Z",
+        reason: `Health check failed with password=${secret}`,
+      },
+      context: attemptContext,
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toMatchObject({ code: "INVALID_INPUT" });
+    expect(JSON.stringify(error)).not.toContain(secret);
+    expect(
+      await store.transaction((repos) =>
+        repos.capabilities.get("capability-1", "workspace-1"),
+      ),
+    ).toMatchObject({ state: "registered", version: 1 });
+  });
+});

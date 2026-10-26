@@ -3,12 +3,15 @@ import type { MarketingService } from "../application/marketing-service.js";
 import { canonicalJson } from "../infrastructure/sqlite.js";
 import { toMcpError } from "./error-mapper.js";
 import {
+  capabilityListInputSchema,
   createRecommendationInputSchema,
   createTaskInputSchema,
   createWorkspaceInputSchema,
   lineageGetInputSchema,
+  recordCapabilityHealthInputSchema,
   recordEvidenceInputSchema,
   recordFindingInputSchema,
+  registerCapabilityInputSchema,
   registerDatasetInputSchema,
   registerSourceInputSchema,
   transitionTaskInputSchema,
@@ -54,6 +57,71 @@ export function registerTools(server: McpServer, service: MarketingService): voi
         });
         return {
           content: [{ type: "text" as const, text: canonicalJson(source) }],
+        };
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "capability_register",
+    {
+      description: "Register controlled tool metadata without installing or executing it",
+      inputSchema: registerCapabilityInputSchema.shape,
+    },
+    async (arguments_) => {
+      try {
+        const { actor, requestId, idempotencyKey, ...input } =
+          registerCapabilityInputSchema.parse(arguments_);
+        const capability = await service.registerCapability({
+          input,
+          context: { actor, requestId, idempotencyKey },
+        });
+        return {
+          content: [{ type: "text" as const, text: canonicalJson(capability) }],
+        };
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "capability_health_record",
+    {
+      description: "Record externally checked capability health and evidence",
+      inputSchema: recordCapabilityHealthInputSchema.shape,
+    },
+    async (arguments_) => {
+      try {
+        const { actor, requestId, idempotencyKey, ...input } =
+          recordCapabilityHealthInputSchema.parse(arguments_);
+        const capability = await service.recordCapabilityHealth({
+          input,
+          context: { actor, requestId, idempotencyKey },
+        });
+        return {
+          content: [{ type: "text" as const, text: canonicalJson(capability) }],
+        };
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "capability_list",
+    {
+      description: "List workspace-scoped controlled tool capabilities",
+      inputSchema: capabilityListInputSchema.shape,
+    },
+    async (arguments_) => {
+      try {
+        const query = capabilityListInputSchema.parse(arguments_);
+        const capabilities = await service.listCapabilities(query);
+        return {
+          content: [{ type: "text" as const, text: canonicalJson(capabilities) }],
         };
       } catch (error) {
         throw toMcpError(error);
