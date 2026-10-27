@@ -147,6 +147,8 @@ describe("deterministic data preparation", () => {
 
     expect(round.state).not.toBe("ready");
     expect(round.answerableQuestionTypes).toEqual([]);
+    expect(round.questions).toHaveLength(1);
+    expect(round.questions[0]).toMatchObject({ questionType: "competitor_content" });
   });
 
   it.each([
@@ -174,6 +176,11 @@ describe("deterministic data preparation", () => {
 
     expect(round.state).not.toBe("ready");
     expect(round.answerableQuestionTypes).toEqual([]);
+    expect(round.questions).toHaveLength(1);
+    expect(round.questions[0]).toMatchObject({ questionType: "content_performance" });
+    for (const question of round.questions) {
+      expect(round.answerableQuestionTypes).not.toContain(question.questionType);
+    }
   });
 
   it("rejects fields assembled across datasets and advances when one valid dataset arrives", () => {
@@ -186,6 +193,8 @@ describe("deterministic data preparation", () => {
     const split = planDataRequestRound(["content_performance"], fields, [], datasets as never);
     expect(split.answerableQuestionTypes).toEqual([]);
     expect(split.state).not.toBe("ready");
+    expect(split.questions).toHaveLength(1);
+    expect(split.questions[0]).toMatchObject({ questionType: "content_performance" });
 
     const valid = planDataRequestRound(["content_performance"], fields, [], [...datasets, {
       source, fields, rowCount: 2, missingCellsByField: {}, stale: false,

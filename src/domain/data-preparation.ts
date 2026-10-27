@@ -374,26 +374,6 @@ export function planDataRequestRound(
   const available = new Set(availableFields);
   const declined = new Set(declinedQuestionTypes);
   const active = questionTypes.filter((questionType) => !declined.has(questionType));
-  const questions: DataRequestQuestion[] = [];
-  for (const questionType of active) {
-    const definition = DATA_QUESTION_CATALOG[questionType];
-    for (const layer of definition.sourceLayers) {
-      const missingFields = layer.acceptedFields.filter((field) => !available.has(field));
-      if (missingFields.length > 0) {
-        questions.push({
-          questionType,
-          sourceLayer: layer.id,
-          prompt: definition.prompt,
-          acceptedFields: layer.acceptedFields,
-          missingFields,
-        });
-        break;
-      }
-    }
-    if (questions.length > 0) {
-      break;
-    }
-  }
   const answerableQuestionTypes = active.filter((questionType) => {
     const requiredFields = DATA_QUESTION_CATALOG[questionType].acceptedFields;
     return datasetDescriptors.some((dataset) =>
@@ -402,6 +382,26 @@ export function planDataRequestRound(
       )
     );
   });
+  const answerable = new Set(answerableQuestionTypes);
+  const questions: DataRequestQuestion[] = [];
+  for (const questionType of active) {
+    if (answerable.has(questionType)) {
+      continue;
+    }
+    const definition = DATA_QUESTION_CATALOG[questionType];
+    const layer = definition.sourceLayers.find((candidate) =>
+      candidate.acceptedFields.some((field) => !available.has(field))
+    ) ?? definition.sourceLayers[0]!;
+    const missingFields = layer.acceptedFields.filter((field) => !available.has(field));
+    questions.push({
+      questionType,
+      sourceLayer: layer.id,
+      prompt: definition.prompt,
+      acceptedFields: layer.acceptedFields,
+      missingFields,
+    });
+    break;
+  }
   const hasAnyData = active.some((questionType) =>
     DATA_QUESTION_CATALOG[questionType].acceptedFields.some((field) => available.has(field))
   );

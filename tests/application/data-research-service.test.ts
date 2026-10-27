@@ -579,6 +579,41 @@ describe("DataResearchService guided data rounds", () => {
     });
   });
 
+  it("does not request an answerable type when a complete batch has no declared available fields", async () => {
+    const plan = await service.planDataRequests({
+      input: {
+        id: "complete-batch-plan",
+        workspaceId: "workspace-1",
+        objective: "Understand content performance",
+        questionTypes: ["content_performance"],
+        availableFields: [],
+        batch: {
+          datasets: [{
+            source: { path: "/imports/content.csv", fileName: "content.csv", format: "csv", sizeBytes: 100 },
+            fields: [
+              { name: "content_id", index: 0, inferredType: "string" },
+              { name: "published_at", index: 1, inferredType: "string" },
+              { name: "impressions", index: 2, inferredType: "number" },
+              { name: "clicks", index: 3, inferredType: "number" },
+            ],
+            rowsJsonl: '{"content_id":"content-1","published_at":"2026-10-26T12:00:00.000Z","impressions":10,"clicks":2}\n',
+            quality: { rowCount: 1, columnCount: 4, duplicateRowCount: 0, emptyRowCount: 0, typeInconsistencyCount: 0 },
+            issues: [],
+          }],
+        },
+      },
+      context: commandContext("complete-batch-plan"),
+    });
+
+    expect(plan).toMatchObject({
+      state: "ready",
+      answerableQuestionTypes: ["content_performance"],
+      questions: [],
+    });
+    expect(plan.questions.map((question) => question.questionType))
+      .not.toContain("content_performance");
+  });
+
   it("reconciles imported fields into later source layers and questions without a decline", async () => {
     const created = await service.planDataRequests({
       input: {
