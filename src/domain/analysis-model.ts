@@ -1,4 +1,4 @@
-import type { JsonValue } from "../application/ports.js";
+import type { EntityRecord, JsonValue } from "../application/ports.js";
 import { DomainError } from "./errors.js";
 import type { MetricComputation } from "./metric-catalog.js";
 
@@ -33,7 +33,7 @@ export interface AnalysisRecommendedAction {
   arguments?: AnalysisPayload;
 }
 
-export interface AnalysisGraph {
+export interface AnalysisGraph extends EntityRecord {
   id: string;
   workspaceId: string;
   version: number;
