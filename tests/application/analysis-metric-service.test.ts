@@ -337,6 +337,34 @@ describe("AnalysisService real metric computation", () => {
     });
   });
 
+  it("excludes a negative nonzero underflow row from real compute instead of admitting it as zero", async () => {
+    await writeFile(join(importRoot, "underflow.csv"), [
+      "clicks,impressions",
+      "100,1000",
+      "-1e-400,1000",
+      "",
+    ].join("\n"));
+    const underflowBatch = await ingest.importFiles({
+      input: { id: "batch-underflow", workspaceId: "workspace-1", paths: ["underflow.csv"] },
+      context: context("batch-underflow"),
+    });
+    const underflowGraph = await startGraph(underflowBatch);
+    const action = underflowGraph.recommendedActions.find((candidate) =>
+      candidate.tool === "metric_compute" && candidate.arguments?.metricId === "ctr_v1")!;
+
+    const result = await executeMetricAction(action, "negative-underflow");
+    expect(metricNode(result).payload).toMatchObject({
+      status: "ok",
+      numerator: 100,
+      denominator: 1000,
+      value: 0.1,
+      totalRowCount: 2,
+      includedRowCount: 1,
+      excludedRowCount: 1,
+      excludedRows: [{ rowIndex: 1, reasons: ["INVALID_NUMERATOR"] }],
+    });
+  });
+
   it("keeps ready actions executable after expand advances the graph version", async () => {
     const expanded = await service.expand({
       input: {

@@ -163,6 +163,38 @@ describe("metric calculation", () => {
     }
   });
 
+  it("distinguishes negative nonzero underflow from mathematical zero and declares positive underflow and overflow behavior", () => {
+    for (const value of ["-1e-400", "-.1e-400"]) {
+      expect(computeMetric("ctr_v1", [{ clicks: value, impressions: 1000 }])).toMatchObject({
+        status: "unknown",
+        includedRowCount: 0,
+        excludedRowCount: 1,
+        excludedRows: [{ rowIndex: 0, reasons: ["INVALID_NUMERATOR"] }],
+      });
+    }
+    for (const value of ["-0", "-0.0", "-0e-400"]) {
+      expect(computeMetric("ctr_v1", [{ clicks: value, impressions: 1000 }])).toMatchObject({
+        status: "ok",
+        numerator: 0,
+        denominator: 1000,
+        value: 0,
+        includedRowCount: 1,
+        excludedRowCount: 0,
+      });
+    }
+    expect(computeMetric("ctr_v1", [{ clicks: "1e-400", impressions: 1000 }])).toMatchObject({
+      status: "ok",
+      numerator: 0,
+      value: 0,
+      includedRowCount: 1,
+    });
+    expect(computeMetric("ctr_v1", [{ clicks: "1e400", impressions: 1000 }])).toMatchObject({
+      status: "unknown",
+      includedRowCount: 0,
+      excludedRows: [{ rowIndex: 0, reasons: ["INVALID_NUMERATOR"] }],
+    });
+  });
+
   it("returns unknown for empty data and zero denominators, never zero or infinity", () => {
     expect(computeMetric("ctr_v1", [])).toMatchObject({
       status: "unknown",

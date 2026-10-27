@@ -222,6 +222,8 @@ function normalizedMetricNumber(value: unknown): number | null {
   if (typeof value !== "string" || !STRICT_DECIMAL_SCIENTIFIC.test(value)) {
     return null;
   }
+  const significand = value.split(/[eE]/, 1)[0]!;
+  if (significand.startsWith("-") && /[1-9]/.test(significand)) return null;
   const normalized = Number(value);
   return Number.isFinite(normalized) && normalized >= 0 ? normalized : null;
 }
