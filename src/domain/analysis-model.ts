@@ -234,7 +234,7 @@ export interface MetricScenario {
   relativeDeltaUnknownReason: "ZERO_BASELINE" | "UNKNOWN_BASELINE" | null;
   projectedNumerator: number | null;
   projectedNumeratorDelta: number | null;
-  assumptions: ["denominator_unchanged", "other_conditions_unchanged"];
+  assumptions: ["projected_denominator_fixed_for_projection", "other_conditions_unchanged"];
   sensitivity: string;
 }
 
@@ -267,8 +267,8 @@ export function createMetricScenario(
     relativeDeltaUnknownReason: "UNKNOWN_BASELINE",
     projectedNumerator: null,
     projectedNumeratorDelta: null,
-    assumptions: ["denominator_unchanged", "other_conditions_unchanged"],
-    sensitivity: "Conditional arithmetic only; changes in the projected denominator or other conditions change the result and do not promise improvement.",
+    assumptions: ["projected_denominator_fixed_for_projection", "other_conditions_unchanged"],
+    sensitivity: "Conditional arithmetic uses the supplied projected denominator as fixed for this projection and holds other conditions constant. The projected numerator delta also reflects any difference between baseline and projected denominators; it does not promise improvement.",
   };
   if (baseline.status === "unknown" || baseline.value === null ||
       baseline.numerator === null || baseline.denominator === null) {

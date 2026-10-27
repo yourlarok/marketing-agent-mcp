@@ -474,6 +474,9 @@ function monitorPayload(
     status: comparisonUnknownReason === null ? "ok" : "unknown",
     baselineMetricNodeId: baselineNode.id,
     scenarioNodeId: input.scenarioNodeId ?? null,
+    batchId: input.batchId,
+    datasetId: input.datasetId,
+    evidenceId: input.evidenceId,
     baseline: {
       value: baseline.value,
       numerator: baseline.numerator,

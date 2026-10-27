@@ -1,5 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AnalysisCapabilityService,
@@ -13,6 +14,7 @@ import type {
 import type { Command, CommandContext } from "../../src/application/commands.js";
 import type { Store } from "../../src/application/ports.js";
 import { DataResearchService } from "../../src/application/data-research-service.js";
+import { MarketingService } from "../../src/application/marketing-service.js";
 import type { AnalysisGraph, AnalysisGraphNode } from "../../src/domain/analysis-model.js";
 import type { IngestionBatch } from "../../src/domain/data-research-model.js";
 import type { DomainError } from "../../src/domain/errors.js";
@@ -246,9 +248,11 @@ describe("AnalysisService conditional scenarios and real-data monitoring", () =>
       projectedNumerator: 180,
       projectedNumeratorDelta: 80,
       relativeDeltaUnknownReason: null,
-      assumptions: ["denominator_unchanged", "other_conditions_unchanged"],
+      assumptions: ["projected_denominator_fixed_for_projection", "other_conditions_unchanged"],
     });
-    expect(scenario.payload.sensitivity).toEqual(expect.stringMatching(/denominator|conditions/i));
+    expect(scenario.payload.sensitivity).toEqual(expect.stringMatching(/supplied projected denominator.*fixed.*projection/i));
+    expect(scenario.payload.sensitivity).toEqual(expect.stringMatching(/difference between baseline and projected denominators/i));
+    expect(JSON.stringify(scenario.payload)).not.toContain("denominator_unchanged");
     expect(JSON.stringify(scenario.payload)).not.toMatch(/revenue|caus|guarantee(?:d)? uplift/i);
 
     const currentBatch = await importCsv("current", "current.csv", [
@@ -282,6 +286,9 @@ describe("AnalysisService conditional scenarios and real-data monitoring", () =>
       status: "ok",
       baselineMetricNodeId: baselineMetric.id,
       scenarioNodeId: scenario.id,
+      batchId: currentBatch.id,
+      datasetId: currentBatch.datasetIds[0],
+      evidenceId: currentBatch.evidenceIds[0],
       baseline: {
         value: 0.1,
         numerator: 100,
@@ -328,6 +335,49 @@ describe("AnalysisService conditional scenarios and real-data monitoring", () =>
       },
     });
     expect(JSON.stringify(monitor.payload)).not.toMatch(/revenue|caused by|guarantee(?:d)? uplift/i);
+
+    const raw = new DatabaseSync(join(tempDir, "analysis.db"));
+    try {
+      expect(raw.prepare(
+        "SELECT dataset_id FROM analysis_graph_datasets WHERE graph_id = ? ORDER BY position",
+      ).all(compared.id)).toEqual([
+        { dataset_id: baselineBatch.datasetIds[0]! },
+        { dataset_id: currentBatch.datasetIds[0]! },
+      ]);
+      expect(raw.prepare(
+        "SELECT evidence_id FROM analysis_graph_evidence WHERE graph_id = ? ORDER BY position",
+      ).all(compared.id)).toEqual([
+        { evidence_id: baselineBatch.evidenceIds[0]! },
+        { evidence_id: currentBatch.evidenceIds[0]! },
+      ]);
+    } finally {
+      raw.close();
+    }
+    const lineage = await new MarketingService(
+      store,
+      { now: () => now },
+      { next: () => "unused" },
+    ).getLineage({
+      entityType: "analysis_graph",
+      id: compared.id,
+      workspaceId: compared.workspaceId,
+    });
+    expect(lineage.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ entityType: "dataset", id: baselineBatch.datasetIds[0]! }),
+      expect.objectContaining({ entityType: "dataset", id: currentBatch.datasetIds[0]! }),
+      expect.objectContaining({ entityType: "evidence", id: baselineBatch.evidenceIds[0]! }),
+      expect.objectContaining({ entityType: "evidence", id: currentBatch.evidenceIds[0]! }),
+    ]));
+    const graphLineageKeys = lineage.edges
+      .filter((edge) => edge.to.entityType === "analysis_graph" && edge.to.id === compared.id)
+      .map((edge) => `${edge.from.entityType}:${edge.from.id}`);
+    expect(new Set(graphLineageKeys).size).toBe(graphLineageKeys.length);
+    expect(graphLineageKeys).toEqual(expect.arrayContaining([
+      `dataset:${baselineBatch.datasetIds[0]!}`,
+      `dataset:${currentBatch.datasetIds[0]!}`,
+      `evidence:${baselineBatch.evidenceIds[0]!}`,
+      `evidence:${currentBatch.evidenceIds[0]!}`,
+    ]));
 
     const read = vi.spyOn(artifacts, "read");
     await expect(service.compareMetricMonitor(command)).resolves.toEqual(compared);
@@ -481,6 +531,19 @@ describe("AnalysisService conditional scenarios and real-data monitoring", () =>
       await descriptors(baselineBatch),
       { baselineMetricNodeId: metricNode(otherGraph).id },
     ))).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    const unrelatedBatch = await importCsv("unrelated-monitor", "unrelated-monitor.csv", [
+      "clicks,impressions",
+      "1,1000",
+      "",
+    ]);
+    await expect(service.compareMetricMonitor(monitorCommand(
+      withScenario,
+      baselineBatch,
+      {
+        ...await descriptors(baselineBatch),
+        evidenceId: unrelatedBatch.evidenceIds[0]!,
+      },
+    ))).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
     await expect(service.get({ id: metricGraph.id, workspaceId: metricGraph.workspaceId }))
       .resolves.toEqual(withScenario);
   });

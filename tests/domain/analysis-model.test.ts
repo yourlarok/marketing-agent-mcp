@@ -204,13 +204,16 @@ describe("conditional metric scenarios", () => {
       relativeDelta: 1,
       projectedNumerator: 200,
       projectedNumeratorDelta: 150,
-      assumptions: ["denominator_unchanged", "other_conditions_unchanged"],
+      assumptions: ["projected_denominator_fixed_for_projection", "other_conditions_unchanged"],
     });
-    expect(createMetricScenario(baseline, {
+    const sensitivity = createMetricScenario(baseline, {
       label: "conservative",
       targetValue: 0.2,
       projectedDenominator: 1000,
-    }).sensitivity).toMatch(/denominator|conditions/i);
+    }).sensitivity;
+    expect(sensitivity).toMatch(/supplied projected denominator.*fixed.*projection/i);
+    expect(sensitivity).toMatch(/difference between baseline and projected denominators/i);
+    expect(sensitivity).not.toContain("denominator_unchanged");
   });
 
   it("keeps relative change null at a zero baseline", () => {
