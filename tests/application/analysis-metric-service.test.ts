@@ -264,7 +264,7 @@ describe("AnalysisService real metric computation", () => {
     ]));
   });
 
-  it("recommends executable dataset metric actions and advertises only the implemented metric operation", async () => {
+  it("recommends executable dataset metric actions and advertises implemented metric operations", async () => {
     const actions = graph.recommendedActions.filter((action) => action.tool === "metric_compute");
     expect(actions.map((action) => action.arguments?.metricId)).toEqual([
       "ctr_v1",
@@ -290,9 +290,10 @@ describe("AnalysisService real metric computation", () => {
       availability: { state: "available" },
       configuration: expect.arrayContaining(["ctr_v1", "save_like_ratio_v1"]),
     });
-    expect(JSON.stringify(new AnalysisCapabilityService().list())).not.toMatch(
-      /metric_(?:scenario_create|monitor_compare).*available/i,
-    );
+    expect(new AnalysisCapabilityService().list()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ operation: "metric_scenario_create", availability: expect.objectContaining({ state: "available" }) }),
+      expect.objectContaining({ operation: "metric_monitor_compare", availability: expect.objectContaining({ state: "available" }) }),
+    ]));
   });
 
   it("executes ready actions after real CSV ingest with the same numeric results as XLSX", async () => {

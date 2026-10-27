@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   createAnalysisGraph,
+  createMetricScenario as calculateMetricScenario,
   expandAnalysisGraph,
   forkAnalysisGraph,
   type AnalysisGraph,
@@ -32,7 +33,9 @@ import {
 import {
   ANALYSIS_INPUT_MODES,
   type AnalysisCapability,
+  type CompareMetricMonitor,
   type ComputeMetric,
+  type CreateMetricScenario,
   type ExpandAnalysisGraph,
   type ForkAnalysisGraph,
   type GetAnalysisGraph,
@@ -341,6 +344,180 @@ function metricPayload(prepared: PreparedMetric, input: ComputeMetric): Analysis
     qualityLimitations: prepared.qualityLimitations,
     definitionLimitations: [...definition.limitations],
     referenceAssessment: prepared.referenceAssessment,
+  } as unknown as AnalysisPayload;
+}
+
+function requireMetricNode(graph: AnalysisGraph, nodeId: string): AnalysisGraphNode {
+  const node = graph.nodes.find((candidate) => candidate.id === nodeId);
+  if (!node) {
+    throw new DomainError("NOT_FOUND", "Metric node not found in analysis graph", false, {
+      id: graph.id,
+      nodeId,
+    });
+  }
+  if (node.kind !== "metric") invalid("Referenced analysis node must be a Metric node");
+  return node;
+}
+
+function metricComputationFromNode(node: AnalysisGraphNode): MetricComputation {
+  const payload = node.payload;
+  const definition = getMetricDefinition(payload.metricId as ComputeMetric["metricId"]);
+  if (payload.definitionVersion !== definition.version ||
+      payload.formula !== definition.formula || payload.unit !== definition.unit ||
+      (payload.status !== "ok" && payload.status !== "unknown")) {
+    conflict("Metric node has an invalid definition or status");
+  }
+  for (const field of ["numerator", "denominator", "value"] as const) {
+    const value = payload[field];
+    if (value !== null && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
+      conflict(`Metric node ${field} must be a finite non-negative number or null`);
+    }
+  }
+  if (payload.status === "ok" &&
+      [payload.numerator, payload.denominator, payload.value].some((value) => value === null)) {
+    conflict("An ok Metric node must contain numerator, denominator, and value");
+  }
+  if (payload.status === "unknown" && payload.value !== null) {
+    conflict("An unknown Metric node must have a null value");
+  }
+  for (const field of ["totalRowCount", "includedRowCount", "excludedRowCount"] as const) {
+    const value = payload[field];
+    if (!Number.isSafeInteger(value) || (value as number) < 0) {
+      conflict(`Metric node ${field} must be a non-negative integer`);
+    }
+  }
+  return { ...payload } as unknown as MetricComputation;
+}
+
+function metricReferenceFromNode(node: AnalysisGraphNode): ReferenceAssessment {
+  const reference = node.payload.referenceAssessment;
+  if (reference === null || typeof reference !== "object" || Array.isArray(reference) ||
+      !["high", "medium", "low", "unknown"].includes(String(reference.level)) ||
+      !Array.isArray(reference.reasons) || reference.reasons.some((reason) =>
+        reason === null || typeof reason !== "object" || Array.isArray(reason) ||
+        typeof reason.code !== "string" || typeof reason.message !== "string")) {
+    conflict("Metric node must contain a valid reference assessment");
+  }
+  return reference as unknown as ReferenceAssessment;
+}
+
+function derivedNodeId(kind: "scenario" | "monitor", identity: unknown): string {
+  return `${kind}-${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}`;
+}
+
+function metricFollowupActions(
+  graphId: string,
+  workspaceId: string,
+  graphVersion: number,
+  metricNodeId: string,
+): AnalysisRecommendedAction[] {
+  return [
+    {
+      tool: "metric_scenario_create",
+      description: "Create a conditional arithmetic scenario for this metric; this is not a performance guarantee.",
+      arguments: { id: graphId, workspaceId, expectedVersion: graphVersion, metricNodeId },
+      status: "requires_input",
+      missingInputs: ["label", "targetValue", "projectedDenominator"],
+    },
+    {
+      tool: "metric_monitor_compare",
+      description: "Recompute the same definition from a new verified snapshot and compare it with this baseline.",
+      arguments: { id: graphId, workspaceId, expectedVersion: graphVersion, baselineMetricNodeId: metricNodeId },
+      status: "requires_input",
+      missingInputs: ["batchId", "datasetId", "evidenceId", "assetId"],
+    },
+  ];
+}
+
+function nullableDelta(current: number | null, baseline: number | null): number | null {
+  if (current === null || baseline === null) return null;
+  const delta = current - baseline;
+  if (!Number.isFinite(delta)) invalid("Monitor arithmetic must remain finite");
+  return delta;
+}
+
+function monitorPayload(
+  baselineNode: AnalysisGraphNode,
+  prepared: PreparedMetric,
+  input: CompareMetricMonitor,
+): AnalysisPayload {
+  const baseline = metricComputationFromNode(baselineNode);
+  const baselineReference = metricReferenceFromNode(baselineNode);
+  const current = prepared.computation;
+  const currentPayload = metricPayload(prepared, {
+    ...input,
+    metricId: baseline.metricId,
+  });
+  const baselineUnknown = baseline.status === "unknown" || baseline.value === null;
+  const currentUnknown = current.status === "unknown" || current.value === null;
+  const comparisonUnknownReason = baselineUnknown && currentUnknown
+    ? "UNKNOWN_BASELINE_AND_CURRENT"
+    : baselineUnknown ? "UNKNOWN_BASELINE" : currentUnknown ? "UNKNOWN_CURRENT" : null;
+  const absoluteDelta = comparisonUnknownReason === null
+    ? nullableDelta(current.value, baseline.value)
+    : null;
+  const zeroBaseline = comparisonUnknownReason === null && baseline.value === 0;
+  const relativeDelta = comparisonUnknownReason !== null || zeroBaseline
+    ? null
+    : absoluteDelta! / baseline.value!;
+  if (relativeDelta !== null && !Number.isFinite(relativeDelta)) {
+    invalid("Monitor arithmetic must remain finite");
+  }
+  const baselineReasons = new Set(baselineReference.reasons.map((reason) => reason.code));
+  const currentReasons = new Set(prepared.referenceAssessment.reasons.map((reason) => reason.code));
+  const definition = getMetricDefinition(baseline.metricId);
+  return {
+    metricId: baseline.metricId,
+    definitionVersion: baseline.definitionVersion,
+    formula: baseline.formula,
+    unit: baseline.unit,
+    status: comparisonUnknownReason === null ? "ok" : "unknown",
+    baselineMetricNodeId: baselineNode.id,
+    scenarioNodeId: input.scenarioNodeId ?? null,
+    baseline: {
+      value: baseline.value,
+      numerator: baseline.numerator,
+      denominator: baseline.denominator,
+      referenceAssessment: baselineReference,
+      sample: {
+        totalRowCount: baseline.totalRowCount,
+        includedRowCount: baseline.includedRowCount,
+        excludedRowCount: baseline.excludedRowCount,
+      },
+    },
+    current: currentPayload,
+    absoluteDelta,
+    relativeDelta,
+    comparisonUnknownReason,
+    relativeDeltaUnknownReason: comparisonUnknownReason ?? (zeroBaseline ? "ZERO_BASELINE" : null),
+    referenceChange: {
+      baselineLevel: baselineReference.level,
+      currentLevel: prepared.referenceAssessment.level,
+      levelChanged: baselineReference.level !== prepared.referenceAssessment.level,
+      reasonCodesAdded: [...currentReasons].filter((code) => !baselineReasons.has(code)),
+      reasonCodesRemoved: [...baselineReasons].filter((code) => !currentReasons.has(code)),
+    },
+    sampleChange: {
+      numeratorDelta: nullableDelta(current.numerator, baseline.numerator),
+      denominatorDelta: nullableDelta(current.denominator, baseline.denominator),
+      totalRowCountDelta: current.totalRowCount - baseline.totalRowCount,
+      includedRowCountDelta: current.includedRowCount - baseline.includedRowCount,
+      excludedRowCountDelta: current.excludedRowCount - baseline.excludedRowCount,
+      baselineMinimumDenominatorMet: baseline.denominator !== null &&
+        baseline.denominator >= definition.monitoring.minimumDenominator,
+      currentMinimumDenominatorMet: current.denominator !== null &&
+        current.denominator >= definition.monitoring.minimumDenominator,
+    },
+    monitoring: {
+      requiredFields: [...definition.monitoring.requiredFields],
+      minimumDenominator: definition.monitoring.minimumDenominator,
+      guardrails: [...definition.monitoring.guardrails],
+      reviewConditions: [...definition.monitoring.reviewConditions],
+      scheduling: "not_provided",
+    },
+    limitations: [
+      "Observed before-and-after arithmetic only; it does not explain the change or predict commercial outcomes.",
+    ],
   } as unknown as AnalysisPayload;
 }
 
@@ -691,7 +868,15 @@ export class AnalysisService {
             args.assetId !== current.assetId || args.batchId !== current.batchId;
         });
         const recommendedActions = rebindGraphActions(
-          remainingActions,
+          [
+            ...remainingActions,
+            ...metricFollowupActions(
+              current.id,
+              current.workspaceId,
+              current.expectedVersion + 1,
+              nodeId,
+            ),
+          ],
           current.id,
           current.expectedVersion + 1,
         );
@@ -714,6 +899,158 @@ export class AnalysisService {
       },
     }, async () => {
       prepared = await readMetric(this.store, this.artifacts!, input);
+    });
+  }
+
+  createMetricScenario(command: Command<CreateMetricScenario>): Promise<AnalysisGraph> {
+    const input = command.input;
+    assertExpectedVersion(input.expectedVersion);
+    assertNonEmptyString(input.metricNodeId, "metricNodeId");
+    return this.commands.execute({
+      workspaceId: input.workspaceId,
+      action: "analysis_graph.create_metric_scenario",
+      entityType: "analysis_graph",
+      input,
+      context: command.context,
+      write: async (repos, current, timestamp) => {
+        const graph = await requireGraph(repos, current.id, current.workspaceId);
+        if (graph.version !== current.expectedVersion) {
+          throw new DomainError("CONFLICT", "Analysis graph version does not match expectedVersion");
+        }
+        const metricNode = requireMetricNode(graph, current.metricNodeId);
+        const scenario = calculateMetricScenario(metricComputationFromNode(metricNode), current);
+        const nodeId = derivedNodeId("scenario", [
+          current.id,
+          current.metricNodeId,
+          current.targetValue,
+          current.projectedDenominator,
+          current.label,
+        ]);
+        const remainingActions = graph.recommendedActions.filter((action) =>
+          action.tool !== "metric_scenario_create" ||
+          action.arguments?.metricNodeId !== current.metricNodeId);
+        const expanded = expandAnalysisGraph(graph, {
+          expectedVersion: current.expectedVersion,
+          updatedAt: timestamp,
+          nodes: [{
+            id: nodeId,
+            kind: "scenario",
+            payload: { ...scenario, metricNodeId: metricNode.id },
+          }],
+          edges: [{
+            id: `scenario-edge-${nodeId.slice("scenario-".length)}`,
+            fromNodeId: metricNode.id,
+            toNodeId: nodeId,
+          }],
+          recommendedActions: rebindGraphActions(
+            remainingActions,
+            graph.id,
+            graph.version + 1,
+          ),
+        });
+        return repos.analysisGraphs.update(expanded, current.expectedVersion);
+      },
+    });
+  }
+
+  compareMetricMonitor(command: Command<CompareMetricMonitor>): Promise<AnalysisGraph> {
+    const input = command.input;
+    assertExpectedVersion(input.expectedVersion);
+    assertNonEmptyString(input.baselineMetricNodeId, "baselineMetricNodeId");
+    if (input.scenarioNodeId !== undefined) {
+      assertNonEmptyString(input.scenarioNodeId, "scenarioNodeId");
+    }
+    for (const field of ["batchId", "datasetId", "evidenceId", "assetId"] as const) {
+      assertNonEmptyString(input[field], field);
+    }
+    if (!this.artifacts) {
+      throw new Error("ArtifactStore is required for metric monitoring");
+    }
+    let prepared: PreparedMetric | undefined;
+    let baselineMetricId: ComputeMetric["metricId"] | undefined;
+    return this.commands.executeBatch({
+      workspaceId: input.workspaceId,
+      action: "analysis_graph.compare_metric_monitor",
+      entityType: "analysis_graph",
+      input,
+      context: command.context,
+      write: async (repos, current, timestamp) => {
+        if (!prepared || !baselineMetricId) {
+          conflict("Metric monitor preparation did not complete");
+        }
+        const descriptors = await loadMetricDescriptors(repos, {
+          ...current,
+          metricId: baselineMetricId,
+        });
+        assertCurrentMetricDescriptors(descriptors, prepared.descriptors);
+        const baselineNode = requireMetricNode(descriptors.graph, current.baselineMetricNodeId);
+        const baseline = metricComputationFromNode(baselineNode);
+        if (baseline.metricId !== baselineMetricId) {
+          conflict("Baseline metric changed while current evidence was being read");
+        }
+        const nodeId = derivedNodeId("monitor", [
+          current.id,
+          current.baselineMetricNodeId,
+          current.batchId,
+          current.datasetId,
+          current.evidenceId,
+          current.assetId,
+          current.scenarioNodeId ?? null,
+          current.comparability ?? null,
+        ]);
+        const edges = [{
+          id: `monitor-edge-baseline-${nodeId.slice("monitor-".length)}`,
+          fromNodeId: baselineNode.id,
+          toNodeId: nodeId,
+        }];
+        if (current.scenarioNodeId !== undefined) {
+          const scenario = descriptors.graph.nodes.find((node) => node.id === current.scenarioNodeId);
+          if (!scenario) {
+            throw new DomainError("NOT_FOUND", "Scenario node not found in analysis graph", false, {
+              id: current.id,
+              nodeId: current.scenarioNodeId,
+            });
+          }
+          if (scenario.kind !== "scenario") {
+            invalid("scenarioNodeId must reference a Scenario node");
+          }
+          if (scenario.payload.metricNodeId !== baselineNode.id) {
+            invalid("Scenario and monitor must reference the same baseline Metric node");
+          }
+        }
+        if (current.scenarioNodeId !== undefined) {
+          edges.push({
+            id: `monitor-edge-scenario-${nodeId.slice("monitor-".length)}`,
+            fromNodeId: current.scenarioNodeId,
+            toNodeId: nodeId,
+          });
+        }
+        const expanded = expandAnalysisGraph(descriptors.graph, {
+          expectedVersion: current.expectedVersion,
+          updatedAt: timestamp,
+          nodes: [{
+            id: nodeId,
+            kind: "monitor",
+            payload: monitorPayload(baselineNode, prepared, current),
+          }],
+          edges,
+          recommendedActions: rebindGraphActions(
+            descriptors.graph.recommendedActions,
+            current.id,
+            current.expectedVersion + 1,
+          ),
+        });
+        return repos.analysisGraphs.update(expanded, current.expectedVersion);
+      },
+    }, async () => {
+      const graph = await this.store.transaction((repos) =>
+        requireGraph(repos, input.id, input.workspaceId));
+      const baselineNode = requireMetricNode(graph, input.baselineMetricNodeId);
+      baselineMetricId = metricComputationFromNode(baselineNode).metricId;
+      prepared = await readMetric(this.store, this.artifacts!, {
+        ...input,
+        metricId: baselineMetricId,
+      });
     });
   }
 
@@ -836,7 +1173,25 @@ export class AnalysisCapabilityService {
         requiredInputs: ["id", "workspaceId", "expectedVersion", "batchId", "datasetId", "evidenceId", "assetId", "metricId", "actor", "requestId", "idempotencyKey"],
         configuration: ["ctr_v1", "save_like_ratio_v1", "ArtifactStore with content-addressed normalized_jsonl and quality_report assets"],
         availability: { state: "available", detail: "Reads verified artifacts outside SQLite write transactions and rechecks entity versions before commit." },
-        limitations: ["Only the controlled formulas are implemented.", "A zero denominator returns unknown.", "No scenario, monitor, scheduled comparison, or MCP registration is provided by this service."],
+        limitations: ["Only the controlled formulas are implemented.", "A zero denominator returns unknown.", "No MCP registration is provided by this service."],
+      }),
+      capability({
+        id: "metric.scenario",
+        operation: "metric_scenario_create",
+        description: "Create a labeled conditional scenario from a Metric node in the same analysis graph.",
+        requiredInputs: ["id", "workspaceId", "expectedVersion", "metricNodeId", "targetValue", "projectedDenominator", "label", "actor", "requestId", "idempotencyKey"],
+        configuration: ["conservative, base, or optimistic label", "Finite non-negative target and projected denominator"],
+        availability: { state: "available", detail: "Returns conditional absolute, relative, and projected numerator arithmetic." },
+        limitations: ["A zero baseline has null relative change.", "Unknown baselines remain unknown.", "No causal or commercial-outcome promise is made."],
+      }),
+      capability({
+        id: "metric.monitor",
+        operation: "metric_monitor_compare",
+        description: "Recompute the baseline definition from a new same-batch verified snapshot and compare value, reference, and sample changes.",
+        requiredInputs: ["id", "workspaceId", "expectedVersion", "baselineMetricNodeId", "batchId", "datasetId", "evidenceId", "assetId", "actor", "requestId", "idempotencyKey"],
+        configuration: ["Optional same-graph scenarioNodeId", "Catalog required fields, minimumDenominator, guardrails, and reviewConditions are returned"],
+        availability: { state: "available", detail: "Runs one explicit comparison; automatic scheduling is not provided." },
+        limitations: ["Unknown baseline or current values keep deltas unknown.", "Observed changes do not establish causality.", "No scheduler or recurring monitor is created."],
       }),
       capability({
         id: "host.search",

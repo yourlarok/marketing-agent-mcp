@@ -2,6 +2,7 @@ import type {
   AnalysisGraphEdge,
   AnalysisGraphNode,
   AnalysisRecommendedAction,
+  ScenarioLabel,
 } from "../domain/analysis-model.js";
 import type { MetricId, ReferenceComparability } from "../domain/metric-catalog.js";
 import type { IngestContentLinks, IngestTemporaryApi } from "./data-research-commands.js";
@@ -54,6 +55,29 @@ export interface ComputeMetric {
   evidenceId: string;
   assetId: string;
   metricId: MetricId;
+  comparability?: ReferenceComparability;
+}
+
+export interface CreateMetricScenario {
+  id: string;
+  workspaceId: string;
+  expectedVersion: number;
+  metricNodeId: string;
+  targetValue: number;
+  projectedDenominator: number;
+  label: ScenarioLabel;
+}
+
+export interface CompareMetricMonitor {
+  id: string;
+  workspaceId: string;
+  expectedVersion: number;
+  baselineMetricNodeId: string;
+  batchId: string;
+  datasetId: string;
+  evidenceId: string;
+  assetId: string;
+  scenarioNodeId?: string;
   comparability?: ReferenceComparability;
 }
 

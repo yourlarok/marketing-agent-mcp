@@ -268,7 +268,7 @@ export function createMetricScenario(
     projectedNumerator: null,
     projectedNumeratorDelta: null,
     assumptions: ["denominator_unchanged", "other_conditions_unchanged"],
-    sensitivity: "Conditional arithmetic only; changes in the projected denominator or other conditions change the result and do not guarantee uplift.",
+    sensitivity: "Conditional arithmetic only; changes in the projected denominator or other conditions change the result and do not promise improvement.",
   };
   if (baseline.status === "unknown" || baseline.value === null ||
       baseline.numerator === null || baseline.denominator === null) {
