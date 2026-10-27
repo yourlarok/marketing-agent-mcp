@@ -447,6 +447,104 @@ export const evidenceAssetGetInputSchema = z.strictObject({
   assetId: idSchema,
 });
 
+const analysisComparabilitySchema = z.enum(["not_assessed", "comparable", "not_comparable"]);
+const analysisPayloadSchema = z
+  .record(z.string().max(MAX_KEY_LENGTH), jsonValueSchema)
+  .superRefine(checkObjectKeys);
+const analysisNodeSchema = z.strictObject({
+  id: idSchema,
+  kind: z.enum(["question", "research", "dataset", "metric", "scenario", "monitor", "decision"]),
+  payload: analysisPayloadSchema,
+});
+const analysisEdgeSchema = z.strictObject({
+  id: idSchema,
+  fromNodeId: idSchema,
+  toNodeId: idSchema,
+});
+const analysisRecommendedActionSchema = z.strictObject({
+  tool: z.string().trim().min(1).max(1_024),
+  description: z.string().trim().min(1).max(8_192),
+  arguments: analysisPayloadSchema.optional(),
+  status: z.enum(["ready", "requires_input"]).optional(),
+  missingInputs: z.array(z.string().trim().min(1).max(1_024)).max(MAX_COLLECTION_ENTRIES).optional(),
+});
+const analysisContentLinksSchema = z.array(z.strictObject({
+  url: z.string().trim().min(1).max(4_096),
+  fields: z.record(z.string().max(MAX_KEY_LENGTH), z.string().min(1).max(1_000)).optional(),
+})).min(1).max(100);
+
+export const analysisStartInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  objective: z.string().trim().min(1).max(MAX_SERIALIZED_INPUT_BYTES),
+  channel: z.string().trim().min(1).max(1_024).optional(),
+  inputMode: z.enum(["none", "links", "dataset", "api"]).optional(),
+  referenceId: idSchema.optional(),
+  links: analysisContentLinksSchema.optional(),
+  url: z.string().trim().min(1).max(4_096).optional(),
+  ownership: z.enum(["owned", "authorized"]).optional(),
+  expiresAt: utcTimestampSchema.optional(),
+  credentialRef: z.string().trim().min(1).max(1_024).optional(),
+  ...commandContextInput,
+});
+export const marketingCapabilityListInputSchema = z.strictObject({});
+export const analysisGraphGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+});
+export const analysisGraphExpandInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  nodes: z.array(analysisNodeSchema).max(MAX_COLLECTION_ENTRIES),
+  edges: z.array(analysisEdgeSchema).max(MAX_COLLECTION_ENTRIES),
+  recommendedActions: z.array(analysisRecommendedActionSchema).max(MAX_COLLECTION_ENTRIES).optional(),
+  ...commandContextInput,
+});
+export const analysisGraphForkInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  parentGraphId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  forkNodeId: idSchema,
+  ...commandContextInput,
+});
+export const metricComputeInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  batchId: idSchema,
+  datasetId: idSchema,
+  evidenceId: idSchema,
+  assetId: idSchema,
+  metricId: z.enum(["ctr_v1", "save_like_ratio_v1"]),
+  comparability: analysisComparabilitySchema.optional(),
+  ...commandContextInput,
+});
+export const metricScenarioCreateInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  metricNodeId: idSchema,
+  targetValue: z.number().finite().nonnegative(),
+  projectedDenominator: z.number().finite().nonnegative(),
+  label: z.enum(["conservative", "base", "optimistic"]),
+  ...commandContextInput,
+});
+export const metricMonitorCompareInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  baselineMetricNodeId: idSchema,
+  batchId: idSchema,
+  datasetId: idSchema,
+  evidenceId: idSchema,
+  assetId: idSchema,
+  scenarioNodeId: idSchema.optional(),
+  comparability: analysisComparabilitySchema.optional(),
+  ...commandContextInput,
+});
+
 const rawStringSchema = z.string();
 const rawNumberSchema = z.number();
 const rawCommandContextInput = {
@@ -454,6 +552,99 @@ const rawCommandContextInput = {
   requestId: rawStringSchema,
   idempotencyKey: rawStringSchema,
 };
+const rawAnalysisNodeSchema = z.strictObject({
+  id: rawStringSchema,
+  kind: rawStringSchema,
+  payload: z.record(z.string(), z.unknown()),
+});
+const rawAnalysisEdgeSchema = z.strictObject({
+  id: rawStringSchema,
+  fromNodeId: rawStringSchema,
+  toNodeId: rawStringSchema,
+});
+const rawAnalysisRecommendedActionSchema = z.strictObject({
+  tool: rawStringSchema,
+  description: rawStringSchema,
+  arguments: z.record(z.string(), z.unknown()).optional(),
+  status: rawStringSchema.optional(),
+  missingInputs: z.array(rawStringSchema).optional(),
+});
+const rawAnalysisContentLinksSchema = z.array(z.strictObject({
+  url: rawStringSchema,
+  fields: z.record(z.string(), rawStringSchema).optional(),
+}));
+
+export const analysisStartToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  objective: rawStringSchema,
+  channel: rawStringSchema.optional(),
+  inputMode: rawStringSchema.optional(),
+  referenceId: rawStringSchema.optional(),
+  links: rawAnalysisContentLinksSchema.optional(),
+  url: rawStringSchema.optional(),
+  ownership: rawStringSchema.optional(),
+  expiresAt: rawStringSchema.optional(),
+  credentialRef: rawStringSchema.optional(),
+  ...rawCommandContextInput,
+});
+export const marketingCapabilityListToolSchema = z.strictObject({});
+export const analysisGraphGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+});
+export const analysisGraphExpandToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  nodes: z.array(rawAnalysisNodeSchema),
+  edges: z.array(rawAnalysisEdgeSchema),
+  recommendedActions: z.array(rawAnalysisRecommendedActionSchema).optional(),
+  ...rawCommandContextInput,
+});
+export const analysisGraphForkToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  parentGraphId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  forkNodeId: rawStringSchema,
+  ...rawCommandContextInput,
+});
+export const metricComputeToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  batchId: rawStringSchema,
+  datasetId: rawStringSchema,
+  evidenceId: rawStringSchema,
+  assetId: rawStringSchema,
+  metricId: rawStringSchema,
+  comparability: rawStringSchema.optional(),
+  ...rawCommandContextInput,
+});
+export const metricScenarioCreateToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  metricNodeId: rawStringSchema,
+  targetValue: rawNumberSchema,
+  projectedDenominator: rawNumberSchema,
+  label: rawStringSchema,
+  ...rawCommandContextInput,
+});
+export const metricMonitorCompareToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  baselineMetricNodeId: rawStringSchema,
+  batchId: rawStringSchema,
+  datasetId: rawStringSchema,
+  evidenceId: rawStringSchema,
+  assetId: rawStringSchema,
+  scenarioNodeId: rawStringSchema.optional(),
+  comparability: rawStringSchema.optional(),
+  ...rawCommandContextInput,
+});
 const rawFreshnessSchema = z.strictObject({
   observedAt: rawStringSchema.optional(),
   evaluatedAt: rawStringSchema.optional(),

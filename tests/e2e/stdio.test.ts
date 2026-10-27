@@ -68,6 +68,9 @@ describe("built stdio server acceptance", () => {
     const { client } = firstProcess;
 
     expect((await client.listTools()).tools.map((tool) => tool.name).sort()).toEqual([
+      "analysis_graph_expand",
+      "analysis_graph_fork",
+      "analysis_graph_get",
       "capability_health_record",
       "capability_list",
       "capability_register",
@@ -84,6 +87,11 @@ describe("built stdio server acceptance", () => {
       "ingest_files",
       "ingest_temporary_api",
       "lineage_get",
+      "marketing_analysis_start",
+      "marketing_capability_list",
+      "metric_compute",
+      "metric_monitor_compare",
+      "metric_scenario_create",
       "recommendation_create",
       "research_permission_set",
       "research_session_create",
@@ -363,7 +371,7 @@ describe("built stdio server acceptance", () => {
     expect(malformed).toMatchObject({ isError: true });
     expect(JSON.stringify(malformed)).toContain("Input validation error");
     expect(JSON.stringify(malformed)).not.toContain("stack");
-    expect((await client.listTools()).tools).toHaveLength(24);
+    expect((await client.listTools()).tools).toHaveLength(32);
 
     await firstProcess.client.close();
     clients.splice(clients.indexOf(firstProcess.client), 1);

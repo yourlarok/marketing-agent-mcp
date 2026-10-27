@@ -1,8 +1,10 @@
 import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { AnalysisService } from "./application/analysis-service.js";
 import { DataResearchService } from "./application/data-research-service.js";
 import { MarketingService } from "./application/marketing-service.js";
 import { loadConfig } from "./config.js";
+import { ArtifactStore } from "./infrastructure/artifact-store.js";
 import { openStore } from "./infrastructure/sqlite-store.js";
 import {
   SystemClock,
@@ -17,8 +19,10 @@ async function run(): Promise<void> {
     const clock = new SystemClock();
     const ids = new SystemIdGenerator();
     const service = new MarketingService(store, clock, ids);
-    const dataResearch = new DataResearchService(store, clock, ids);
-    const server = createMcpServer(service, dataResearch);
+    const artifacts = new ArtifactStore(join(config.dataDir, "artifacts"));
+    const dataResearch = new DataResearchService(store, clock, ids, artifacts);
+    const analysis = new AnalysisService(store, clock, ids, artifacts);
+    const server = createMcpServer(service, dataResearch, analysis);
     const transport = new StdioServerTransport();
     let shutdown: Promise<void> | undefined;
 
