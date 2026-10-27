@@ -1,4 +1,4 @@
-import type { SourceOwnership } from "./model.js";
+import { SOURCE_OWNERSHIPS, type SourceOwnership } from "./model.js";
 import { DomainError } from "./errors.js";
 
 export const METRIC_IDS = ["ctr_v1", "save_like_ratio_v1"] as const;
@@ -193,11 +193,10 @@ export interface ReferenceAssessmentInput {
 }
 
 export function getMetricDefinition(metricId: MetricId): MetricDefinition {
-  const definition = METRIC_CATALOG[metricId];
-  if (definition === undefined) {
+  if (!Object.hasOwn(METRIC_CATALOG, metricId)) {
     throw new DomainError("INVALID_INPUT", `Unknown controlled metric: ${String(metricId)}`);
   }
-  return definition;
+  return METRIC_CATALOG[metricId];
 }
 
 export function compensatedSum(values: readonly number[]): number {
@@ -289,7 +288,19 @@ export function assessMetricReference(
   input: ReferenceAssessmentInput,
 ): ReferenceAssessment {
   const definition = getMetricDefinition(metricId);
-  const comparability = input.comparability ?? "not_assessed";
+  if (computation.metricId !== metricId) {
+    throw new DomainError("INVALID_INPUT", "Metric computation and requested definition must match");
+  }
+  if (!SOURCE_OWNERSHIPS.includes(input.ownership)) {
+    throw new DomainError("INVALID_INPUT", `Invalid source ownership: ${String(input.ownership)}`);
+  }
+  if (typeof input.stale !== "boolean") {
+    throw new DomainError("INVALID_INPUT", "Reference stale must be a boolean");
+  }
+  const comparability = input.comparability === undefined ? "not_assessed" : input.comparability;
+  if (!(["not_assessed", "comparable", "not_comparable"] as const).includes(comparability)) {
+    throw new DomainError("INVALID_INPUT", `Invalid comparability: ${String(comparability)}`);
+  }
   const reasons: ReferenceReason[] = [];
   const addReason = (code: ReferenceReasonCode): void => {
     reasons.push({ code, message: REFERENCE_REASON_MESSAGES[code] });

@@ -118,7 +118,7 @@ export function validateAnalysisGraph(graph: AnalysisGraph): void {
     if (!nodeIds.has(edge.fromNodeId) || !nodeIds.has(edge.toNodeId)) {
       throw new DomainError("INVALID_INPUT", `Edge has an orphan node reference: ${edge.id}`);
     }
-    const relationship = `${edge.fromNodeId}\u0000${edge.toNodeId}`;
+    const relationship = JSON.stringify([edge.fromNodeId, edge.toNodeId]);
     if (relationships.has(relationship)) {
       throw new DomainError("INVALID_INPUT", "Duplicate directed node relationship");
     }
@@ -275,13 +275,15 @@ export function createMetricScenario(
 
   const projectedNumerator = input.targetValue * input.projectedDenominator;
   const absoluteDelta = input.targetValue - baseline.value;
+  const relativeDelta = baseline.value === 0 ? null : absoluteDelta / baseline.value;
   const projectedNumeratorDelta = projectedNumerator - baseline.numerator;
-  if (![projectedNumerator, absoluteDelta, projectedNumeratorDelta].every(Number.isFinite)) {
+  if (![projectedNumerator, absoluteDelta, projectedNumeratorDelta].every(Number.isFinite) ||
+      (relativeDelta !== null && !Number.isFinite(relativeDelta))) {
     throw new DomainError("INVALID_INPUT", "Scenario arithmetic must remain finite");
   }
   scenario.status = "ok";
   scenario.absoluteDelta = absoluteDelta;
-  scenario.relativeDelta = baseline.value === 0 ? null : absoluteDelta / baseline.value;
+  scenario.relativeDelta = relativeDelta;
   scenario.relativeDeltaUnknownReason = baseline.value === 0 ? "ZERO_BASELINE" : null;
   scenario.projectedNumerator = projectedNumerator;
   scenario.projectedNumeratorDelta = projectedNumeratorDelta;

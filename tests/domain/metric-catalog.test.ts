@@ -45,6 +45,20 @@ describe("controlled metric catalog", () => {
     );
   });
 
+  it.each(["toString", "constructor", "__proto__"])(
+    "rejects inherited catalog property %s in lookup and computation",
+    (metricId) => {
+      for (const operation of [
+        () => getMetricDefinition(metricId as never),
+        () => computeMetric(metricId as never, []),
+      ]) {
+        expect(operation).toThrowError(
+          expect.objectContaining<Partial<DomainError>>({ code: "INVALID_INPUT" }),
+        );
+      }
+    },
+  );
+
   it("states deterministic reference thresholds and downgrade order", () => {
     expect(REFERENCE_ASSESSMENT_RUBRIC).toMatchObject({
       unknownWhen: ["NO_VALID_ROWS", "ZERO_DENOMINATOR", "NON_FINITE_TOTAL"],
@@ -197,6 +211,27 @@ describe("deterministic reference assessment", () => {
         excludedRowCount: 0,
       });
     }
+  });
+
+  it.each([
+    ["ownership", { ownership: "untrusted", stale: false, comparability: "comparable" }],
+    ["comparability", { ownership: "owned", stale: false, comparability: "similar" }],
+    ["null comparability", { ownership: "owned", stale: false, comparability: null }],
+    ["string stale", { ownership: "owned", stale: "false", comparability: "comparable" }],
+    ["numeric stale", { ownership: "owned", stale: 0, comparability: "comparable" }],
+  ])("rejects invalid runtime reference input: %s", (_name, input) => {
+    expect(() => assessMetricReference("ctr_v1", calculated, input as never)).toThrowError(
+      expect.objectContaining<Partial<DomainError>>({ code: "INVALID_INPUT" }),
+    );
+  });
+
+  it("rejects a computation whose metric ID differs from the requested definition", () => {
+    const mismatched = computeMetric("save_like_ratio_v1", [{ saves: 10, likes: 100 }]);
+    expect(() => assessMetricReference("ctr_v1", mismatched, {
+      ownership: "owned",
+      stale: false,
+      comparability: "comparable",
+    })).toThrowError(expect.objectContaining<Partial<DomainError>>({ code: "INVALID_INPUT" }));
   });
 
   it("marks comparability not_assessed by default and caps otherwise high data at medium", () => {

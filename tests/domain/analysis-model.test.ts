@@ -97,6 +97,26 @@ describe("analysis graph", () => {
     } as AnalysisGraph)).toThrowError(expect.objectContaining<Partial<DomainError>>({ code: "INVALID_INPUT" }));
   });
 
+  it("does not collide distinct edge tuples when IDs contain NUL characters", () => {
+    const graphWithNulIds = createAnalysisGraph({
+      id: "graph-nul",
+      workspaceId: "workspace-1",
+      createdAt: "2026-10-27T00:00:00.000Z",
+      nodes: [
+        { id: "a", kind: "question", payload: {} },
+        { id: "b\u0000c", kind: "research", payload: {} },
+        { id: "a\u0000b", kind: "dataset", payload: {} },
+        { id: "c", kind: "metric", payload: {} },
+      ],
+      edges: [
+        { id: "edge-1", fromNodeId: "a", toNodeId: "b\u0000c" },
+        { id: "edge-2", fromNodeId: "a\u0000b", toNodeId: "c" },
+      ],
+    });
+
+    expect(graphWithNulIds.edges).toHaveLength(2);
+  });
+
   it("expands atomically after any existing node and enforces expected version", () => {
     const original = graph();
     const expanded = expandAnalysisGraph(original, {
@@ -210,6 +230,16 @@ describe("conditional metric scenarios", () => {
       projectedNumeratorDelta: 10,
     });
     expect(Number.isFinite(scenario.absoluteDelta)).toBe(true);
+  });
+
+  it("rejects non-finite relative change from a tiny non-zero baseline", () => {
+    const tiny = computeMetric("ctr_v1", [{ clicks: Number.MIN_VALUE, impressions: 1 }]);
+    expect(tiny.value).toBe(Number.MIN_VALUE);
+    expect(() => createMetricScenario(tiny, {
+      label: "base",
+      targetValue: 1,
+      projectedDenominator: 1,
+    })).toThrowError(expect.objectContaining<Partial<DomainError>>({ code: "INVALID_INPUT" }));
   });
 
   it("preserves unknown baselines and rejects invalid targets and denominators", () => {

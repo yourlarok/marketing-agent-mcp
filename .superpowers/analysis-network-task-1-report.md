@@ -95,3 +95,41 @@ npm run build && npm test
 - high 仍只表示数据可参考度，不表示营销结论的因果强度。
 - 本任务不读取真实 artifact、不补 Dataset/Evidence 血缘、不持久化 MetricValue，也不做 monitor compare；这些属于后续 Task 4/5。
 - 图的 ID 生成、workspace 隔离、审计和幂等由后续应用/持久化层负责；领域层只校验并保留稳定 ID。
+
+## 独立复核 findings 修复
+
+### 回归 RED（原修复提交 `d25800a` 的实现）
+
+先只修改两个领域测试文件，新增 11 个回归用例，然后运行：
+
+```sh
+npx vitest run tests/domain/analysis-model.test.ts tests/domain/metric-catalog.test.ts
+```
+
+真实结果：exit 1，`Test Files 2 failed (2)`，`Tests 11 failed | 27 passed (38)`。四组问题均复现：
+
+- Important 1：`toString`、`constructor`、`__proto__` 在 get/compute 中共 3 个参数化测试失败；旧索引读取会继承 Object prototype。
+- Important 2：非法 ownership、非法/null comparability、string/number stale 共 5 个参数化测试失败，computation.metricId 与请求 metricId 不一致也有 1 个测试失败；旧实现可能错误给出 high。
+- Important 3：`Number.MIN_VALUE` 非零基线使 relativeDelta=Infinity，但旧实现未抛错，1 个测试失败。
+- Minor 4：两个不同边元组经 NUL 拼接得到相同键，合法图被误报重复，1 个测试失败。
+
+### 最小修复
+
+- `getMetricDefinition` 先以 `Object.hasOwn(METRIC_CATALOG, metricId)` 验证受控 own property，再读取定义；compute/assess 继续统一经过此入口。
+- `assessMetricReference` 运行时校验 computation.metricId 一致、ownership 属于 SOURCE_OWNERSHIPS、stale 为 boolean、comparability 属于三个受控状态；只有 undefined comparability 使用 not_assessed 默认值，非法值均 DomainError INVALID_INPUT。
+- `createMetricScenario` 先计算 relativeDelta，并把它与其他算术结果一起纳入 Number.isFinite 检查；非有限相对变化明确 INVALID_INPUT。0 基线仍返回 relativeDelta=null 和 ZERO_BASELINE。
+- 边关系键改为 `JSON.stringify([fromNodeId, toNodeId])`，避免分隔符碰撞，同时保留真正的重复有向关系校验。
+
+### 修复 GREEN 与完整验收
+
+同一聚焦命令真实结果：exit 0，`Test Files 2 passed (2)`，`Tests 38 passed (38)`；analysis-model 13 项、metric-catalog 25 项，包含原 27 项和新增 11 项。
+
+```sh
+npm run typecheck
+npm run build && npm test
+git diff --check
+```
+
+真实结果：typecheck/build 均 exit 0；完整测试 exit 0，`Test Files 16 passed (16)`，`Tests 413 passed (413)`；diff check 无错误。新增测试使完整总数由 402 增至 413。
+
+修复作为独立本地提交交付，主题：`fix: harden analysis domain runtime validation`。复核遗留的未跟踪 `.superpowers/analysis-network-task-1.diff` 未读取、未修改、未提交。
