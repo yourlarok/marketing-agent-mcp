@@ -8,6 +8,7 @@ import { parse } from "csv-parse";
 import ExcelJS from "exceljs";
 import { SaxesParser } from "saxes";
 import unzipper from "unzipper";
+import type { ConnectorSnapshot } from "../domain/connector-model.js";
 
 export interface IngestLimits {
   maxFileBytes?: number;
@@ -44,7 +45,7 @@ export interface ParsedDatasetField {
 export interface ParsedSourceMetadata {
   path: string;
   fileName: string;
-  format: "csv" | "xlsx";
+  format: "csv" | "xlsx" | "sqlite";
   sizeBytes: number;
   sheetName?: string;
 }
@@ -424,6 +425,44 @@ export async function ingestCsvSnapshot(
     snapshot,
   );
   return { original: snapshot, datasets: [dataset] };
+}
+
+export function ingestConnectorSnapshot(snapshot: ConnectorSnapshot): IngestedFile {
+  const databaseId = snapshot.sourceDescriptor.databaseId;
+  const table = snapshot.sourceDescriptor.table;
+  if (typeof databaseId !== "string" || typeof table !== "string") {
+    throw new Error("Connector snapshot source descriptor is incomplete");
+  }
+  const original = Buffer.from(JSON.stringify(snapshot));
+  const baseName = basename(databaseId);
+  const fileName = extname(baseName) ? baseName : `${baseName}.sqlite`;
+  let rowCount = 0;
+  let jsonlBytes = 0;
+  const accumulator = new DatasetAccumulator(
+    {
+      path: `sqlite://${databaseId}`,
+      fileName,
+      format: "sqlite",
+      sizeBytes: original.length,
+      sheetName: table,
+    },
+    { ...DEFAULT_INGEST_LIMITS },
+    () => {
+      if (rowCount >= DEFAULT_INGEST_LIMITS.maxRows) throw new Error("Import exceeds 100000 rows");
+      rowCount += 1;
+    },
+    (bytes) => {
+      if (jsonlBytes + bytes > MAX_BATCH_JSONL_BYTES) {
+        throw new Error("Batch exceeds 100 MiB normalized JSONL limit");
+      }
+      jsonlBytes += bytes;
+    },
+  );
+  accumulator.setHeaders(snapshot.schema.map((column) => column.name));
+  snapshot.rows.forEach((row, index) => {
+    accumulator.addRow(snapshot.schema.map((column) => row[column.name] ?? null), index + 1);
+  });
+  return { original, datasets: [accumulator.finish()] };
 }
 
 function resolveLimits(limits: IngestLimits): Required<IngestLimits> {

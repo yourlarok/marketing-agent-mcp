@@ -26,6 +26,8 @@ import {
   type ResearchScope,
   type ResearchSession,
 } from "../domain/data-research-model.js";
+import { validateStructuredTableQuery } from "../domain/connector-model.js";
+import { assertDatabaseId } from "../domain/contract-validation.js";
 import { DomainError } from "../domain/errors.js";
 import { SOURCE_OWNERSHIPS, type Dataset, type Evidence, type Source } from "../domain/model.js";
 import { AcquisitionRouter, type AcquisitionProvider, type AcquiredPage } from "../infrastructure/acquisition-router.js";
@@ -39,12 +41,14 @@ import { ArtifactStore, type StoredArtifact } from "../infrastructure/artifact-s
 import {
   DEFAULT_INGEST_LIMITS,
   MAX_BATCH_JSONL_BYTES,
+  ingestConnectorSnapshot,
   ingestCsvSnapshot,
   ingestFileWithOriginal,
   type IngestLimits,
   type ParsedDataset,
 } from "../infrastructure/file-ingestor.js";
 import { SafeHttpClient } from "../infrastructure/safe-http.js";
+import { SqliteConnector } from "../infrastructure/sqlite-connector.js";
 import {
   AuditableCommandPipeline,
   type Command,
@@ -61,6 +65,7 @@ import type {
   EvidenceAssetQuery,
   ImportFiles,
   IngestContentLinks,
+  IngestSqlite,
   IngestTemporaryApi,
   ReconcileDataRequestPlan,
   RunResearch,
@@ -69,6 +74,7 @@ import type {
 import type {
   Clock,
   IdGenerator,
+  JsonValue,
   Repositories,
   Store,
 } from "./ports.js";
@@ -223,9 +229,12 @@ interface PreparedFile {
   source: ParsedDataset["source"];
   original: StoredArtifact;
   datasets: PreparedDataset[];
-  artifactKind?: "original" | "api_response";
+  artifactKind?: "original" | "api_response" | "snapshot";
   ownership?: Source["ownership"];
   responseFormat?: "json" | "csv";
+  sourceType?: Source["type"];
+  observedAt?: string;
+  metadata?: Readonly<Record<string, JsonValue>>;
 }
 
 interface PreparedLink {
@@ -335,6 +344,8 @@ export class DataResearchService {
     private readonly artifacts: ArtifactStore = new ArtifactStore(),
     private readonly http: Pick<SafeHttpClient, "get"> = new SafeHttpClient(),
     private readonly acquisition: AcquisitionProvider = AcquisitionRouter.fromEnvironment(),
+    private readonly sqlite: Pick<SqliteConnector, "discover" | "snapshot"> =
+      new SqliteConnector(process.env.MARKETING_DATABASE_ROOT, clock),
   ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
@@ -951,6 +962,78 @@ export class DataResearchService {
     }, prepare);
   }
 
+  connectorSqliteDiscover(input: { databaseId: string }) {
+    assertDatabaseId(input?.databaseId);
+    return this.sqlite.discover(input.databaseId);
+  }
+
+  async ingestSqlite(command: Command<IngestSqlite>): Promise<IngestionBatch> {
+    const input = command.input;
+    validateStructuredTableQuery(input.query);
+    if (input.ownership !== "owned" && input.ownership !== "authorized") {
+      invalid("ownership must be owned or authorized");
+    }
+    if ((input.planId === undefined) !== (input.expectedPlanVersion === undefined)) {
+      invalid("planId and expectedPlanVersion must be provided together");
+    }
+    if (input.planId !== undefined) {
+      assertNonEmptyString(input.planId, "planId");
+      if (!Number.isInteger(input.expectedPlanVersion) || input.expectedPlanVersion! < 1) {
+        invalid("expectedPlanVersion must be a positive integer");
+      }
+    }
+    if (input.freshness !== undefined &&
+      (input.freshness === null || typeof input.freshness !== "object" || Array.isArray(input.freshness))) {
+      invalid("freshness must be an object");
+    }
+
+    let files: PreparedFile[] = [];
+    const prepare = async (): Promise<void> => {
+      files = [];
+      const snapshot = this.sqlite.snapshot(input.query);
+      const parsed = ingestConnectorSnapshot(snapshot);
+      const first = parsed.datasets[0];
+      if (!first) throw new Error("SQLite snapshot contains no dataset");
+      const original = await this.artifacts.put(parsed.original);
+      const qualityReports = createDataQualityReports(parsed, input.freshness);
+      const datasets: PreparedDataset[] = [];
+      for (let index = 0; index < parsed.datasets.length; index += 1) {
+        const dataset = parsed.datasets[index]!;
+        const qualityReport = qualityReports[index]!;
+        const [normalized, quality] = await Promise.all([
+          this.artifacts.put(Buffer.from(dataset.rowsJsonl)),
+          this.artifacts.put(Buffer.from(JSON.stringify(qualityReport))),
+        ]);
+        datasets.push({ parsed: dataset, normalized, quality, qualityReport });
+      }
+      files = [{
+        source: first.source,
+        original,
+        datasets,
+        artifactKind: "snapshot",
+        ownership: input.ownership,
+        sourceType: "database",
+        observedAt: snapshot.observedAt,
+        metadata: {
+          acquisition: "connector",
+          ...snapshot.sourceDescriptor,
+          queryHash: snapshot.queryHash,
+          observedAt: snapshot.observedAt,
+        },
+      }];
+    };
+
+    return this.commands.executeBatch({
+      workspaceId: input.workspaceId,
+      action: "ingestion_batch.connector_sqlite",
+      entityType: "ingestion_batch",
+      input,
+      context: command.context,
+      write: (repos, _input, timestamp) =>
+        this.writeIngestionBatch(repos, input, files, [], timestamp),
+    }, prepare);
+  }
+
   async ingestContentLinks(command: Command<IngestContentLinks>): Promise<IngestionBatch> {
     const input = command.input;
     if (!Array.isArray(input.links) || input.links.length === 0) {
@@ -1109,10 +1192,11 @@ export class DataResearchService {
         createdAt: timestamp,
         updatedAt: timestamp,
         name: file.source.fileName,
-        type: file.responseFormat ? "api" : "file",
+        type: file.sourceType ?? (file.responseFormat ? "api" : "file"),
         ownership: file.ownership ?? "owned",
         metadata: {
           ...sourceMetadata,
+          ...file.metadata,
           format: file.responseFormat ?? sourceMetadata.format,
           originalContentHash: file.original.contentHash,
           originalByteLength: file.original.byteLength,
@@ -1149,7 +1233,7 @@ export class DataResearchService {
           updatedAt: timestamp,
           sourceId: source.id,
           sourceLocator: `${parsed.source.path}${parsed.source.sheetName ? `#${parsed.source.sheetName}` : ""}`,
-          observedAt: timestamp,
+          observedAt: file.observedAt ?? timestamp,
           summary: `Imported ${dataset.name}`,
           contentHash: prepared.normalized.contentHash,
           classification: source.ownership === "external_public" ? "external_observation" : "owned_operating",

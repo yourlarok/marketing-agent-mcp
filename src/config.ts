@@ -4,6 +4,7 @@ export interface AppConfig {
   dataDir: string;
   artifactDir?: string;
   importRoot?: string;
+  databaseRoot?: string;
   httpAllowlist?: string[];
   httpCredentialAllowlist?: string[];
   contentMcp?: {
@@ -68,6 +69,21 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     }
   }
 
+  const databaseRoot = env.MARKETING_DATABASE_ROOT;
+  if (databaseRoot) {
+    let databaseRootIsDirectory: boolean;
+    try {
+      databaseRootIsDirectory = statSync(databaseRoot).isDirectory();
+    } catch (error) {
+      throw new Error("MARKETING_DATABASE_ROOT must be an existing directory", {
+        cause: error,
+      });
+    }
+    if (!databaseRootIsDirectory) {
+      throw new Error("MARKETING_DATABASE_ROOT must be a directory");
+    }
+  }
+
   const httpAllowlist = parseCommaSeparatedList(env.MARKETING_HTTP_ALLOWLIST);
   const httpCredentialAllowlist = parseCommaSeparatedList(env.MARKETING_HTTP_CREDENTIAL_ALLOWLIST);
   const contentMcpCommand = env.MARKETING_CONTENT_MCP_COMMAND;
@@ -78,6 +94,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     dataDir,
     ...(env.MARKETING_ARTIFACT_DIR ? { artifactDir: env.MARKETING_ARTIFACT_DIR } : {}),
     ...(importRoot ? { importRoot } : {}),
+    ...(databaseRoot ? { databaseRoot } : {}),
     ...(httpAllowlist.length > 0 ? { httpAllowlist } : {}),
     ...(httpCredentialAllowlist.length > 0 ? { httpCredentialAllowlist } : {}),
     ...(contentMcpCommand ? {

@@ -5,6 +5,7 @@ import { DataResearchService } from "./application/data-research-service.js";
 import { MarketingService } from "./application/marketing-service.js";
 import { loadConfig } from "./config.js";
 import { ArtifactStore } from "./infrastructure/artifact-store.js";
+import { SqliteConnector } from "./infrastructure/sqlite-connector.js";
 import { openStore } from "./infrastructure/sqlite-store.js";
 import {
   SystemClock,
@@ -20,7 +21,15 @@ async function run(): Promise<void> {
     const ids = new SystemIdGenerator();
     const service = new MarketingService(store, clock, ids);
     const artifacts = new ArtifactStore(config.artifactDir);
-    const dataResearch = new DataResearchService(store, clock, ids, artifacts);
+    const dataResearch = new DataResearchService(
+      store,
+      clock,
+      ids,
+      artifacts,
+      undefined,
+      undefined,
+      new SqliteConnector(config.databaseRoot, clock),
+    );
     const analysis = new AnalysisService(store, clock, ids, artifacts);
     const server = createMcpServer(service, dataResearch, analysis);
     const transport = new StdioServerTransport();

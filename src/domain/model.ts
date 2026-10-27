@@ -51,6 +51,7 @@ export const ARTIFACT_KINDS = [
   "page_text",
   "screenshot",
   "api_response",
+  "snapshot",
 ] as const;
 export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
 

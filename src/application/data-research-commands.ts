@@ -2,6 +2,7 @@ import type {
   FreshnessAssessment,
   QuestionType,
 } from "../domain/data-preparation.js";
+import type { StructuredTableQuery } from "../domain/connector-model.js";
 import type { EvidenceAsset, SourceOwnership } from "../domain/model.js";
 import type { ResearchExpansion, ResearchLimits, ResearchScope } from "../domain/data-research-model.js";
 import type { IngestLimits, ParsedFileBatch } from "../infrastructure/file-ingestor.js";
@@ -52,6 +53,16 @@ export interface IngestTemporaryApi {
   expiresAt: string;
   credentialRef?: string;
   limits?: IngestLimits;
+  planId?: string;
+  expectedPlanVersion?: number;
+  freshness?: FreshnessAssessment;
+}
+
+export interface IngestSqlite {
+  id: string;
+  workspaceId: string;
+  query: StructuredTableQuery;
+  ownership: "owned" | "authorized";
   planId?: string;
   expectedPlanVersion?: number;
   freshness?: FreshnessAssessment;

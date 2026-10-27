@@ -89,7 +89,7 @@ export interface QualityDataset {
   source: {
     path: string;
     fileName: string;
-    format: "csv" | "xlsx";
+    format: "csv" | "xlsx" | "sqlite";
     sizeBytes: number;
     sheetName?: string;
   };
