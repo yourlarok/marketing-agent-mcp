@@ -8,6 +8,9 @@ import {
   type AnalysisRecommendedAction,
 } from "../domain/analysis-model.js";
 import { DomainError } from "../domain/errors.js";
+import { canonicalAcquisitionUrl } from "../infrastructure/acquisition-policy.js";
+import { credentialEnvironmentVariable } from "../infrastructure/safe-http.js";
+import { assertUtcInstant } from "../infrastructure/sqlite.js";
 import {
   AuditableCommandPipeline,
   type Command,
@@ -107,32 +110,65 @@ async function requireReferences(
   }
 }
 
-function startActions(input: StartAnalysis & { inputMode: NonNullable<StartAnalysis["inputMode"]> }) {
-  const actions: AnalysisRecommendedAction[] = [];
+function startActions(
+  input: StartAnalysis & { inputMode: NonNullable<StartAnalysis["inputMode"]> },
+): AnalysisRecommendedAction[] {
   if (input.inputMode === "none") {
-    actions.push(
+    return [
       {
         tool: "host.web_search",
         description: "Use the host agent's search capability, when available, to gather current public sources; this server does not perform general web search.",
         arguments: { query: `${input.objective}${input.channel ? ` ${input.channel}` : ""}` },
+        status: "ready",
+        missingInputs: [],
       },
       {
         tool: "research_session_create",
-        description: "Alternatively create a scope- and budget-bounded public research session with explicit seed URLs; no research has run yet.",
+        description: "After host search or user input supplies seed URLs and a bounded scope, create a public research session; no research has run yet.",
+        arguments: {
+          id: `${input.id}-research-session`,
+          workspaceId: input.workspaceId,
+          goal: input.objective,
+          expansion: false,
+        },
+        status: "requires_input",
+        missingInputs: ["seeds", "scope"],
       },
-    );
-  } else if (input.inputMode === "links") {
-    actions.push({
+    ];
+  }
+  if (input.inputMode === "links") {
+    return [{
       tool: "ingest_content_links",
       description: "Acquire the supplied public content links through the configured browser acquisition fallback chain.",
-    });
-  } else if (input.inputMode === "api") {
-    actions.push({
+      arguments: {
+        id: `${input.id}-content-ingestion`,
+        workspaceId: input.workspaceId,
+        links: input.links!.map((link) => ({
+          url: link.url,
+          ...(link.fields === undefined ? {} : { fields: { ...link.fields } }),
+        })),
+      },
+      status: "ready",
+      missingInputs: [],
+    }];
+  }
+  if (input.inputMode === "api") {
+    return [{
       tool: "ingest_temporary_api",
       description: "Import an owned or authorized, expiring JSON or CSV API response using a credential reference rather than plaintext credentials.",
-    });
+      arguments: {
+        id: `${input.id}-temporary-api-ingestion`,
+        workspaceId: input.workspaceId,
+        url: input.url!,
+        ownership: input.ownership!,
+        expiresAt: input.expiresAt!,
+        ...(input.credentialRef === undefined ? {} : { credentialRef: input.credentialRef }),
+      },
+      status: "ready",
+      missingInputs: [],
+    }];
   }
-  return actions;
+  return [];
 }
 
 function startGraph(
@@ -160,13 +196,13 @@ function startGraph(
   } : input.inputMode === "api" ? {
     id: `${input.id}-dataset`,
     kind: "dataset",
-    payload: { inputMode: "api", status: "awaiting_import" },
+    payload: { inputMode: "api", status: "ready_to_ingest" },
   } : {
     id: `${input.id}-research`,
     kind: "research",
     payload: {
       mode: input.inputMode === "links" ? "content_links" : "public_research",
-      status: input.inputMode === "links" ? "awaiting_input" : "planned",
+      status: input.inputMode === "links" ? "ready_to_ingest" : "planned",
       researchCompleted: false,
     },
   };
@@ -189,7 +225,7 @@ export class AnalysisService {
 
   constructor(
     private readonly store: Store,
-    clock: Clock,
+    private readonly clock: Clock,
     ids: IdGenerator,
   ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
@@ -210,10 +246,61 @@ export class AnalysisService {
     if (inputMode !== "dataset" && input.referenceId !== undefined) {
       invalid("referenceId is only supported for dataset inputMode");
     }
+
+    let links: StartAnalysis["links"];
+    if (inputMode === "links") {
+      if (!Array.isArray(input.links) || input.links.length === 0 || input.links.length > 100) {
+        invalid("links inputMode requires between 1 and 100 public links");
+      }
+      links = input.links.map((link) => {
+        if (link === null || typeof link !== "object" || Array.isArray(link)) {
+          invalid("links must contain objects with public URLs");
+        }
+        if (link.fields !== undefined &&
+          (link.fields === null || typeof link.fields !== "object" || Array.isArray(link.fields) ||
+            Object.values(link.fields).some((value) => typeof value !== "string" || value.length === 0))) {
+          invalid("link fields must contain non-empty string selectors");
+        }
+        return {
+          url: canonicalAcquisitionUrl(link.url),
+          ...(link.fields === undefined ? {} : { fields: { ...link.fields } }),
+        };
+      });
+    } else if (input.links !== undefined) {
+      invalid("links are only supported for links inputMode");
+    }
+
+    let url: string | undefined;
+    if (inputMode === "api") {
+      if (input.url === undefined || input.ownership === undefined || input.expiresAt === undefined) {
+        invalid("api inputMode requires url, ownership, and expiresAt");
+      }
+      if (input.ownership !== "owned" && input.ownership !== "authorized") {
+        invalid("ownership must be owned or authorized");
+      }
+      assertNonEmptyString(input.expiresAt, "expiresAt");
+      if (input.credentialRef !== undefined) assertNonEmptyString(input.credentialRef, "credentialRef");
+      url = canonicalAcquisitionUrl(input.url);
+      try {
+        assertUtcInstant(input.expiresAt);
+        if (input.credentialRef !== undefined) credentialEnvironmentVariable(input.credentialRef);
+      } catch {
+        invalid("expiresAt must be valid UTC and credentialRef must be an environment reference");
+      }
+      if (Date.parse(input.expiresAt) <= Date.parse(this.clock.now())) {
+        invalid("expiresAt must be in the future");
+      }
+    } else if ([input.url, input.ownership, input.expiresAt, input.credentialRef]
+      .some((value) => value !== undefined)) {
+      invalid("url, ownership, expiresAt, and credentialRef are only supported for api inputMode");
+    }
+
     const normalized = {
       ...input,
       objective: input.objective.trim(),
       ...(input.channel === undefined ? {} : { channel: input.channel.trim() }),
+      ...(links === undefined ? {} : { links }),
+      ...(url === undefined ? {} : { url }),
       inputMode,
     };
 
@@ -324,7 +411,7 @@ export class AnalysisCapabilityService {
         operation: "marketing_analysis_start",
         description: "Create a versioned analysis question and a guidance-only branch for an optional input mode.",
         requiredInputs: ["id", "workspaceId", "objective", "actor", "requestId", "idempotencyKey"],
-        configuration: ["channel (optional)", "inputMode=none|links|dataset|api (default none)", "referenceId for dataset mode"],
+        configuration: ["channel (optional)", "inputMode=none|links|dataset|api (default none)", "referenceId for dataset mode", "links for links mode", "url, ownership, expiresAt, and optional credentialRef for api mode"],
         availability: { state: "available", detail: "Creates graph state only; it does not run research or import data." },
         limitations: ["No business data is required for none mode.", "No metric, scenario, monitor, or research result is produced by start."],
       }),

@@ -3,6 +3,7 @@ import type {
   AnalysisGraphNode,
   AnalysisRecommendedAction,
 } from "../domain/analysis-model.js";
+import type { IngestContentLinks, IngestTemporaryApi } from "./data-research-commands.js";
 
 export const ANALYSIS_INPUT_MODES = ["none", "links", "dataset", "api"] as const;
 export type AnalysisInputMode = (typeof ANALYSIS_INPUT_MODES)[number];
@@ -14,6 +15,11 @@ export interface StartAnalysis {
   channel?: string;
   inputMode?: AnalysisInputMode;
   referenceId?: string;
+  links?: IngestContentLinks["links"];
+  url?: IngestTemporaryApi["url"];
+  ownership?: IngestTemporaryApi["ownership"];
+  expiresAt?: IngestTemporaryApi["expiresAt"];
+  credentialRef?: IngestTemporaryApi["credentialRef"];
 }
 
 export interface GetAnalysisGraph {

@@ -122,6 +122,14 @@ function validateUrl(raw: string): URL {
   return url;
 }
 
+export function credentialEnvironmentVariable(reference: string): string {
+  const match = /^env:([A-Z_][A-Z0-9_]*)$/.exec(reference);
+  if (!match) {
+    throw new SafeHttpError("credentialRef must reference an environment variable");
+  }
+  return match[1]!;
+}
+
 function origin(url: URL): string {
   return url.origin;
 }
@@ -243,11 +251,11 @@ export class SafeHttpClient {
   }
 
   private resolveCredential(reference: string): string {
-    const match = /^env:([A-Z_][A-Z0-9_]*)$/.exec(reference);
-    if (!match || !this.credentialAllowlist.has(match[1]!)) {
+    const environmentVariable = credentialEnvironmentVariable(reference);
+    if (!this.credentialAllowlist.has(environmentVariable)) {
       throw new SafeHttpError("credentialRef must reference an allowed environment variable");
     }
-    const value = this.env[match[1]!];
+    const value = this.env[environmentVariable];
     if (!value || /[\r\n]/.test(value)) {
       throw new SafeHttpError("Temporary API credential environment variable is missing or invalid");
     }

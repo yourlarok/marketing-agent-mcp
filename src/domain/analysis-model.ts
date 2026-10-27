@@ -31,6 +31,8 @@ export interface AnalysisRecommendedAction {
   tool: string;
   description: string;
   arguments?: AnalysisPayload;
+  status?: "ready" | "requires_input";
+  missingInputs?: string[];
 }
 
 export interface AnalysisGraph extends EntityRecord {

@@ -9,6 +9,11 @@ import type { Store } from "../../src/application/ports.js";
 import type { AnalysisGraphNode, AnalysisNodeKind } from "../../src/domain/analysis-model.js";
 import type { DomainError } from "../../src/domain/errors.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
+import {
+  ingestContentLinksInputSchema,
+  ingestTemporaryApiInputSchema,
+  researchSessionCreateInputSchema,
+} from "../../src/mcp/schemas.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
 
 const now = "2026-10-27T12:00:00.000Z";
@@ -122,9 +127,24 @@ describe("AnalysisService with real SQLite", () => {
       "host.web_search",
       "research_session_create",
     ]);
-    expect(graph.recommendedActions[0]!.arguments).toMatchObject({
-      query: expect.stringContaining("AI education"),
+    expect(graph.recommendedActions[0]).toMatchObject({
+      status: "ready",
+      arguments: { query: expect.stringContaining("AI education") },
     });
+    expect(graph.recommendedActions[1]).toMatchObject({
+      status: "requires_input",
+      missingInputs: ["seeds", "scope"],
+      arguments: {
+        id: "graph-none-research-session",
+        workspaceId: "workspace-1",
+        goal: "Understand how to market AI education",
+        expansion: false,
+      },
+    });
+    expect(researchSessionCreateInputSchema.safeParse({
+      ...graph.recommendedActions[1]!.arguments,
+      ...context("wrapped-research"),
+    }).success).toBe(false);
     expect(JSON.stringify(graph)).not.toMatch(/CSV.*required|research.*completed.*true/i);
 
     const questionNodes = graph.nodes.filter((node) => node.kind === "question");
@@ -145,6 +165,15 @@ describe("AnalysisService with real SQLite", () => {
       channel: "short_video",
       inputMode,
       ...(inputMode === "dataset" ? { referenceId: "dataset-1" } : {}),
+      ...(inputMode === "links" ? {
+        links: [{ url: "https://example.com/research", fields: { price: ".price" } }],
+      } : {}),
+      ...(inputMode === "api" ? {
+        url: "https://example.com/metrics.json",
+        ownership: "authorized",
+        expiresAt: "2026-10-27T13:00:00.000Z",
+        credentialRef: "env:TEMPORARY_API_TOKEN",
+      } : {}),
     });
 
     expect(graph.nodes.map((node) => node.kind)).toEqual(kinds);
@@ -156,7 +185,7 @@ describe("AnalysisService with real SQLite", () => {
     if (inputMode === "links") {
       expect(graph.nodes[1]!.payload).toMatchObject({
         mode: "content_links",
-        status: "awaiting_input",
+        status: "ready_to_ingest",
         researchCompleted: false,
       });
     }
@@ -167,14 +196,69 @@ describe("AnalysisService with real SQLite", () => {
       });
     }
     if (inputMode === "api") {
-      expect(graph.nodes[1]!.payload).toMatchObject({ status: "awaiting_import" });
+      expect(graph.nodes[1]!.payload).toMatchObject({ status: "ready_to_ingest" });
     }
     if (tool) {
-      expect(graph.recommendedActions.map((action) => action.tool)).toContain(tool);
+      const action = graph.recommendedActions.find((candidate) => candidate.tool === tool)!;
+      expect(action).toMatchObject({ status: "ready", missingInputs: [] });
+      const argumentsWithContext = { ...action.arguments, ...context(`wrapped-${inputMode}`) };
+      if (inputMode === "links") {
+        expect(ingestContentLinksInputSchema.parse(argumentsWithContext)).toMatchObject({
+          id: "graph-links-content-ingestion",
+          workspaceId: "workspace-1",
+          links: [{ url: "https://example.com/research", fields: { price: ".price" } }],
+        });
+      }
+      if (inputMode === "api") {
+        expect(ingestTemporaryApiInputSchema.parse(argumentsWithContext)).toMatchObject({
+          id: "graph-api-temporary-api-ingestion",
+          workspaceId: "workspace-1",
+          url: "https://example.com/metrics.json",
+          ownership: "authorized",
+          expiresAt: "2026-10-27T13:00:00.000Z",
+          credentialRef: "env:TEMPORARY_API_TOKEN",
+        });
+      }
     } else {
       expect(graph.recommendedActions).toEqual([]);
     }
     expect(graph.recommendedActions.map((action) => action.tool)).not.toContain("metric_compute");
+  });
+
+  it("rejects missing or unsafe links/API inputs before creating a graph", async () => {
+    const cases: [string, Record<string, unknown>][] = [
+      ["links-missing", { inputMode: "links" }],
+      ["links-empty", { inputMode: "links", links: [] }],
+      ["links-not-public", { inputMode: "links", links: [{ url: "file:///etc/passwd" }] }],
+      ["links-userinfo", { inputMode: "links", links: [{ url: "https://user:secret@example.com" }] }],
+      ["api-missing", { inputMode: "api" }],
+      ["api-ownership", {
+        inputMode: "api", url: "https://example.com/data", ownership: "external_public",
+        expiresAt: "2026-10-27T13:00:00.000Z",
+      }],
+      ["api-expired", {
+        inputMode: "api", url: "https://example.com/data", ownership: "owned",
+        expiresAt: "2026-10-27T12:00:00.000Z",
+      }],
+      ["api-time", {
+        inputMode: "api", url: "https://example.com/data", ownership: "owned",
+        expiresAt: "tomorrow",
+      }],
+      ["api-url", {
+        inputMode: "api", url: "file:///etc/passwd", ownership: "owned",
+        expiresAt: "2026-10-27T13:00:00.000Z",
+      }],
+      ["api-plaintext-credential", {
+        inputMode: "api", url: "https://example.com/data", ownership: "owned",
+        expiresAt: "2026-10-27T13:00:00.000Z",
+        credentialRef: "database-secret-must-not-leak",
+      }],
+    ];
+    for (const [id, input] of cases) {
+      await expect(start(id, input)).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+      await expect(service.get({ id, workspaceId: "workspace-1" }))
+        .rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    }
   });
 
   it("requires an existing same-workspace dataset reference for dataset mode", async () => {
