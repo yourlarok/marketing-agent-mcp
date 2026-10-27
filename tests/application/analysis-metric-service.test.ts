@@ -1,3 +1,4 @@
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import ExcelJS from "exceljs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -161,6 +162,24 @@ describe("AnalysisService real metric computation", () => {
     };
   }
 
+  function executeMetricAction(
+    action: AnalysisGraph["recommendedActions"][number],
+    suffix: string,
+  ): Promise<AnalysisGraph> {
+    const input = action.arguments as ComputeMetric & {
+      requestId?: string;
+      idempotencyKey?: string;
+    };
+    return service.computeMetric({
+      input,
+      context: {
+        actor: "agent-1",
+        requestId: input.requestId ?? `request-${suffix}`,
+        idempotencyKey: input.idempotencyKey ?? `command-${suffix}`,
+      },
+    });
+  }
+
   function metricNode(currentGraph: AnalysisGraph) {
     const nodes = currentGraph.nodes.filter((node) => node.kind === "metric");
     expect(nodes.length).toBeGreaterThan(0);
@@ -274,6 +293,117 @@ describe("AnalysisService real metric computation", () => {
     expect(JSON.stringify(new AnalysisCapabilityService().list())).not.toMatch(
       /metric_(?:scenario_create|monitor_compare).*available/i,
     );
+  });
+
+  it("executes ready actions after real CSV ingest with the same numeric results as XLSX", async () => {
+    await writeFile(join(importRoot, "metrics.csv"), [
+      "clicks,impressions,saves,likes",
+      "100,1000,1,10",
+      "2e2,2.0E3,4e0,2e1",
+      "",
+    ].join("\n"));
+    const csvBatch = await ingest.importFiles({
+      input: { id: "batch-csv", workspaceId: "workspace-1", paths: ["metrics.csv"] },
+      context: context("batch-csv"),
+    });
+    const csvGraph = await startGraph(csvBatch);
+    const actions = csvGraph.recommendedActions.filter((action) => action.tool === "metric_compute");
+    expect(actions).toHaveLength(2);
+    expect(actions.every((action) => action.status === "ready")).toBe(true);
+
+    const ctrGraph = await executeMetricAction(actions[0]!, "csv-ctr");
+    expect(metricNode(ctrGraph).payload).toMatchObject({
+      metricId: "ctr_v1",
+      status: "ok",
+      numerator: 300,
+      denominator: 3000,
+      value: 0.1,
+      includedRowCount: 2,
+      excludedRowCount: 0,
+      numericInputNormalization: "strict_decimal_scientific_to_ieee754",
+      precision: "ieee754_compensated_sum",
+    });
+    const saveAction = ctrGraph.recommendedActions.find((action) =>
+      action.tool === "metric_compute" && action.arguments?.metricId === "save_like_ratio_v1")!;
+    const saveGraph = await executeMetricAction(saveAction, "csv-save");
+    expect(metricNode(saveGraph).payload).toMatchObject({
+      metricId: "save_like_ratio_v1",
+      status: "ok",
+      numerator: 5,
+      denominator: 30,
+      value: 1 / 6,
+      includedRowCount: 2,
+      excludedRowCount: 0,
+    });
+  });
+
+  it("keeps ready actions executable after expand advances the graph version", async () => {
+    const expanded = await service.expand({
+      input: {
+        id: graph.id,
+        workspaceId: graph.workspaceId,
+        expectedVersion: graph.version,
+        nodes: [],
+        edges: [],
+      },
+      context: context("expand-before-action"),
+    });
+    const action = expanded.recommendedActions.find((candidate) =>
+      candidate.tool === "metric_compute" && candidate.arguments?.metricId === "ctr_v1")!;
+    expect(action.arguments).toMatchObject({ id: graph.id, expectedVersion: 2 });
+
+    const computed = await executeMetricAction(action, "expanded-action");
+    expect(computed).toMatchObject({ id: graph.id, version: 3 });
+    expect(metricNode(computed).payload).toMatchObject({ metricId: "ctr_v1", value: 0.1 });
+  });
+
+  it("rebinds forked graph actions and executes parent and child without shared replay", async () => {
+    const parent = await service.expand({
+      input: {
+        id: graph.id,
+        workspaceId: graph.workspaceId,
+        expectedVersion: graph.version,
+        nodes: [],
+        edges: [],
+        recommendedActions: graph.recommendedActions.map((action) => ({
+          ...action,
+          arguments: {
+            ...action.arguments,
+            expectedVersion: 2,
+            requestId: `parent-request-${String(action.arguments?.metricId)}`,
+            idempotencyKey: `parent-command-${String(action.arguments?.metricId)}`,
+          },
+        })),
+      },
+      context: context("parent-action-bind"),
+    });
+    const child = await service.fork({
+      input: {
+        id: "forked-metric-graph",
+        workspaceId: parent.workspaceId,
+        parentGraphId: parent.id,
+        expectedVersion: parent.version,
+        forkNodeId: `${parent.id}-dataset`,
+      },
+      context: context("fork-action-bind"),
+    });
+    const parentAction = parent.recommendedActions.find((action) =>
+      action.tool === "metric_compute" && action.arguments?.metricId === "ctr_v1")!;
+    const childAction = child.recommendedActions.find((action) =>
+      action.tool === "metric_compute" && action.arguments?.metricId === "ctr_v1")!;
+    expect(childAction.arguments).toMatchObject({ id: child.id, expectedVersion: 1 });
+    expect(childAction.arguments?.idempotencyKey).not.toBe(parentAction.arguments?.idempotencyKey);
+    expect(childAction.arguments?.requestId).not.toBe(parentAction.arguments?.requestId);
+
+    const parentResult = await executeMetricAction(parentAction, "parent-action");
+    const childResult = await executeMetricAction(childAction, "child-action");
+    expect(parentResult).toMatchObject({ id: parent.id, version: 3 });
+    expect(childResult).toMatchObject({ id: child.id, version: 2 });
+    expect(metricNode(childResult).payload).toMatchObject({ metricId: "ctr_v1", value: 0.1 });
+    await expect(service.get({ id: parent.id, workspaceId: parent.workspaceId }))
+      .resolves.toEqual(parentResult);
+    await expect(service.get({ id: child.id, workspaceId: child.workspaceId }))
+      .resolves.toEqual(childResult);
   });
 
   it("returns unknown rather than zero for a zero denominator", async () => {

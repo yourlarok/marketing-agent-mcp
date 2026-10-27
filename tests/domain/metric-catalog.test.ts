@@ -110,11 +110,11 @@ describe("metric calculation", () => {
 
     expect(result).toMatchObject({
       status: "ok",
-      numerator: 2,
-      denominator: 6,
-      value: 2 / 6,
-      includedRowCount: 2,
-      excludedRowCount: 7,
+      numerator: 3,
+      denominator: 11,
+      value: 3 / 11,
+      includedRowCount: 3,
+      excludedRowCount: 6,
       totalRowCount: 9,
     });
     expect(result.excludedRows).toEqual([
@@ -123,7 +123,6 @@ describe("metric calculation", () => {
       { rowIndex: 3, reasons: ["INVALID_DENOMINATOR"] },
       { rowIndex: 4, reasons: ["INVALID_NUMERATOR"] },
       { rowIndex: 5, reasons: ["INVALID_DENOMINATOR"] },
-      { rowIndex: 6, reasons: ["INVALID_NUMERATOR"] },
       { rowIndex: 7, reasons: ["MISSING_DENOMINATOR"] },
     ]);
   });
@@ -143,6 +142,25 @@ describe("metric calculation", () => {
       rowIndex: 0,
       reasons: ["INVALID_NUMERATOR", "INVALID_DENOMINATOR"],
     }]);
+  });
+
+  it("normalizes only complete decimal or scientific numeric strings with declared IEEE-754 semantics", () => {
+    expect(computeMetric("ctr_v1", [{ clicks: "1e2", impressions: "1.0e3" }])).toMatchObject({
+      status: "ok",
+      numerator: 100,
+      denominator: 1000,
+      value: 0.1,
+      numericInputNormalization: "strict_decimal_scientific_to_ieee754",
+      precision: "ieee754_compensated_sum",
+    });
+    for (const value of ["NaN", "Infinity", "0x64", "100 clicks", " 100", "100 ", "1e400", ""]) {
+      expect(computeMetric("ctr_v1", [{ clicks: value, impressions: 1000 }])).toMatchObject({
+        status: "unknown",
+        includedRowCount: 0,
+        excludedRowCount: 1,
+        numerator: 0,
+      });
+    }
   });
 
   it("returns unknown for empty data and zero denominators, never zero or infinity", () => {

@@ -284,6 +284,42 @@ function metricNodeId(input: ComputeMetric): string {
   return `metric-${createHash("sha256").update(identity).digest("hex")}`;
 }
 
+const GRAPH_SCOPED_ACTION_TOOLS = new Set([
+  "metric_compute",
+  "metric_scenario_create",
+  "metric_monitor_compare",
+]);
+
+function rebindGraphActions(
+  actions: AnalysisRecommendedAction[],
+  graphId: string,
+  graphVersion: number,
+): AnalysisRecommendedAction[] {
+  return actions.map((action) => {
+    if (!GRAPH_SCOPED_ACTION_TOOLS.has(action.tool)) return action;
+    const args = action.arguments ?? {};
+    const rebound: AnalysisPayload = {
+      ...args,
+      id: graphId,
+      expectedVersion: graphVersion,
+    };
+    for (const field of ["graphId", "parentGraphId"] as const) {
+      if (Object.hasOwn(args, field)) rebound[field] = graphId;
+    }
+    if (Object.hasOwn(args, "expectedGraphVersion")) {
+      rebound.expectedGraphVersion = graphVersion;
+    }
+    for (const field of ["requestId", "idempotencyKey"] as const) {
+      const previous = args[field];
+      if (typeof previous === "string") {
+        const identity = JSON.stringify([graphId, graphVersion, field, previous]);
+        rebound[field] = `analysis-${field}-${createHash("sha256").update(identity).digest("hex")}`;
+      }
+    }
+    return { ...action, arguments: rebound };
+  });
+}
+
 function metricPayload(prepared: PreparedMetric, input: ComputeMetric): AnalysisPayload {
   const { descriptors, computation } = prepared;
   const definition = getMetricDefinition(input.metricId);
@@ -648,19 +684,17 @@ export class AnalysisService {
           invalid("The analysis graph must contain the metric dataset node");
         }
         const nodeId = metricNodeId(current);
-        const recommendedActions = descriptors.graph.recommendedActions.flatMap((action) => {
-          if (action.tool !== "metric_compute") return [action];
+        const remainingActions = descriptors.graph.recommendedActions.filter((action) => {
           const args = action.arguments;
-          if (args?.metricId === current.metricId &&
-              args.datasetId === current.datasetId && args.evidenceId === current.evidenceId &&
-              args.assetId === current.assetId && args.batchId === current.batchId) {
-            return [];
-          }
-          return [{
-            ...action,
-            arguments: { ...args, expectedVersion: descriptors.graph.version + 1 },
-          }];
+          return action.tool !== "metric_compute" || args?.metricId !== current.metricId ||
+            args.datasetId !== current.datasetId || args.evidenceId !== current.evidenceId ||
+            args.assetId !== current.assetId || args.batchId !== current.batchId;
         });
+        const recommendedActions = rebindGraphActions(
+          remainingActions,
+          current.id,
+          current.expectedVersion + 1,
+        );
         const expanded = expandAnalysisGraph(descriptors.graph, {
           expectedVersion: current.expectedVersion,
           updatedAt: timestamp,
@@ -705,9 +739,11 @@ export class AnalysisService {
           updatedAt: timestamp,
           nodes: current.nodes,
           edges: current.edges,
-          ...(current.recommendedActions === undefined
-            ? {}
-            : { recommendedActions: current.recommendedActions }),
+          recommendedActions: rebindGraphActions(
+            current.recommendedActions ?? graph.recommendedActions,
+            graph.id,
+            graph.version + 1,
+          ),
         });
         await requireReferences(repos, current.workspaceId, current.nodes);
         return repos.analysisGraphs.update(expanded, current.expectedVersion);
@@ -738,6 +774,7 @@ export class AnalysisService {
           forkNodeId: current.forkNodeId,
           createdAt: timestamp,
         });
+        fork.recommendedActions = rebindGraphActions(fork.recommendedActions, fork.id, fork.version);
         return repos.analysisGraphs.insert(fork);
       },
     });

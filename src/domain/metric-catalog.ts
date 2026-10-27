@@ -152,6 +152,7 @@ export interface MetricComputation {
   value: number | null;
   unknownReason: MetricUnknownReason | null;
   precision: "ieee754_compensated_sum";
+  numericInputNormalization: "strict_decimal_scientific_to_ieee754";
   totalRowCount: number;
   includedRowCount: number;
   excludedRowCount: number;
@@ -212,14 +213,28 @@ export function compensatedSum(values: readonly number[]): number {
   return sum + compensation;
 }
 
-function exclusionReason(value: unknown, field: "NUMERATOR" | "DENOMINATOR"): MetricExclusionReason | null {
+const STRICT_DECIMAL_SCIENTIFIC = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+function normalizedMetricNumber(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  }
+  if (typeof value !== "string" || !STRICT_DECIMAL_SCIENTIFIC.test(value)) {
+    return null;
+  }
+  const normalized = Number(value);
+  return Number.isFinite(normalized) && normalized >= 0 ? normalized : null;
+}
+
+function exclusionReason(
+  value: unknown,
+  normalized: number | null,
+  field: "NUMERATOR" | "DENOMINATOR",
+): MetricExclusionReason | null {
   if (value === undefined || value === null || value === "") {
     return `MISSING_${field}`;
   }
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return `INVALID_${field}`;
-  }
-  return null;
+  return normalized === null ? `INVALID_${field}` : null;
 }
 
 export function computeMetric(metricId: MetricId, rows: readonly MetricRow[]): MetricComputation {
@@ -228,8 +243,12 @@ export function computeMetric(metricId: MetricId, rows: readonly MetricRow[]): M
   const denominators: number[] = [];
   const excludedRows: MetricExcludedRow[] = [];
   rows.forEach((row, rowIndex) => {
-    const numeratorReason = exclusionReason(row[definition.numeratorField], "NUMERATOR");
-    const denominatorReason = exclusionReason(row[definition.denominatorField], "DENOMINATOR");
+    const numeratorValue = row[definition.numeratorField];
+    const denominatorValue = row[definition.denominatorField];
+    const numerator = normalizedMetricNumber(numeratorValue);
+    const denominator = normalizedMetricNumber(denominatorValue);
+    const numeratorReason = exclusionReason(numeratorValue, numerator, "NUMERATOR");
+    const denominatorReason = exclusionReason(denominatorValue, denominator, "DENOMINATOR");
     const reasons = [numeratorReason, denominatorReason].filter(
       (reason): reason is MetricExclusionReason => reason !== null,
     );
@@ -237,8 +256,8 @@ export function computeMetric(metricId: MetricId, rows: readonly MetricRow[]): M
       excludedRows.push({ rowIndex, reasons });
       return;
     }
-    numerators.push(row[definition.numeratorField] as number);
-    denominators.push(row[definition.denominatorField] as number);
+    numerators.push(numerator!);
+    denominators.push(denominator!);
   });
 
   const numeratorTotal = compensatedSum(numerators);
@@ -275,6 +294,7 @@ export function computeMetric(metricId: MetricId, rows: readonly MetricRow[]): M
     value,
     unknownReason,
     precision: definition.precision,
+    numericInputNormalization: "strict_decimal_scientific_to_ieee754",
     totalRowCount: rows.length,
     includedRowCount: numerators.length,
     excludedRowCount: excludedRows.length,
