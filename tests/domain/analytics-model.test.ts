@@ -104,7 +104,7 @@ describe("public deterministic analytics formulas", () => {
   it("aggregates UTC daily windows with compensated sums and explicit missing coverage", () => {
     const result = computeTrendReference(trendOperation, [
       { observedAt: "2026-01-04T12:00:00.000Z", revenue: 4 },
-      { observedAt: "2026-01-01T23:00:00-01:00", revenue: 1e16 },
+      { observedAt: "2026-01-02T00:00:00.000Z", revenue: 1e16 },
       { observedAt: "2026-01-02T01:00:00.000Z", revenue: 1 },
       { observedAt: "2026-01-02T02:00:00.000Z", revenue: 1 },
       { observedAt: "2026-01-02T03:00:00.000Z", revenue: -1e16 },
@@ -232,5 +232,104 @@ describe("public deterministic analytics formulas", () => {
       { observedAt: "2026-01-01T00:00:00.000Z", revenue: 1e308 },
       { observedAt: "2026-01-01T01:00:00.000Z", revenue: 1e308 },
     ]));
+  });
+});
+
+describe("analytics review regressions", () => {
+  it.each([
+    "2026-02-30T00:00:00.000Z",
+    "2025-02-29T00:00:00.000Z",
+    "2026-13-01T00:00:00.000Z",
+    "2026-01-01T24:00:00.000Z",
+    "2026-01-01T00:00:00.000+00:00",
+    "2026-01-01T00:00:00Z",
+  ])("rejects a nonexistent or non-canonical UTC trend instant %s", (observedAt) => {
+    expectInvalid(() => computeTrendReference(trendOperation, [{ observedAt, revenue: 1 }]));
+  });
+
+  it("rejects literal __proto__ parameters while allowing null-prototype records", () => {
+    expectInvalid(() => validateAnalyticsOperation({
+      ...trendOperation,
+      parameters: {
+        timeField: "observedAt",
+        valueField: "revenue",
+        grain: "day",
+        __proto__: { polluted: true },
+      },
+    }));
+    const parameters = Object.assign(Object.create(null) as Record<string, unknown>, {
+      timeField: "observedAt",
+      valueField: "revenue",
+      grain: "day",
+    });
+    expect(() => validateAnalyticsOperation({ ...trendOperation, parameters })).not.toThrow();
+  });
+
+  it("rejects trend unknown status accompanied by computed result fields", () => {
+    const unknown = computeTrendReference(trendOperation, []);
+    expect(() => validateAnalyticsResult(unknown)).not.toThrow();
+    for (const result of [
+      { ...unknown, points: [{ window: "2026-01-01", value: 1, rowCount: 1 }] },
+      { ...unknown, missingWindows: ["2026-01-01"] },
+      { ...unknown, coverage: 1 },
+    ]) {
+      expectInvalid(() => validateAnalyticsResult(result));
+    }
+    const valid = computeTrendReference(trendOperation, [
+      { observedAt: "2026-01-01T00:00:00.000Z", revenue: 1 },
+    ]);
+    expectInvalid(() => validateAnalyticsResult({ ...valid, points: [] }));
+  });
+
+  it("enforces funnel value and unknownReason mutual exclusion at stage and overall levels", () => {
+    const valid = computeFunnelReference(funnelOperation, [
+      { impressions: 10, clicks: 5, conversions: 1 },
+    ]);
+    const zero = computeFunnelReference(funnelOperation, [
+      { impressions: 0, clicks: 5, conversions: 1 },
+    ]);
+    expect(() => validateAnalyticsResult(valid)).not.toThrow();
+    expect(() => validateAnalyticsResult(zero)).not.toThrow();
+    for (const result of [
+      { ...valid, overallUnknownReason: "ZERO_DENOMINATOR" },
+      { ...zero, overallUnknownReason: null },
+      {
+        ...valid,
+        stages: valid.stages.map((stage, index) => index === 1
+          ? { ...stage, conversionUnknownReason: "ZERO_DENOMINATOR" }
+          : stage),
+      },
+      {
+        ...zero,
+        stages: zero.stages.map((stage, index) => index === 1
+          ? { ...stage, conversionUnknownReason: null }
+          : stage),
+      },
+    ]) {
+      expectInvalid(() => validateAnalyticsResult(result));
+    }
+  });
+
+  it("enforces anomaly status, unknown reason, statistics, threshold, and anomalies consistency", () => {
+    const valid = computeAnomalyReference(anomalyOperation, [9, 10, 11, 12, 100]);
+    const insufficient = computeAnomalyReference(anomalyOperation, [1, 2]);
+    const zeroMad = computeAnomalyReference(anomalyOperation, [1, 1, 1]);
+    for (const result of [valid, insufficient, zeroMad]) {
+      expect(() => validateAnalyticsResult(result)).not.toThrow();
+    }
+    const anomaly = { index: 0, value: 1, modifiedZScore: 4 };
+    for (const result of [
+      { ...valid, threshold: null },
+      { ...valid, median: null },
+      { ...valid, mad: 0 },
+      { ...insufficient, threshold: 1 },
+      { ...insufficient, anomalies: [anomaly] },
+      { ...insufficient, median: 1.5, mad: 0.5 },
+      { ...zeroMad, threshold: 1 },
+      { ...zeroMad, anomalies: [anomaly] },
+      { ...zeroMad, mad: 1 },
+    ]) {
+      expectInvalid(() => validateAnalyticsResult(result));
+    }
   });
 });

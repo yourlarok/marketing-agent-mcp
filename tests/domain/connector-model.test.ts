@@ -183,3 +183,29 @@ describe("connector snapshot runtime contract", () => {
     }
   });
 });
+
+describe("connector review regressions", () => {
+  it.each([
+    "2026-02-30T00:00:00.000Z",
+    "2025-02-29T00:00:00.000Z",
+    "2026-13-01T00:00:00.000Z",
+    "2026-01-01T24:00:00.000Z",
+    "2026-01-01T00:00:00.000+00:00",
+    "2026-01-01T00:00:00Z",
+  ])("rejects a nonexistent or non-canonical snapshot UTC instant %s", (observedAt) => {
+    expectInvalid(() => validateConnectorSnapshot({ ...snapshot(), observedAt }));
+  });
+
+  it("rejects literal __proto__ filters and rows while allowing null-prototype filters", () => {
+    expectInvalid(() => validateStructuredTableQuery({
+      ...query(),
+      filters: { __proto__: { polluted: true } },
+    }));
+    const filters = Object.assign(Object.create(null) as Record<string, unknown>, { channel: "owned" });
+    expect(() => validateStructuredTableQuery({ ...query(), filters })).not.toThrow();
+    expectInvalid(() => validateConnectorSnapshot({
+      ...snapshot(),
+      rows: [{ day: "2026-10-27", clicks: 1, conversions: 2, __proto__: { polluted: true } }],
+    }));
+  });
+});

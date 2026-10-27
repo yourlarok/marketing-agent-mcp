@@ -6,6 +6,7 @@ import {
   assertNonEmptyStringArray,
   assertRecord,
   assertStableId,
+  assertUtcInstant,
   invalid,
 } from "./contract-validation.js";
 import { SOURCE_OWNERSHIPS, type SourceOwnership } from "./model.js";
@@ -146,9 +147,7 @@ export function validateStructuredTableQuery(value: unknown): asserts value is S
 }
 
 function assertObservedAt(value: unknown): asserts value is string {
-  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
-    invalid("Snapshot observedAt must be a valid timestamp");
-  }
+  assertUtcInstant(value, "Snapshot observedAt");
 }
 
 export function validateConnectorSnapshot(value: unknown): asserts value is ConnectorSnapshot {

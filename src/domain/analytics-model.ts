@@ -2,6 +2,7 @@ import {
   assertIdentifier,
   assertRecord,
   assertStableId,
+  assertUtcInstant,
   invalid,
 } from "./contract-validation.js";
 import { compensatedSum } from "./metric-catalog.js";
@@ -194,6 +195,13 @@ function validateTrendResult(value: Record<string, unknown>): void {
   for (const window of value.missingWindows) assertWindow(window, "Trend missing window");
   assertFiniteNumber(value.coverage, "Trend coverage");
   if (value.coverage < 0 || value.coverage > 1) invalid("Trend coverage must be between zero and one");
+  if (value.status === "unknown") {
+    if (value.points.length !== 0 || value.missingWindows.length !== 0 || value.coverage !== 0) {
+      invalid("Unknown trend results must not contain computed points, missing windows, or coverage");
+    }
+  } else if (value.points.length === 0 || value.coverage === 0) {
+    invalid("Successful trend results require points and positive coverage");
+  }
 }
 
 function validateFunnelResult(value: Record<string, unknown>): void {
@@ -207,7 +215,7 @@ function validateFunnelResult(value: Record<string, unknown>): void {
   ]);
   if (value.status !== "ok") invalid("Invalid funnel status");
   if (!Array.isArray(value.stages) || value.stages.length < 2) invalid("Funnel stages must be an array");
-  for (const stage of value.stages) {
+  for (const [index, stage] of value.stages.entries()) {
     assertRecord(stage, "Funnel stage", [
       "field",
       "total",
@@ -222,14 +230,21 @@ function validateFunnelResult(value: Record<string, unknown>): void {
     if (stage.conversionUnknownReason !== null && stage.conversionUnknownReason !== "ZERO_DENOMINATOR") {
       invalid("Invalid funnel conversion unknownReason");
     }
-    if ((stage.conversionFromPrevious === null) !== (stage.conversionUnknownReason === "ZERO_DENOMINATOR") &&
-        stage.conversionFromPrevious !== null) {
+    if (index === 0) {
+      if (stage.conversionFromPrevious !== null || stage.conversionUnknownReason !== null) {
+        invalid("The first funnel stage must not have a previous-stage conversion");
+      }
+    } else if ((stage.conversionFromPrevious === null) !==
+        (stage.conversionUnknownReason === "ZERO_DENOMINATOR")) {
       invalid("Funnel conversion and unknownReason are inconsistent");
     }
   }
   if (value.overallConversion !== null) assertFiniteNumber(value.overallConversion, "Funnel overallConversion", true);
   if (value.overallUnknownReason !== null && value.overallUnknownReason !== "ZERO_DENOMINATOR") {
     invalid("Invalid funnel overallUnknownReason");
+  }
+  if ((value.overallConversion === null) !== (value.overallUnknownReason === "ZERO_DENOMINATOR")) {
+    invalid("Funnel overallConversion and overallUnknownReason are inconsistent");
   }
 }
 
@@ -263,6 +278,21 @@ function validateAnomalyResult(value: Record<string, unknown>): void {
     assertFiniteNumber(anomaly.value, "Anomaly value");
     assertFiniteNumber(anomaly.modifiedZScore, "Anomaly modifiedZScore");
   }
+  if (value.status === "unknown") {
+    if (value.threshold !== null || value.anomalies.length !== 0) {
+      invalid("Unknown anomaly results must not contain a threshold or anomalies");
+    }
+    if (value.unknownReason === "INSUFFICIENT_SAMPLES" &&
+        (value.median !== null || value.mad !== null)) {
+      invalid("Insufficient anomaly samples must not contain median or MAD");
+    }
+    if (value.unknownReason === "ZERO_MAD" && (value.median === null || value.mad !== 0)) {
+      invalid("Zero-MAD anomaly results require a median and zero MAD");
+    }
+  } else if (value.median === null || value.mad === null || value.mad <= 0 ||
+      value.threshold === null || value.threshold <= 0) {
+    invalid("Successful anomaly results require median, positive MAD, and a positive threshold");
+  }
 }
 
 export function validateAnalyticsResult(value: unknown): asserts value is AnalyticsResult {
@@ -293,13 +323,8 @@ function strictFiniteNumber(value: unknown, nonNegative: boolean): number {
 }
 
 function timestamp(value: unknown): number {
-  if (typeof value !== "string" ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
-    invalid("Trend timestamps must be ISO date-times with an explicit UTC offset");
-  }
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) invalid("Trend timestamp is invalid");
-  return parsed;
+  assertUtcInstant(value, "Trend timestamp");
+  return Date.parse(value);
 }
 
 function utcWindow(time: number, grain: "day" | "week"): string {

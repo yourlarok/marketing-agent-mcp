@@ -19,10 +19,25 @@ export function assertRecord(
   allowedKeys?: readonly string[],
 ): asserts value is Record<string, unknown> {
   if (!isRecord(value)) invalid(`${label} must be an object`);
+  const prototype = Object.getPrototypeOf(value) as object | null;
+  if (prototype !== Object.prototype && prototype !== null) {
+    invalid(`${label} must be a plain object`);
+  }
   for (const key of Object.keys(value)) {
     if (FORBIDDEN_KEYS.has(key) || (allowedKeys !== undefined && !allowedKeys.includes(key))) {
       invalid(`${label} contains unsupported key: ${key}`);
     }
+  }
+}
+
+export function assertUtcInstant(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
+    invalid(`${label} must be a canonical UTC instant with millisecond precision`);
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+    invalid(`${label} must be a real calendar date and round-trip as the same UTC instant`);
   }
 }
 
