@@ -12,6 +12,10 @@ import type {
   RegisterDataset,
 } from "../../src/application/commands.js";
 import { DomainError } from "../../src/domain/errors.js";
+import {
+  createAnalysisGraph,
+  forkAnalysisGraph,
+} from "../../src/domain/analysis-model.js";
 import type { ToolHealthEvidence } from "../../src/domain/model.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
 
@@ -1583,6 +1587,81 @@ describe("MarketingService recommendations and tasks", () => {
     await expect(
       brokenService.getLineage({ entityType: "task", id: "task-1", workspaceId: "workspace-1" }),
     ).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+  });
+
+  it("projects analysis graph dataset, evidence, and fork-parent lineage", async () => {
+    await service.registerDataset({
+      input: datasetInput(),
+      context: nextContext(),
+    });
+    const parent = createAnalysisGraph({
+      id: "analysis-parent",
+      workspaceId: "workspace-1",
+      createdAt: firstNow,
+      nodes: [
+        { id: "question-node", kind: "question", payload: { text: "How?" } },
+        { id: "dataset-node", kind: "dataset", payload: { datasetId: "dataset-1" } },
+        {
+          id: "metric-node",
+          kind: "metric",
+          payload: { datasetId: "dataset-1", evidenceId: "evidence-1" },
+        },
+      ],
+      edges: [
+        { id: "edge-1", fromNodeId: "question-node", toNodeId: "dataset-node" },
+        { id: "edge-2", fromNodeId: "dataset-node", toNodeId: "metric-node" },
+      ],
+    });
+    const fork = forkAnalysisGraph(parent, {
+      id: "analysis-fork",
+      forkNodeId: "metric-node",
+      createdAt: secondNow,
+    });
+    await store.transaction(async (repos) => {
+      await repos.analysisGraphs.insert(parent);
+      await repos.analysisGraphs.insert(fork);
+      for (const [id, entityId, requestId] of [
+        ["audit-analysis-parent", parent.id, "analysis-request-parent"],
+        ["audit-analysis-fork", fork.id, "analysis-request-fork"],
+      ] as const) {
+        await repos.audit.append({
+          id,
+          workspaceId: "workspace-1",
+          requestId,
+          actor: "agent-1",
+          action: "analysis_graph.test",
+          entityType: "analysis_graph",
+          entityId,
+          details: {},
+          createdAt: firstNow,
+        });
+      }
+    });
+
+    expect(parent.version).toBe(1);
+    await expect(service.getLineage({
+      entityType: "analysis_graph",
+      id: fork.id,
+      workspaceId: "workspace-1",
+    })).resolves.toEqual({
+      workspaceId: "workspace-1",
+      nodes: [
+        { entityType: "source", id: "source-1", version: 1, auditRequestIds: ["task-request-2"] },
+        { entityType: "dataset", id: "dataset-1", version: 1, auditRequestIds: ["task-request-5"] },
+        { entityType: "evidence", id: "evidence-1", version: 1, auditRequestIds: ["task-request-3"] },
+        { entityType: "analysis_graph", id: parent.id, version: 1, auditRequestIds: ["analysis-request-parent"] },
+        { entityType: "analysis_graph", id: fork.id, version: 1, auditRequestIds: ["analysis-request-fork"] },
+      ],
+      edges: [
+        { from: { entityType: "source", id: "source-1" }, to: { entityType: "dataset", id: "dataset-1" } },
+        { from: { entityType: "source", id: "source-1" }, to: { entityType: "evidence", id: "evidence-1" } },
+        { from: { entityType: "dataset", id: "dataset-1" }, to: { entityType: "analysis_graph", id: parent.id } },
+        { from: { entityType: "dataset", id: "dataset-1" }, to: { entityType: "analysis_graph", id: fork.id } },
+        { from: { entityType: "evidence", id: "evidence-1" }, to: { entityType: "analysis_graph", id: parent.id } },
+        { from: { entityType: "evidence", id: "evidence-1" }, to: { entityType: "analysis_graph", id: fork.id } },
+        { from: { entityType: "analysis_graph", id: parent.id }, to: { entityType: "analysis_graph", id: fork.id } },
+      ],
+    });
   });
 
   it("does not leak lineage across workspaces", async () => {

@@ -38,6 +38,10 @@ const stage1Migration = readFileSync(
   new URL("../../migrations/001_initial.sql", import.meta.url),
   "utf8",
 );
+const stage2Migration = readFileSync(
+  new URL("../../migrations/002_data_research.sql", import.meta.url),
+  "utf8",
+);
 
 function entity(id: string, workspaceId = "workspace-1"): EntityRecord {
   return {
@@ -172,14 +176,25 @@ describe("versioned data-research storage", () => {
     }
   }
 
-  it("upgrades a real stage-1 database once and preserves records on repeat open", async () => {
+  function createStage2Database(): void {
+    createStage1Database();
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec(stage2Migration);
+    } finally {
+      database.close();
+    }
+  }
+
+  it("upgrades a real stage-1 database through 002 and 003 and preserves records on repeat open", async () => {
     createStage1Database();
     const first = open();
     expect(
-      await first.transaction((repos) =>
-        repos.workspaces.get("workspace-1", "workspace-1"),
-      ),
-    ).toEqual(entity("workspace-1", "workspace-1"));
+      await first.transaction(async (repos) => ({
+        workspace: await repos.workspaces.get("workspace-1", "workspace-1"),
+        graph: await repos.analysisGraphs.get("missing", "workspace-1"),
+      })),
+    ).toEqual({ workspace: entity("workspace-1", "workspace-1"), graph: undefined });
     first.close();
 
     const migrationTimes = new DatabaseSync(databasePath);
@@ -191,6 +206,7 @@ describe("versioned data-research storage", () => {
       expect(before).toEqual([
         { version: 1, applied_at: expect.any(String) },
         { version: 2, applied_at: expect.any(String) },
+        { version: 3, applied_at: expect.any(String) },
       ]);
     } finally {
       migrationTimes.close();
@@ -219,7 +235,7 @@ describe("versioned data-research storage", () => {
     const database = new DatabaseSync(databasePath);
     try {
       database
-        .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)")
+        .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)")
         .run(now);
     } finally {
       database.close();
@@ -235,7 +251,7 @@ describe("versioned data-research storage", () => {
       ).toBeUndefined();
       expect(
         after.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
-      ).toEqual([{ version: 1 }, { version: 3 }]);
+      ).toEqual([{ version: 1 }, { version: 4 }]);
     } finally {
       after.close();
     }
@@ -269,6 +285,40 @@ describe("versioned data-research storage", () => {
     const repaired = open();
     await expect(
       repaired.transaction((repos) => repos.dataRequestPlans.get("missing", "workspace-1")),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rolls back a failed 003 upgrade without losing stage-2 records and succeeds after repair", async () => {
+    createStage2Database();
+    const broken = new DatabaseSync(databasePath);
+    try {
+      broken.exec("CREATE TABLE analysis_graph_evidence (broken TEXT)");
+    } finally {
+      broken.close();
+    }
+
+    expect(() => openStore(databasePath)).toThrow();
+    const afterFailure = new DatabaseSync(databasePath);
+    try {
+      expect(
+        afterFailure.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
+      ).toEqual([{ version: 1 }, { version: 2 }]);
+      for (const table of ["analysis_graphs", "analysis_graph_datasets"]) {
+        expect(
+          afterFailure.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(table),
+        ).toBeUndefined();
+      }
+      expect(
+        afterFailure.prepare("SELECT payload FROM workspaces WHERE id = 'workspace-1'").get(),
+      ).toEqual({ payload: JSON.stringify(entity("workspace-1", "workspace-1")) });
+      afterFailure.exec("DROP TABLE analysis_graph_evidence");
+    } finally {
+      afterFailure.close();
+    }
+
+    const repaired = open();
+    await expect(
+      repaired.transaction((repos) => repos.analysisGraphs.get("missing", "workspace-1")),
     ).resolves.toBeUndefined();
   });
 

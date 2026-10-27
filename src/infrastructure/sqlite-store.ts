@@ -1,7 +1,9 @@
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DomainError } from "../domain/errors.js";
+import { validateAnalysisGraph, type AnalysisGraph } from "../domain/analysis-model.js";
 import type {
+  AnalysisGraphRepository,
   AuditRecord,
   AuditRepository,
   CapabilityRepository,
@@ -12,7 +14,12 @@ import type {
   Repositories,
   Store,
 } from "../application/ports.js";
-import { assertUtcInstant, canonicalJson, openDatabase } from "./sqlite.js";
+import {
+  analysisGraphReferenceIds,
+  assertUtcInstant,
+  canonicalJson,
+  openDatabase,
+} from "./sqlite.js";
 
 interface TransactionCoordinator {
   queue: Promise<void>;
@@ -57,8 +64,8 @@ interface ReferenceTable {
 
 interface EntityConfig {
   table: string;
-  referenceColumn?: "source_id" | "evidence_id";
-  referenceKey?: "sourceId" | "evidenceId";
+  referenceColumn?: "source_id" | "evidence_id" | "parent_graph_id";
+  referenceKey?: "sourceId" | "evidenceId" | "parentGraphId";
   references?: ReferenceTable | ReferenceTable[];
 }
 
@@ -157,6 +164,25 @@ const entityConfigs: Record<string, EntityConfig> = {
       targetColumn: "finding_id",
       recordKey: "findingIds",
     },
+  },
+  analysisGraphs: {
+    table: "analysis_graphs",
+    referenceColumn: "parent_graph_id",
+    referenceKey: "parentGraphId",
+    references: [
+      {
+        table: "analysis_graph_datasets",
+        ownerColumn: "graph_id",
+        targetColumn: "dataset_id",
+        recordKey: "datasetIds",
+      },
+      {
+        table: "analysis_graph_evidence",
+        ownerColumn: "graph_id",
+        targetColumn: "evidence_id",
+        recordKey: "evidenceIds",
+      },
+    ],
   },
 };
 
@@ -283,9 +309,13 @@ class SqliteEntityRepository implements EntityRepository {
     return Array.isArray(references) ? references : [references];
   }
 
+  protected referenceIds(record: EntityRecord, recordKey: string): unknown {
+    return record[recordKey] ?? [];
+  }
+
   private insertReferences(record: EntityRecord): void {
     for (const references of this.referenceTables()) {
-      const ids = record[references.recordKey] ?? [];
+      const ids = this.referenceIds(record, references.recordKey);
       if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
         throw new TypeError(`${references.recordKey} must be an array of strings`);
       }
@@ -305,6 +335,25 @@ class SqliteEntityRepository implements EntityRepository {
         .run(record.id);
     }
     this.insertReferences(record);
+  }
+}
+
+class SqliteAnalysisGraphRepository extends SqliteEntityRepository {
+  override async insert(record: EntityRecord): Promise<EntityRecord> {
+    validateAnalysisGraph(record as unknown as AnalysisGraph);
+    return super.insert(record);
+  }
+
+  override async update(record: EntityRecord, expectedVersion: number): Promise<EntityRecord> {
+    validateAnalysisGraph(record as unknown as AnalysisGraph);
+    return super.update(record, expectedVersion);
+  }
+
+  protected override referenceIds(record: EntityRecord, recordKey: string): unknown {
+    if (recordKey === "datasetIds" || recordKey === "evidenceIds") {
+      return analysisGraphReferenceIds(record as unknown as AnalysisGraph)[recordKey];
+    }
+    return super.referenceIds(record, recordKey);
   }
 }
 
@@ -538,7 +587,9 @@ class SqliteStore implements Store {
     const repository = <T extends EntityRecord>(name: string): EntityRepository<T> =>
       (name === "tasks"
         ? new SqliteTaskRepository(this.database, entityConfigs[name]!)
-        : new SqliteEntityRepository(this.database, entityConfigs[name]!)) as unknown as EntityRepository<T>;
+        : name === "analysisGraphs"
+          ? new SqliteAnalysisGraphRepository(this.database, entityConfigs[name]!)
+          : new SqliteEntityRepository(this.database, entityConfigs[name]!)) as unknown as EntityRepository<T>;
     return {
       workspaces: repository("workspaces"),
       sources: repository("sources"),
@@ -552,6 +603,7 @@ class SqliteStore implements Store {
       researchSessions: repository("researchSessions"),
       competitors: repository("competitors"),
       competitorDiffs: repository("competitorDiffs"),
+      analysisGraphs: repository("analysisGraphs") as unknown as AnalysisGraphRepository,
       capabilities: new SqliteCapabilityRepository(
         this.database,
         entityConfigs.capabilities!,

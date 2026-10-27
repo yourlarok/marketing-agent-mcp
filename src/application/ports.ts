@@ -5,6 +5,7 @@ import type {
   IngestionBatch,
   ResearchSession,
 } from "../domain/data-research-model.js";
+import type { AnalysisGraph } from "../domain/analysis-model.js";
 
 export type Id = string;
 export type Instant = string;
@@ -30,6 +31,12 @@ export interface EntityRepository<T extends EntityRecord = EntityRecord> {
   get(id: Id, workspaceId: Id): Promise<T | undefined>;
   insert(record: T): Promise<T>;
   update(record: T, expectedVersion: number): Promise<T>;
+}
+
+export interface AnalysisGraphRepository {
+  get(id: Id, workspaceId: Id): Promise<AnalysisGraph | undefined>;
+  insert(record: AnalysisGraph): Promise<AnalysisGraph>;
+  update(record: AnalysisGraph, expectedVersion: number): Promise<AnalysisGraph>;
 }
 
 export interface CapabilityRepository extends EntityRepository {
@@ -59,7 +66,8 @@ export type LineageEntityType =
   | "ingestion_batch"
   | "research_session"
   | "competitor"
-  | "competitor_diff";
+  | "competitor_diff"
+  | "analysis_graph";
 
 export interface EntityRef {
   entityType: LineageEntityType;
@@ -118,6 +126,7 @@ export interface Repositories {
   researchSessions: EntityRepository<ResearchSession>;
   competitors: EntityRepository<Competitor>;
   competitorDiffs: EntityRepository<CompetitorDiff>;
+  analysisGraphs: AnalysisGraphRepository;
   capabilities: CapabilityRepository;
   audit: AuditRepository;
   idempotency: IdempotencyRepository;

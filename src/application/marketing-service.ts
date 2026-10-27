@@ -1,4 +1,5 @@
 import { DomainError } from "../domain/errors.js";
+import type { AnalysisGraph } from "../domain/analysis-model.js";
 import {
   CAPABILITY_ADAPTER_KINDS,
   CAPABILITY_STATES,
@@ -23,7 +24,7 @@ import {
   assertTaskDependencyGraph,
   assertTaskTransition,
 } from "../domain/task-machine.js";
-import { assertUtcInstant } from "../infrastructure/sqlite.js";
+import { analysisGraphReferenceIds, assertUtcInstant } from "../infrastructure/sqlite.js";
 import {
   AuditableCommandPipeline,
   type Command,
@@ -73,9 +74,32 @@ const lineageEntityTypes: Record<LineageEntityType, keyof Repositories> = {
   research_session: "researchSessions",
   competitor: "competitors",
   competitor_diff: "competitorDiffs",
+  analysis_graph: "analysisGraphs",
 };
 
 function lineageReferences(record: EntityRecord, entityType: LineageEntityType): EntityRef[] {
+  if (entityType === "analysis_graph") {
+    try {
+      const graph = record as unknown as AnalysisGraph;
+      const ids = analysisGraphReferenceIds(graph);
+      const references: EntityRef[] = [
+        ...ids.datasetIds.map((id) => ({ entityType: "dataset" as const, id })),
+        ...ids.evidenceIds.map((id) => ({ entityType: "evidence" as const, id })),
+      ];
+      if (graph.parentGraphId !== null) {
+        if (typeof graph.parentGraphId !== "string" || graph.parentGraphId.trim().length === 0) {
+          throw new TypeError("Invalid parent graph reference");
+        }
+        references.push({ entityType: "analysis_graph", id: graph.parentGraphId });
+      }
+      return references;
+    } catch {
+      throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {
+        entityType,
+        id: record.id,
+      });
+    }
+  }
   if (entityType === "dataset" || entityType === "evidence") {
     if (typeof record.sourceId !== "string") {
       throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {

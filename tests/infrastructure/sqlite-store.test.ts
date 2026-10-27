@@ -9,9 +9,15 @@ import {
   SystemIdGenerator,
 } from "../../src/infrastructure/system.js";
 import type { EntityRecord, Store } from "../../src/application/ports.js";
+import {
+  createAnalysisGraph,
+  expandAnalysisGraph,
+  type AnalysisGraph,
+} from "../../src/domain/analysis-model.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
 
 const now = "2026-10-26T12:30:00.000Z";
+const later = "2026-10-26T12:31:00.000Z";
 
 function entity(id: string, workspaceId = id): EntityRecord {
   return {
@@ -23,6 +29,33 @@ function entity(id: string, workspaceId = id): EntityRecord {
     name: `Entity ${id}`,
     metadata: { z: 1, a: { z: 2, a: 1 } },
   };
+}
+
+function analysisGraph(id = "graph-1", workspaceId = "ws-1"): AnalysisGraph {
+  return createAnalysisGraph({
+    id,
+    workspaceId,
+    createdAt: now,
+    nodes: [
+      { id: "question-node", kind: "question", payload: { text: "How?" } },
+      { id: "dataset-node", kind: "dataset", payload: { datasetId: "dataset-1" } },
+      {
+        id: "research-node",
+        kind: "research",
+        payload: { evidenceIds: ["evidence-2", "evidence-1"] },
+      },
+      {
+        id: "metric-node",
+        kind: "metric",
+        payload: { datasetId: "dataset-1", evidenceId: "evidence-1" },
+      },
+    ],
+    edges: [
+      { id: "edge-1", fromNodeId: "question-node", toNodeId: "dataset-node" },
+      { id: "edge-2", fromNodeId: "dataset-node", toNodeId: "metric-node" },
+    ],
+    recommendedActions: [{ tool: "research", description: "Review evidence" }],
+  });
 }
 
 describe("transactional SQLite storage", () => {
@@ -369,6 +402,127 @@ describe("transactional SQLite storage", () => {
         { dependency_id: "dependency-2", position: 0 },
         { dependency_id: "dependency-1", position: 1 },
       ]);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("persists canonical analysis graphs with optimistic versions across restart", async () => {
+    const first = open();
+    await first.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("ws-1"));
+      await repos.sources.insert(entity("source-1", "ws-1"));
+      await repos.datasets.insert({ ...entity("dataset-1", "ws-1"), sourceId: "source-1" });
+      await repos.evidence.insert({ ...entity("evidence-1", "ws-1"), sourceId: "source-1" });
+      await repos.evidence.insert({ ...entity("evidence-2", "ws-1"), sourceId: "source-1" });
+      await repos.analysisGraphs.insert(analysisGraph());
+    });
+    const expanded = expandAnalysisGraph(analysisGraph(), {
+      expectedVersion: 1,
+      updatedAt: later,
+      nodes: [{ id: "decision-node", kind: "decision", payload: { decision: "continue" } }],
+      edges: [{ id: "edge-3", fromNodeId: "metric-node", toNodeId: "decision-node" }],
+    });
+    await first.transaction((repos) => repos.analysisGraphs.update(expanded, 1));
+    await expect(
+      first.transaction((repos) => repos.analysisGraphs.update(analysisGraph(), 1)),
+    ).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    first.close();
+
+    const second = open();
+    const restored = await second.transaction((repos) =>
+      repos.analysisGraphs.get("graph-1", "ws-1"),
+    );
+    expect(restored).toEqual(expanded);
+    expect(restored?.version).toBe(2);
+    expect(
+      await second.transaction((repos) => repos.analysisGraphs.get("graph-1", "ws-2")),
+    ).toBeUndefined();
+
+    const raw = new DatabaseSync(databasePath);
+    try {
+      const row = raw
+        .prepare("SELECT payload, version FROM analysis_graphs WHERE id = ?")
+        .get("graph-1") as { payload: string; version: number };
+      expect(row).toEqual({ payload: canonicalJson(expanded), version: 2 });
+      expect(
+        raw.prepare(
+          "SELECT dataset_id, position FROM analysis_graph_datasets WHERE graph_id = ? ORDER BY position",
+        ).all("graph-1"),
+      ).toEqual([{ dataset_id: "dataset-1", position: 0 }]);
+      expect(
+        raw.prepare(
+          "SELECT evidence_id, position FROM analysis_graph_evidence WHERE graph_id = ? ORDER BY position",
+        ).all("graph-1"),
+      ).toEqual([
+        { evidence_id: "evidence-2", position: 0 },
+        { evidence_id: "evidence-1", position: 1 },
+      ]);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("enforces analysis graph workspace references and rolls back failed updates", async () => {
+    const store = open();
+    await store.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("ws-1"));
+      await repos.workspaces.insert(entity("ws-2"));
+      await repos.sources.insert(entity("source-1", "ws-1"));
+      await repos.datasets.insert({ ...entity("dataset-1", "ws-1"), sourceId: "source-1" });
+      await repos.evidence.insert({ ...entity("evidence-1", "ws-1"), sourceId: "source-1" });
+      await repos.evidence.insert({ ...entity("evidence-2", "ws-1"), sourceId: "source-1" });
+      await repos.sources.insert(entity("source-other", "ws-2"));
+      await repos.datasets.insert({ ...entity("dataset-other", "ws-2"), sourceId: "source-other" });
+      await repos.evidence.insert({ ...entity("evidence-other", "ws-2"), sourceId: "source-other" });
+      await repos.analysisGraphs.insert(analysisGraph());
+      await repos.analysisGraphs.insert(createAnalysisGraph({
+        id: "parent-other",
+        workspaceId: "ws-2",
+        createdAt: now,
+      }));
+    });
+
+    await expect(
+      store.transaction((repos) => repos.analysisGraphs.insert({
+        ...analysisGraph("cross-dataset"),
+        nodes: [{ id: "dataset-node", kind: "dataset", payload: { datasetId: "dataset-other" } }],
+      })),
+    ).rejects.toThrow();
+    await expect(
+      store.transaction((repos) => repos.analysisGraphs.insert({
+        ...createAnalysisGraph({ id: "cross-parent", workspaceId: "ws-1", createdAt: now }),
+        parentGraphId: "parent-other",
+        parentVersion: 1,
+      })),
+    ).rejects.toThrow();
+
+    const invalidUpdate = expandAnalysisGraph(analysisGraph(), {
+      expectedVersion: 1,
+      updatedAt: later,
+      nodes: [{
+        id: "other-research",
+        kind: "research",
+        payload: { evidenceId: "evidence-other" },
+      }],
+      edges: [],
+    });
+    await expect(
+      store.transaction((repos) => repos.analysisGraphs.update(invalidUpdate, 1)),
+    ).rejects.toThrow();
+
+    expect(
+      await store.transaction((repos) => repos.analysisGraphs.get("graph-1", "ws-1")),
+    ).toEqual(analysisGraph());
+    expect(
+      await store.transaction((repos) => repos.analysisGraphs.get("cross-dataset", "ws-1")),
+    ).toBeUndefined();
+    const raw = new DatabaseSync(databasePath);
+    try {
+      expect(
+        raw.prepare("SELECT COUNT(*) AS count FROM analysis_graph_evidence WHERE evidence_id = ?")
+          .get("evidence-other"),
+      ).toEqual({ count: 0 });
     } finally {
       raw.close();
     }
