@@ -186,13 +186,21 @@ describe("connector snapshot runtime contract", () => {
 
 describe("connector review regressions", () => {
   it.each([
-    "2026-02-30T00:00:00.000Z",
+    "2026-01-01T00:00:00Z",
+    "2026-01-01T00:00:00.1Z",
+    "2026-01-01T00:00:00.123Z",
+    "2026-01-01T00:00:00.123456Z",
+  ])("accepts a real snapshot UTC instant with optional fractional seconds %s", (observedAt) => {
+    expect(() => validateConnectorSnapshot({ ...snapshot(), observedAt })).not.toThrow();
+  });
+
+  it.each([
+    "2026-02-30T00:00:00Z",
     "2025-02-29T00:00:00.000Z",
     "2026-13-01T00:00:00.000Z",
     "2026-01-01T24:00:00.000Z",
     "2026-01-01T00:00:00.000+00:00",
-    "2026-01-01T00:00:00Z",
-  ])("rejects a nonexistent or non-canonical snapshot UTC instant %s", (observedAt) => {
+  ])("rejects a nonexistent or non-UTC snapshot instant %s", (observedAt) => {
     expectInvalid(() => validateConnectorSnapshot({ ...snapshot(), observedAt }));
   });
 

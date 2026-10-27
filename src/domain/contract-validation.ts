@@ -31,12 +31,11 @@ export function assertRecord(
 }
 
 export function assertUtcInstant(value: unknown, label: string): asserts value is string {
-  if (typeof value !== "string" ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
-    invalid(`${label} must be a canonical UTC instant with millisecond precision`);
-  }
+  if (typeof value !== "string") invalid(`${label} must be a UTC ISO-8601 instant`);
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z$/.exec(value);
+  if (!match) invalid(`${label} must use UTC Z with required seconds and optional fractional seconds`);
   const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+  if (!Number.isFinite(parsed) || !new Date(parsed).toISOString().startsWith(match[1]!)) {
     invalid(`${label} must be a real calendar date and round-trip as the same UTC instant`);
   }
 }
