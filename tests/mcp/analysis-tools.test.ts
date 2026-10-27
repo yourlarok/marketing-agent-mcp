@@ -89,7 +89,32 @@ describe("analysis MCP tools and initialization", () => {
     const ids = { next: () => `generated-${++sequence}` };
     const artifacts = new ArtifactStore(join(tempDir, "artifacts"));
     const marketing = new MarketingService(store, clock, ids);
-    const dataResearch = new DataResearchService(store, clock, ids, artifacts);
+    const dataResearch = new DataResearchService(
+      store,
+      clock,
+      ids,
+      artifacts,
+      {
+        get: async (request) => ({
+          body: Buffer.from('[{"clicks":1,"impressions":10}]'),
+          contentType: "application/json",
+          finalUrl: request.url,
+        }),
+      },
+      {
+        acquire: async (request) => ({
+          url: request.url,
+          finalUrl: request.url,
+          title: "Public page",
+          text: "Public observation",
+          fields: request.fields ?? {},
+          links: [],
+          screenshot: Buffer.from("screenshot"),
+          provider: "playwright",
+          toolVersion: "fixture-1",
+        }),
+      },
+    );
     const analysis = new AnalysisService(store, clock, ids, artifacts);
     await marketing.createWorkspace({
       input: { id: "workspace-1", name: "Analysis" },
@@ -170,6 +195,9 @@ describe("analysis MCP tools and initialization", () => {
       "host.web_search",
       "research_session_create",
     ]);
+    expect(started.recommendedActions[0]!.arguments).toEqual({
+      query: "Understand how AI education can be marketed",
+    });
 
     const capabilities = await call<{ availability: { state: string }; id: string }[]>(
       "marketing_capability_list",
@@ -218,6 +246,35 @@ describe("analysis MCP tools and initialization", () => {
     })).toEqual(forked);
   });
 
+  it.each(["links", "api"] as const)("executes %s ready actions verbatim with derived command context", async (inputMode) => {
+    const startArguments = {
+      id: `graph-ready-${inputMode}`,
+      workspaceId: "workspace-1",
+      objective: `Execute ${inputMode} action`,
+      inputMode,
+      ...(inputMode === "links" ? {
+        links: [{ url: "https://example.com/public", fields: { price: ".price" } }],
+      } : {
+        url: "https://example.com/metrics.json",
+        ownership: "authorized",
+        expiresAt: "2026-10-27T13:00:00.000Z",
+      }),
+      ...context(`start-ready-${inputMode}`),
+    };
+    const started = await call<AnalysisGraph>("marketing_analysis_start", startArguments);
+    const action = started.recommendedActions.find((candidate) => candidate.status === "ready")!;
+    expect(action.arguments).toMatchObject({ actor: "agent-1" });
+    for (const field of ["requestId", "idempotencyKey"]) {
+      expect(action.arguments?.[field]).toEqual(expect.any(String));
+      expect(String(action.arguments?.[field]).length).toBeLessThanOrEqual(256);
+      expect(action.arguments?.[field]).not.toBe(startArguments[field]);
+    }
+    expect(await call<AnalysisGraph>("marketing_analysis_start", startArguments)).toEqual(started);
+
+    const result = await call<IngestionBatch>(action.tool, action.arguments!);
+    expect(result).toMatchObject({ state: "completed", failures: [] });
+  });
+
   it("computes, scenarios, and monitors real imported evidence through the public tools", async () => {
     async function importCsv(id: string, fileName: string, content: string): Promise<IngestionBatch> {
       await writeFile(join(tempDir, fileName), content);
@@ -249,17 +306,9 @@ describe("analysis MCP tools and initialization", () => {
       referenceId: baseline.datasetIds[0]!,
       ...context("start-metric"),
     });
-    expect(started.recommendedActions.some((action) => action.tool === "metric_compute" && action.status === "ready")).toBe(true);
-
-    const computed = await call<AnalysisGraph>("metric_compute", {
-      id: started.id,
-      workspaceId: started.workspaceId,
-      expectedVersion: 1,
-      ...await descriptors(baseline),
-      metricId: "ctr_v1",
-      comparability: "comparable",
-      ...context("compute-metric"),
-    });
+    const computeAction = started.recommendedActions.find((action) =>
+      action.tool === "metric_compute" && action.status === "ready")!;
+    const computed = await call<AnalysisGraph>(computeAction.tool, computeAction.arguments!);
     const metric = computed.nodes.find((node) => node.kind === "metric")!;
     expect(metric.payload).toMatchObject({ numerator: 100, denominator: 1000, value: 0.1, status: "ok" });
 
@@ -292,6 +341,46 @@ describe("analysis MCP tools and initialization", () => {
       expect.objectContaining({ fromNodeId: metric.id, toNodeId: monitor.id }),
       expect.objectContaining({ fromNodeId: scenario.id, toNodeId: monitor.id }),
     ]));
+  });
+
+  it("rejects a 65,724-byte __proto__ payload without advancing the graph", async () => {
+    await call<AnalysisGraph>("marketing_analysis_start", {
+      id: "graph-proto",
+      workspaceId: "workspace-1",
+      objective: "Preserve the raw input boundary",
+      ...context("start-proto"),
+    });
+    const skeleton = JSON.stringify({
+      id: "graph-proto",
+      workspaceId: "workspace-1",
+      expectedVersion: 1,
+      nodes: [{ id: "proto-node", kind: "decision", payload: {} }],
+      edges: [],
+      ...context("expand-proto"),
+    });
+    const emptyPayload = '"payload":{}';
+    const overhead = Buffer.byteLength(
+      skeleton.replace(emptyPayload, '"payload":{"__proto__":""}'),
+      "utf8",
+    );
+    const wire = skeleton.replace(
+      emptyPayload,
+      `"payload":{"__proto__":"${"x".repeat(65_724 - overhead)}"}`,
+    );
+    expect(Buffer.byteLength(wire, "utf8")).toBe(65_724);
+    const arguments_ = JSON.parse(wire) as Record<string, unknown>;
+
+    const result = await client.callTool({ name: "analysis_graph_expand", arguments: arguments_ });
+    expect(result).toMatchObject({ isError: true });
+    const graph = await call<AnalysisGraph>("analysis_graph_get", {
+      id: "graph-proto",
+      workspaceId: "workspace-1",
+    });
+    expect(graph.version).toBe(1);
+    expect(graph.nodes.map((node) => node.id)).toEqual([
+      "graph-proto-question",
+      "graph-proto-research",
+    ]);
   });
 
   it("rejects unknown fields, oversized input, and nested secrets before analysis writes", async () => {

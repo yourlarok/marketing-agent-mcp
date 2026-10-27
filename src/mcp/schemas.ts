@@ -555,7 +555,7 @@ const rawCommandContextInput = {
 const rawAnalysisNodeSchema = z.strictObject({
   id: rawStringSchema,
   kind: rawStringSchema,
-  payload: z.record(z.string(), z.unknown()),
+  payload: z.unknown(),
 });
 const rawAnalysisEdgeSchema = z.strictObject({
   id: rawStringSchema,
@@ -565,13 +565,13 @@ const rawAnalysisEdgeSchema = z.strictObject({
 const rawAnalysisRecommendedActionSchema = z.strictObject({
   tool: rawStringSchema,
   description: rawStringSchema,
-  arguments: z.record(z.string(), z.unknown()).optional(),
+  arguments: z.unknown().optional(),
   status: rawStringSchema.optional(),
   missingInputs: z.array(rawStringSchema).optional(),
 });
 const rawAnalysisContentLinksSchema = z.array(z.strictObject({
   url: rawStringSchema,
-  fields: z.record(z.string(), rawStringSchema).optional(),
+  fields: z.unknown().optional(),
 }));
 
 export const analysisStartToolSchema = z.strictObject({

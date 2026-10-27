@@ -28,6 +28,7 @@ import { assertUtcInstant } from "../infrastructure/sqlite.js";
 import {
   AuditableCommandPipeline,
   type Command,
+  type CommandContext,
   type CommandPipeline,
 } from "./commands.js";
 import {
@@ -570,6 +571,20 @@ function derivedActionId(graphId: string, purpose: "research" | "content" | "api
   return `analysis-${purpose}-${createHash("sha256").update(graphId).digest("hex")}`;
 }
 
+function bindStartActionContext(
+  action: AnalysisRecommendedAction,
+  graphId: string,
+  context: CommandContext,
+): AnalysisRecommendedAction {
+  if (action.tool === "host.web_search") return action;
+  const derived: AnalysisPayload = { actor: context.actor };
+  for (const field of ["requestId", "idempotencyKey"] as const) {
+    const identity = JSON.stringify([graphId, action.tool, action.arguments ?? null, field, context[field]]);
+    derived[field] = `analysis-${field}-${createHash("sha256").update(identity).digest("hex")}`;
+  }
+  return { ...action, arguments: { ...action.arguments, ...derived } };
+}
+
 function startActions(
   input: StartAnalysis & { inputMode: NonNullable<StartAnalysis["inputMode"]> },
 ): AnalysisRecommendedAction[] {
@@ -677,6 +692,7 @@ async function datasetMetricActions(
 function startGraph(
   input: StartAnalysis & { inputMode: NonNullable<StartAnalysis["inputMode"]> },
   timestamp: string,
+  context: CommandContext,
   metricActions: AnalysisRecommendedAction[] = [],
 ): AnalysisGraph {
   const question: AnalysisGraphNode = {
@@ -720,7 +736,8 @@ function startGraph(
       fromNodeId: question.id,
       toNodeId: branch.id,
     }],
-    recommendedActions: [...startActions(input), ...metricActions],
+    recommendedActions: [...startActions(input), ...metricActions].map((action) =>
+      bindStartActionContext(action, input.id, context)),
   });
 }
 
@@ -826,7 +843,7 @@ export class AnalysisService {
           }]);
           metricActions = await datasetMetricActions(repos, { ...current, inputMode: "dataset" });
         }
-        return repos.analysisGraphs.insert(startGraph(current, timestamp, metricActions));
+        return repos.analysisGraphs.insert(startGraph(current, timestamp, command.context, metricActions));
       },
     });
   }

@@ -2,6 +2,7 @@ import { statSync } from "node:fs";
 
 export interface AppConfig {
   dataDir: string;
+  artifactDir?: string;
   importRoot?: string;
   httpAllowlist?: string[];
   httpCredentialAllowlist?: string[];
@@ -75,6 +76,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   }
   return {
     dataDir,
+    ...(env.MARKETING_ARTIFACT_DIR ? { artifactDir: env.MARKETING_ARTIFACT_DIR } : {}),
     ...(importRoot ? { importRoot } : {}),
     ...(httpAllowlist.length > 0 ? { httpAllowlist } : {}),
     ...(httpCredentialAllowlist.length > 0 ? { httpCredentialAllowlist } : {}),

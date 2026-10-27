@@ -1,4 +1,4 @@
-import { copyFile } from "node:fs/promises";
+import { copyFile, readdir } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -191,6 +191,8 @@ describe("built data-research stdio acceptance", () => {
     expect(files).toMatchObject({ state: "completed", failures: [] });
     expect(files.datasetIds).toHaveLength(3);
     expect(files.evidenceIds).toHaveLength(3);
+    expect((await readdir(artifactDir)).length).toBeGreaterThan(0);
+    await expect(readdir(join(dataDir, "artifacts"))).rejects.toMatchObject({ code: "ENOENT" });
     const fileEvidence = (await batchEvidence(files.id as string))[0]!;
     expect(fileEvidence.id).toBe((files.evidenceIds as string[])[0]);
     const fileAssets = fileEvidence.assets as { id: string; kind: string }[];

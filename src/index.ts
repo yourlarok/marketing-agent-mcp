@@ -19,7 +19,7 @@ async function run(): Promise<void> {
     const clock = new SystemClock();
     const ids = new SystemIdGenerator();
     const service = new MarketingService(store, clock, ids);
-    const artifacts = new ArtifactStore(join(config.dataDir, "artifacts"));
+    const artifacts = new ArtifactStore(config.artifactDir);
     const dataResearch = new DataResearchService(store, clock, ids, artifacts);
     const analysis = new AnalysisService(store, clock, ids, artifacts);
     const server = createMcpServer(service, dataResearch, analysis);
