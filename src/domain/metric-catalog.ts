@@ -1,7 +1,12 @@
 import { SOURCE_OWNERSHIPS, type SourceOwnership } from "./model.js";
 import { DomainError } from "./errors.js";
 
-export const METRIC_IDS = ["ctr_v1", "save_like_ratio_v1"] as const;
+export const METRIC_IDS = [
+  "ctr_v1",
+  "save_like_ratio_v1",
+  "engagement_rate_v1",
+  "conversion_rate_v1",
+] as const;
 export type MetricId = (typeof METRIC_IDS)[number];
 
 export interface MetricMonitoringDefinition {
@@ -17,11 +22,12 @@ export interface MetricDefinition {
   unit: "ratio";
   role: string;
   limitations: readonly string[];
-  numeratorField: string;
+  numeratorFields: readonly string[];
   denominatorField: string;
   formula: string;
   minimumDenominator: number;
   precision: "ieee754_compensated_sum";
+  binomialEligible: boolean;
   monitoring: MetricMonitoringDefinition;
 }
 
@@ -32,11 +38,12 @@ export const METRIC_CATALOG: Readonly<Record<MetricId, MetricDefinition>> = {
     unit: "ratio",
     role: "Process efficiency from impressions to clicks.",
     limitations: ["Does not measure conversion or establish causation."],
-    numeratorField: "clicks",
+    numeratorFields: ["clicks"],
     denominatorField: "impressions",
     formula: "sum(clicks) / sum(impressions)",
     minimumDenominator: 1000,
     precision: "ieee754_compensated_sum",
+    binomialEligible: true,
     monitoring: {
       requiredFields: ["clicks", "impressions"],
       minimumDenominator: 1000,
@@ -59,11 +66,12 @@ export const METRIC_CATALOG: Readonly<Record<MetricId, MetricDefinition>> = {
       "This is not a save rate or a conversion rate.",
       "Public interaction composition does not establish CTR, conversion, or causation.",
     ],
-    numeratorField: "saves",
+    numeratorFields: ["saves"],
     denominatorField: "likes",
     formula: "sum(saves) / sum(likes)",
     minimumDenominator: 30,
     precision: "ieee754_compensated_sum",
+    binomialEligible: false,
     monitoring: {
       requiredFields: ["saves", "likes"],
       minimumDenominator: 30,
@@ -74,6 +82,62 @@ export const METRIC_CATALOG: Readonly<Record<MetricId, MetricDefinition>> = {
       reviewConditions: [
         "Review when likes cross the minimum denominator threshold.",
         "Review changes in exclusions, freshness, provenance, or comparability alongside value changes.",
+      ],
+    },
+  },
+  engagement_rate_v1: {
+    id: "engagement_rate_v1",
+    version: 1,
+    unit: "ratio",
+    role: "Interaction efficiency from impressions to likes, saves, and comments.",
+    limitations: [
+      "This composite interaction ratio is not a conversion rate and does not establish causation.",
+      "Multiple interactions per impression are possible, so this definition is not binomial eligible.",
+    ],
+    numeratorFields: ["likes", "saves", "comments"],
+    denominatorField: "impressions",
+    formula: "(sum(likes) + sum(saves) + sum(comments)) / sum(impressions)",
+    minimumDenominator: 1000,
+    precision: "ieee754_compensated_sum",
+    binomialEligible: false,
+    monitoring: {
+      requiredFields: ["likes", "saves", "comments", "impressions"],
+      minimumDenominator: 1000,
+      guardrails: [
+        "Compare the same definition and comparable content, placements, or audiences.",
+        "Do not interpret composite engagement as unique users or conversion performance.",
+      ],
+      reviewConditions: [
+        "Review when impressions cross the minimum denominator threshold.",
+        "Review changes in interaction definitions, exclusions, freshness, provenance, or comparability.",
+      ],
+    },
+  },
+  conversion_rate_v1: {
+    id: "conversion_rate_v1",
+    version: 1,
+    unit: "ratio",
+    role: "Owned or authorized process efficiency from clicks to conversions.",
+    limitations: [
+      "Only owned or authorized source data may be used; external_public conversion is rejected.",
+      "This does not establish incrementality or causation.",
+    ],
+    numeratorFields: ["conversions"],
+    denominatorField: "clicks",
+    formula: "sum(conversions) / sum(clicks)",
+    minimumDenominator: 100,
+    precision: "ieee754_compensated_sum",
+    binomialEligible: true,
+    monitoring: {
+      requiredFields: ["conversions", "clicks"],
+      minimumDenominator: 100,
+      guardrails: [
+        "Compare the same attribution and conversion definitions for comparable audiences.",
+        "Never infer conversion from public interaction data.",
+      ],
+      reviewConditions: [
+        "Review when clicks cross the minimum denominator threshold.",
+        "Review attribution, exclusions, freshness, provenance, or comparability alongside value changes.",
       ],
     },
   },
@@ -245,11 +309,16 @@ export function computeMetric(metricId: MetricId, rows: readonly MetricRow[]): M
   const denominators: number[] = [];
   const excludedRows: MetricExcludedRow[] = [];
   rows.forEach((row, rowIndex) => {
-    const numeratorValue = row[definition.numeratorField];
+    const numeratorValues = definition.numeratorFields.map((field) => row[field]);
+    const normalizedNumerators = numeratorValues.map(normalizedMetricNumber);
     const denominatorValue = row[definition.denominatorField];
-    const numerator = normalizedMetricNumber(numeratorValue);
     const denominator = normalizedMetricNumber(denominatorValue);
-    const numeratorReason = exclusionReason(numeratorValue, numerator, "NUMERATOR");
+    const numeratorReasons = numeratorValues.map((value, index) =>
+      exclusionReason(value, normalizedNumerators[index]!, "NUMERATOR")
+    );
+    const numeratorReason = numeratorReasons.includes("MISSING_NUMERATOR")
+      ? "MISSING_NUMERATOR"
+      : numeratorReasons.includes("INVALID_NUMERATOR") ? "INVALID_NUMERATOR" : null;
     const denominatorReason = exclusionReason(denominatorValue, denominator, "DENOMINATOR");
     const reasons = [numeratorReason, denominatorReason].filter(
       (reason): reason is MetricExclusionReason => reason !== null,
@@ -258,7 +327,7 @@ export function computeMetric(metricId: MetricId, rows: readonly MetricRow[]): M
       excludedRows.push({ rowIndex, reasons });
       return;
     }
-    numerators.push(numerator!);
+    numerators.push(...normalizedNumerators as number[]);
     denominators.push(denominator!);
   });
 
@@ -298,7 +367,7 @@ export function computeMetric(metricId: MetricId, rows: readonly MetricRow[]): M
     precision: definition.precision,
     numericInputNormalization: "strict_decimal_scientific_to_ieee754",
     totalRowCount: rows.length,
-    includedRowCount: numerators.length,
+    includedRowCount: rows.length - excludedRows.length,
     excludedRowCount: excludedRows.length,
     excludedRows,
   };
@@ -315,6 +384,12 @@ export function assessMetricReference(
   }
   if (!SOURCE_OWNERSHIPS.includes(input.ownership)) {
     throw new DomainError("INVALID_INPUT", `Invalid source ownership: ${String(input.ownership)}`);
+  }
+  if (metricId === "conversion_rate_v1" && input.ownership === "external_public") {
+    throw new DomainError(
+      "INVALID_INPUT",
+      "conversion_rate_v1 requires owned or authorized source data; external_public conversion is not permitted",
+    );
   }
   if (typeof input.stale !== "boolean") {
     throw new DomainError("INVALID_INPUT", "Reference stale must be a boolean");

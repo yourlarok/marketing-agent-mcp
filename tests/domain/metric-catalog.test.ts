@@ -11,29 +11,51 @@ import { DomainError } from "../../src/domain/errors.js";
 
 describe("controlled metric catalog", () => {
   it("declares exact formulas, roles, precision, and monitoring contracts", () => {
-    expect(Object.keys(METRIC_CATALOG)).toEqual(["ctr_v1", "save_like_ratio_v1"]);
+    expect(Object.keys(METRIC_CATALOG)).toEqual([
+      "ctr_v1",
+      "save_like_ratio_v1",
+      "engagement_rate_v1",
+      "conversion_rate_v1",
+    ]);
     expect(METRIC_CATALOG.ctr_v1).toMatchObject({
       id: "ctr_v1",
       version: 1,
       unit: "ratio",
-      numeratorField: "clicks",
+      numeratorFields: ["clicks"],
       denominatorField: "impressions",
       formula: "sum(clicks) / sum(impressions)",
       minimumDenominator: 1000,
       precision: "ieee754_compensated_sum",
+      binomialEligible: true,
     });
     expect(METRIC_CATALOG.ctr_v1.role).toMatch(/impression.*click|exposure.*click/i);
     expect(METRIC_CATALOG.save_like_ratio_v1).toMatchObject({
-      numeratorField: "saves",
+      numeratorFields: ["saves"],
       denominatorField: "likes",
       formula: "sum(saves) / sum(likes)",
       minimumDenominator: 30,
+      binomialEligible: false,
     });
     expect(METRIC_CATALOG.save_like_ratio_v1.role).toMatch(/engagement|interaction/i);
     expect(METRIC_CATALOG.save_like_ratio_v1.limitations.join(" ")).toMatch(/not a save rate|not.*conversion/i);
+    expect(METRIC_CATALOG.engagement_rate_v1).toMatchObject({
+      numeratorFields: ["likes", "saves", "comments"],
+      denominatorField: "impressions",
+      formula: "(sum(likes) + sum(saves) + sum(comments)) / sum(impressions)",
+      minimumDenominator: 1000,
+      binomialEligible: false,
+    });
+    expect(METRIC_CATALOG.conversion_rate_v1).toMatchObject({
+      numeratorFields: ["conversions"],
+      denominatorField: "clicks",
+      formula: "sum(conversions) / sum(clicks)",
+      minimumDenominator: 100,
+      binomialEligible: true,
+    });
+    expect(METRIC_CATALOG.conversion_rate_v1.limitations.join(" ")).toMatch(/owned.*authorized|authorized.*owned/i);
     for (const definition of Object.values(METRIC_CATALOG)) {
       expect(definition.monitoring.requiredFields).toEqual([
-        definition.numeratorField,
+        ...definition.numeratorFields,
         definition.denominatorField,
       ]);
       expect(definition.monitoring.minimumDenominator).toBe(definition.minimumDenominator);
