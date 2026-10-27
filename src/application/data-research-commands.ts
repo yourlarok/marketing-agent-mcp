@@ -2,7 +2,7 @@ import type {
   FreshnessAssessment,
   QuestionType,
 } from "../domain/data-preparation.js";
-import type { EvidenceAsset } from "../domain/model.js";
+import type { EvidenceAsset, SourceOwnership } from "../domain/model.js";
 import type { ResearchExpansion, ResearchLimits, ResearchScope } from "../domain/data-research-model.js";
 import type { IngestLimits, ParsedFileBatch } from "../infrastructure/file-ingestor.js";
 
@@ -37,6 +37,7 @@ export interface ImportFiles {
   id: string;
   workspaceId: string;
   paths: string[];
+  ownership?: SourceOwnership;
   limits?: IngestLimits;
   planId?: string;
   expectedPlanVersion?: number;

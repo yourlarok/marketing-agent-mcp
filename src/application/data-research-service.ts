@@ -27,7 +27,7 @@ import {
   type ResearchSession,
 } from "../domain/data-research-model.js";
 import { DomainError } from "../domain/errors.js";
-import type { Dataset, Evidence, Source } from "../domain/model.js";
+import { SOURCE_OWNERSHIPS, type Dataset, type Evidence, type Source } from "../domain/model.js";
 import { AcquisitionRouter, type AcquisitionProvider, type AcquiredPage } from "../infrastructure/acquisition-router.js";
 import {
   acquisitionPayloadBytes,
@@ -224,7 +224,7 @@ interface PreparedFile {
   original: StoredArtifact;
   datasets: PreparedDataset[];
   artifactKind?: "original" | "api_response";
-  ownership?: "owned" | "authorized";
+  ownership?: Source["ownership"];
   responseFormat?: "json" | "csv";
 }
 
@@ -759,6 +759,9 @@ export class DataResearchService {
     for (const path of input.paths) {
       assertNonEmptyString(path, "paths");
     }
+    if (input.ownership !== undefined && !SOURCE_OWNERSHIPS.includes(input.ownership)) {
+      invalid("ownership must be owned, authorized, or external_public");
+    }
     if ((input.planId === undefined) !== (input.expectedPlanVersion === undefined)) {
       invalid("planId and expectedPlanVersion must be provided together");
     }
@@ -833,7 +836,12 @@ export class DataResearchService {
             ]);
             datasets.push({ parsed: dataset, normalized, quality, qualityReport });
           }
-          files.push({ source: first.source, original, datasets });
+          files.push({
+            source: first.source,
+            original,
+            datasets,
+            ...(input.ownership === undefined ? {} : { ownership: input.ownership }),
+          });
           remainingRows -= rowCount;
           jsonlBytes += parsedBytes;
         } catch (error) {
@@ -1144,7 +1152,7 @@ export class DataResearchService {
           observedAt: timestamp,
           summary: `Imported ${dataset.name}`,
           contentHash: prepared.normalized.contentHash,
-          classification: "owned_operating",
+          classification: source.ownership === "external_public" ? "external_observation" : "owned_operating",
           assets: [
             { id: this.ids.next(), kind: file.artifactKind ?? "original", ...file.original },
             { id: this.ids.next(), kind: "normalized_jsonl", ...prepared.normalized },

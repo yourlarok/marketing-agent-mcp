@@ -1260,7 +1260,7 @@ export class AnalysisCapabilityService {
         operation: "ingest_files",
         description: "Import CSV or XLSX snapshots into datasets, evidence, and quality reports.",
         requiredInputs: ["id", "workspaceId", "paths", "actor", "requestId", "idempotencyKey"],
-        configuration: ["MARKETING_IMPORT_ROOT", "Optional bounded ingestion limits"],
+        configuration: ["MARKETING_IMPORT_ROOT", "Optional bounded ingestion limits", "Optional ownership=owned|authorized|external_public (default owned)"],
         availability: { state: "available", detail: "Uses local snapshots inside the configured import root." },
         fallback: ["ingest_temporary_api for an authorized JSON or CSV response"],
         limitations: ["Files are not required for no-data analysis.", "Existing row, column, file, and byte limits apply."],

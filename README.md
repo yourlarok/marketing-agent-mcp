@@ -1,6 +1,6 @@
 # Marketing Agent MCP
 
-通过 stdio 提供营销审计、数据准备、证据资产、受控公开研究和确定性竞品比较的 MCP server。所有实体按 `workspaceId` 隔离；写操作保留审计与幂等记录。
+通过 stdio 提供营销审计、数据准备、证据资产、受控公开研究、确定性竞品比较和版本化分析网络的 MCP server。所有实体按 `workspaceId` 隔离；写操作保留审计与幂等记录。
 
 ## 环境要求与安装
 
@@ -125,7 +125,7 @@ API 还必须具有 `owned` 或 `authorized` 所有权，并提供未来的 UTC 
 
 1. 用 `workspace_create` 创建工作区。
 2. 用 `data_request_plan` 声明目标、`questionTypes` 与当前 `availableFields`，得到第 1 轮计划。
-3. 用 `ingest_files` 导入 CSV/XLSX；关联计划时同时传 `planId` 和当前 `expectedPlanVersion`。一次可传多个路径，XLSX 每个 sheet 形成独立 Dataset/Evidence。
+3. 用 `ingest_files` 导入 CSV/XLSX；关联计划时同时传 `planId` 和当前 `expectedPlanVersion`。一次可传多个路径，XLSX 每个 sheet 形成独立 Dataset/Evidence。可选 `ownership` 为 `owned`（默认）、`authorized` 或 `external_public`；公开导出快照必须显式标为 `external_public`，其 Evidence 会记为 `external_observation`，不得把公开数据伪装成自有数据。
 4. 读取 batch 返回的 `datasetIds` / `evidenceIds`。每个数据集保存原始资产、规范化 JSONL 和质量报告；质量统计与 issue 包括行列数、逐字段/总缺失单元格、重复/空行、类型不一致、重复/空表头、列数不一致和缺失公式缓存值。`coverageStart` / `coverageEnd` 从 `published_at`、`converted_at` 或 `stage_changed_at` 的实际有效值提取；无法确定时为 `null`，不会写入导入时间。
 5. 成功导入会推进计划轮次并保留各 dataset 的质量描述。一个问题只有在**单一 dataset** 同时提供全部必需字段、至少一行数据、每个必需字段至少一个非空值且数据未 stale 时才可 answerable；零行、必需字段全空、stale 和跨 dataset 拼字段都不能进入 `ready`。后续有效 dataset 可在下一轮推进。用 `data_request_decline` 拒绝某一轮时必须给出限制原因。
 
@@ -157,6 +157,54 @@ API 还必须具有 `owned` 或 `authorized` 所有权，并提供未来的 UTC 
 `evidence_asset_get` 只接受 `workspaceId`、`evidenceId`、`assetId`，返回资产元数据及 base64 `content`，不接受文件路径。Evidence 的 `assets` 元数据提供 asset ID 与 kind。
 
 SQLite、实体版本、审计和幂等结果在同一数据目录重启后保留；artifact 通过内容哈希重新读取。重启后可仅用 `data_research_get` 恢复 plan/session/diff payload 和资产描述，再用 `evidence_asset_get` 读取正文。
+
+## 分析网络
+
+普通用户只需对 Agent 说一句话，例如：**“我没有业务数据，想了解 AI 教育怎么营销。”** Agent 应先调用 `marketing_analysis_start`；默认 `inputMode=none` 会创建 question 与 `public_research` 分支，最多提出一个可跳过的关键问题，并给出宿主搜索或限域研究的下一步。它不要求 CSV，也不会假装研究已经完成。自有数据是可选增强；公开互动不能推断成 CTR、转化或因果效果。
+
+`marketing_capability_list` 说明操作、所需输入/配置、可用性、fallback 与限制。`host_provided` 只表示能力须由宿主实际提供，`not_installed` 的 live connector 占位说明不能被当作已安装或可用能力。
+
+### 8 个分析工具
+
+- `marketing_analysis_start`：按 `none|links|dataset|api` 创建分析图和结构化 recommended actions；`dataset` 模式用 `referenceId` 引用已导入 Dataset。
+- `marketing_capability_list`：发现真实能力、配置和边界，不是安装或健康证明。
+- `analysis_graph_get`：按 `workspaceId` 与图 ID 恢复完整图、节点 payload、边和引用。
+- `analysis_graph_expand`：用当前 `expectedVersion` 原子追加受控节点/边，可从任意现有节点扩展；拒绝环、重复和孤儿引用。
+- `analysis_graph_fork`：深拷贝独立分支并记录 `parentGraphId`、`parentVersion`、`forkNodeId`；父图不变，本批不做分支合并。
+- `metric_compute`：从同 batch 的 Dataset、Evidence 与 `normalized_jsonl` 计算受控指标，并校验 hash、字节数和质量报告。
+- `metric_scenario_create`：从当前 Metric 节点创建明确假设的条件化算术情景。
+- `metric_monitor_compare`：用新导入快照按同一定义重算并做一次显式对比，可链接同图 Scenario。
+
+所有写工具仍需写上下文和幂等键。图变更使用乐观版本；重启后只需公开 `analysis_graph_get` 即可恢复结果，不需要带外 SQL。
+
+### 指标、严格数值与 complete-case
+
+| 指标 | 数学定义 | 角色与边界 | minimumDenominator |
+| --- | --- | --- | --- |
+| `ctr_v1` | `sum(clicks) / sum(impressions)` | 曝光到点击的过程效率；不是转化率，也不证明因果 | 1000 |
+| `save_like_ratio_v1` | `sum(saves) / sum(likes)` | 收藏相对点赞的互动构成；不是收藏率、转化率或 CTR | 30 |
+
+只纳入同一行分子、分母均为有限非负数的 complete-case 行。数值必须是 number，或匹配严格十进制/科学计数法的字符串，再转换为 IEEE-754；缺失、空字符串、负数、非数值、NaN/Infinity 都排除，不得当作 0。结果保留总行数、纳入/排除行数和逐行排除原因，使用 `ieee754_compensated_sum` 补偿求和，不做未声明的显示舍入。
+
+没有有效行、分母合计为 0 或合计/比值超出有限数值范围时，`status=unknown`、`value=null`，分别给出 `NO_VALID_ROWS`、`ZERO_DENOMINATOR` 或 `NON_FINITE_TOTAL`；零分母不能返回 0。结果同时保存公式、定义版本、分子、分母、覆盖时间、输入 ID、证据 hash、质量限制和参考度。
+
+### 参考度 exact rubric
+
+`referenceAssessment` 只有 `high|medium|low|unknown`，附机器可读 reason codes、简短说明以及 provenance、freshness、sample、missingness、comparability 五个维度；它不是主观置信概率，也不衡量因果强度。规则固定如下：
+
+1. 计算为 unknown 时，参考度必为 unknown。
+2. `comparability=not_comparable` 时，参考度必为 low。
+3. 对可计算结果，统计三类质量问题：分母低于该指标 minimumDenominator、stale、存在排除行。两类及以上为 low；恰好一类时，owned/authorized 为 medium，external_public 为 low。
+4. 没有这三类问题时，external_public 最高 medium。
+5. 没有这三类问题时，owned/authorized 只有 `comparability=comparable` 才为 high；默认 `not_assessed` 最高 medium。数值可复算不等于已做同类标杆校验。
+
+对应 reason codes 包括 `NO_VALID_ROWS`、`ZERO_DENOMINATOR`、`NON_FINITE_TOTAL`、`COMPARABILITY_NOT_COMPARABLE`、`SAMPLE_BELOW_MINIMUM`、`STALE_DATA`、`EXCLUDED_ROWS`、`EXTERNAL_PUBLIC`、`COMPARABILITY_NOT_ASSESSED`。
+
+### 条件情景与监控
+
+`metric_scenario_create` 要求 `conservative|base|optimistic` 标签、有限非负 `targetValue` 和 `projectedDenominator`。它计算 `targetValue - baselineValue`、相对变化、`targetValue * projectedDenominator` 及预测分子相对基线分子的增量；基线为 0 时相对变化为 null 并标记 `ZERO_BASELINE`，unknown 基线保持 unknown。投影固定使用调用方给的预测分母并假设其他条件不变，分母变化也会影响预测分子增量；这些是敏感性算术，不是提升保证或因果预测。
+
+`metric_monitor_compare` 比较值、绝对/相对变化、参考度和样本变化。基线或新值 unknown 时对比为 unknown、delta 为 null；基线为 0 时相对变化为 null。它只执行一次调用，返回 guardrail 与复盘条件，`scheduling=not_provided`，不会创建定时任务、 recurring monitor 或自动调度。
 
 ## 上限、部分失败与隐私
 
@@ -206,8 +254,9 @@ SQLite、实体版本、审计和幂等结果在同一数据目录重启后保�
 | 数据计划与导入 | `data_request_plan`、`data_request_decline`、`ingest_files`、`ingest_temporary_api`、`ingest_content_links` |
 | 公开研究 | `research_session_create`、`research_permission_set`、`research_session_run` |
 | 竞品与证据 | `competitor_confirm`、`competitor_diff_create`、`data_research_get`、`evidence_asset_get` |
+| 分析网络 | `marketing_analysis_start`、`marketing_capability_list`、`analysis_graph_get`、`analysis_graph_expand`、`analysis_graph_fork`、`metric_compute`、`metric_scenario_create`、`metric_monitor_compare` |
 
-`capability_health_record` 只有在关联证据包含完全匹配的 `toolHealth` 时才能把能力置为 `verified`。健康检查必须由调用方实际完成；能力注册不等于安装、授权、执行或健康验证。
+`capability_health_record` 只有在关联证据包含完全匹配的 `toolHealth` 时才能把能力置为 `verified`。健康检查必须由调用方实际完成；能力注册不等于安装、授权、执行或健康验证。`marketing_capability_list` 同样只是声明与路由目录，不会把未安装的 connector 变成可用能力。
 
 ## 验证
 
@@ -221,19 +270,22 @@ npm run smoke
 `npm run smoke` 等价于：
 
 ```bash
-vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts
+vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts
 ```
 
-运行 smoke 前必须构建最新代码。两套验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client：
+运行 smoke 前必须构建最新代码。三套验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client：
 
 - 原套件覆盖营销链、幂等、血缘、能力健康、输入边界、原始 malformed JSON、协议专用 stdout、启动失败和优雅关闭。
 - 数据研究套件启动本地 HTTP fixture 与真 Chromium，完成计划、CSV/XLSX 与质量资产、env-ref 认证临时 API、内容链接、研究权限与限域抓取、竞品确认/Diff、证据读取，并重启验证 plan/session/diff/artifact。loopback 仅在测试进程内显式 allowlist，测试凭据仅通过 env reference 使用。
+- 分析网络套件覆盖初始化 instructions、无数据公开研究分支、能力边界、公开/自有文件指标、条件情景、监控、expand/fork、幂等与父图不变，并在重启后仅通过 `analysis_graph_get` 恢复全部节点和引用；验证零分母 unknown、complete-case、公开来源参考度与不可比语义，不使用带外 SQL。
 
 `npm test` 也包含这些 e2e 文件，因此同样要求最新 `dist` 和可用 Chromium。
 
 ## 当前不支持
 
-- 不提供分析引擎、仪表盘、内容生成、审批执行、发布或效果衡量。
-- 不声明内置任何外部营销平台或专业 MCP 供应商集成。
-- 不支持自动登录、CAPTCHA 绕过、文件下载、任意脚本执行、语义化竞品结论或把 `unknown` 当作事实。
+- 不做自动因果推断、保证性提升或商业结果承诺；条件情景和前后对比不能替代实验或因果分析。
+- 不提供仪表盘、内容生成、逆向制作、审批执行或发布。
+- 不安装或声明外部营销平台的 OAuth、账户同步、live connector，也不提供定时/自动调度监控；文件、临时授权 API 和公开链接快照不等于持续平台集成。
+- 不声明内置任何特定专业 MCP 供应商集成。
+- 不支持自动登录、CAPTCHA 绕过、文件下载、任意脚本执行、任意 SQL/Python/公式 DSL、跨 Dataset join、语义化竞品结论或把 `unknown` 当作事实。
 - 不提供跨工作区访问、多用户认证、远程传输、访问控制或数据库加密。
