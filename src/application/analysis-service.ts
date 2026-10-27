@@ -293,20 +293,32 @@ const GRAPH_SCOPED_ACTION_TOOLS = new Set([
   "metric_scenario_create",
   "metric_monitor_compare",
 ]);
+const FORK_COMMAND_ACTION_TOOLS = new Set([
+  "ingest_content_links",
+  "ingest_temporary_api",
+  "research_session_create",
+]);
 
 function rebindGraphActions(
   actions: AnalysisRecommendedAction[],
   graphId: string,
   graphVersion: number,
+  fork = false,
 ): AnalysisRecommendedAction[] {
   return actions.map((action) => {
-    if (!GRAPH_SCOPED_ACTION_TOOLS.has(action.tool)) return action;
+    const graphScoped = GRAPH_SCOPED_ACTION_TOOLS.has(action.tool);
+    const forkCommand = fork && FORK_COMMAND_ACTION_TOOLS.has(action.tool);
+    if (!graphScoped && !forkCommand) return action;
     const args = action.arguments ?? {};
-    const rebound: AnalysisPayload = {
-      ...args,
-      id: graphId,
-      expectedVersion: graphVersion,
-    };
+    const rebound: AnalysisPayload = { ...args };
+    if (graphScoped) {
+      rebound.id = graphId;
+      rebound.expectedVersion = graphVersion;
+    }
+    if (forkCommand && typeof args.id === "string") {
+      const identity = JSON.stringify([graphId, action.tool, args.id]);
+      rebound.id = `analysis-command-${createHash("sha256").update(identity).digest("hex")}`;
+    }
     for (const field of ["graphId", "parentGraphId"] as const) {
       if (Object.hasOwn(args, field)) rebound[field] = graphId;
     }
@@ -1131,7 +1143,7 @@ export class AnalysisService {
           forkNodeId: current.forkNodeId,
           createdAt: timestamp,
         });
-        fork.recommendedActions = rebindGraphActions(fork.recommendedActions, fork.id, fork.version);
+        fork.recommendedActions = rebindGraphActions(fork.recommendedActions, fork.id, fork.version, true);
         return repos.analysisGraphs.insert(fork);
       },
     });

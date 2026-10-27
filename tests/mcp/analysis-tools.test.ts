@@ -1,5 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -273,6 +274,84 @@ describe("analysis MCP tools and initialization", () => {
 
     const result = await call<IngestionBatch>(action.tool, action.arguments!);
     expect(result).toMatchObject({ state: "completed", failures: [] });
+  });
+
+  it.each(["links", "api"] as const)("forks %s actions with independent execution, audit, and replay", async (inputMode) => {
+    const started = await call<AnalysisGraph>("marketing_analysis_start", {
+      id: `graph-fork-execution-${inputMode}`,
+      workspaceId: "workspace-1",
+      objective: `Fork ${inputMode} execution`,
+      inputMode,
+      ...(inputMode === "links" ? {
+        links: [{ url: "https://example.com/public", fields: { price: ".price" } }],
+      } : {
+        url: "https://example.com/metrics.json",
+        ownership: "authorized",
+        expiresAt: "2026-10-27T13:00:00.000Z",
+      }),
+      ...context(`start-fork-execution-${inputMode}`),
+    });
+    const branchNodeId = inputMode === "links" ? `${started.id}-research` : `${started.id}-dataset`;
+    const parent = await call<AnalysisGraph>("analysis_graph_expand", {
+      id: started.id,
+      workspaceId: "workspace-1",
+      expectedVersion: 1,
+      nodes: [{ id: "expand-decision", kind: "decision", payload: { status: "planned" } }],
+      edges: [{ id: "expand-decision-edge", fromNodeId: branchNodeId, toNodeId: "expand-decision" }],
+      ...context(`expand-fork-execution-${inputMode}`),
+    });
+    const child = await call<AnalysisGraph>("analysis_graph_fork", {
+      id: `graph-fork-execution-${inputMode}-child`,
+      workspaceId: "workspace-1",
+      parentGraphId: parent.id,
+      expectedVersion: parent.version,
+      forkNodeId: branchNodeId,
+      ...context(`fork-execution-${inputMode}`),
+    });
+    const parentAction = parent.recommendedActions.find((action) => action.status === "ready")!;
+    const childAction = child.recommendedActions.find((action) => action.status === "ready")!;
+    expect(parentAction.arguments).toEqual(started.recommendedActions[0]!.arguments);
+    if (inputMode === "links") {
+      expect(childAction.arguments?.links).toEqual(parentAction.arguments?.links);
+    } else {
+      expect(childAction.arguments?.url).toBe(parentAction.arguments?.url);
+      expect(childAction.arguments?.ownership).toBe(parentAction.arguments?.ownership);
+      expect(childAction.arguments?.expiresAt).toBe(parentAction.arguments?.expiresAt);
+    }
+
+    const parentBatch = await call<IngestionBatch>(parentAction.tool, parentAction.arguments!);
+    expect(await call<IngestionBatch>(parentAction.tool, parentAction.arguments!)).toEqual(parentBatch);
+    const childBatch = await call<IngestionBatch>(childAction.tool, childAction.arguments!);
+    expect(await call<IngestionBatch>(childAction.tool, childAction.arguments!)).toEqual(childBatch);
+    expect(childBatch.id).not.toBe(parentBatch.id);
+    expect(childAction.arguments?.id).toBe(childBatch.id);
+    expect(childAction.arguments?.requestId).not.toBe(parentAction.arguments?.requestId);
+    expect(childAction.arguments?.idempotencyKey).not.toBe(parentAction.arguments?.idempotencyKey);
+
+    const raw = new DatabaseSync(join(tempDir, "store.db"));
+    try {
+      const audit = (action: typeof parentAction) => raw.prepare(
+        "SELECT entity_id AS entityId FROM audit_records WHERE request_id = ?",
+      ).all(action.arguments!.requestId as string);
+      expect(audit(parentAction)).toEqual([{ entityId: parentBatch.id }]);
+      expect(audit(childAction)).toEqual([{ entityId: childBatch.id }]);
+      expect(raw.prepare(
+        "SELECT COUNT(*) AS count FROM idempotency_records WHERE key IN (?, ?)",
+      ).get(
+        parentAction.arguments!.idempotencyKey as string,
+        childAction.arguments!.idempotencyKey as string,
+      )).toMatchObject({ count: 2 });
+    } finally {
+      raw.close();
+    }
+    expect(await call<AnalysisGraph>("analysis_graph_get", {
+      id: parent.id,
+      workspaceId: "workspace-1",
+    })).toEqual(parent);
+    expect(await call<AnalysisGraph>("analysis_graph_get", {
+      id: child.id,
+      workspaceId: "workspace-1",
+    })).toEqual(child);
   });
 
   it("computes, scenarios, and monitors real imported evidence through the public tools", async () => {
