@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   createAnalysisGraph,
   expandAnalysisGraph,
@@ -110,6 +111,10 @@ async function requireReferences(
   }
 }
 
+function derivedActionId(graphId: string, purpose: "research" | "content" | "api"): string {
+  return `analysis-${purpose}-${createHash("sha256").update(graphId).digest("hex")}`;
+}
+
 function startActions(
   input: StartAnalysis & { inputMode: NonNullable<StartAnalysis["inputMode"]> },
 ): AnalysisRecommendedAction[] {
@@ -126,7 +131,7 @@ function startActions(
         tool: "research_session_create",
         description: "After host search or user input supplies seed URLs and a bounded scope, create a public research session; no research has run yet.",
         arguments: {
-          id: `${input.id}-research-session`,
+          id: derivedActionId(input.id, "research"),
           workspaceId: input.workspaceId,
           goal: input.objective,
           expansion: false,
@@ -141,7 +146,7 @@ function startActions(
       tool: "ingest_content_links",
       description: "Acquire the supplied public content links through the configured browser acquisition fallback chain.",
       arguments: {
-        id: `${input.id}-content-ingestion`,
+        id: derivedActionId(input.id, "content"),
         workspaceId: input.workspaceId,
         links: input.links!.map((link) => ({
           url: link.url,
@@ -157,7 +162,7 @@ function startActions(
       tool: "ingest_temporary_api",
       description: "Import an owned or authorized, expiring JSON or CSV API response using a credential reference rather than plaintext credentials.",
       arguments: {
-        id: `${input.id}-temporary-api-ingestion`,
+        id: derivedActionId(input.id, "api"),
         workspaceId: input.workspaceId,
         url: input.url!,
         ownership: input.ownership!,

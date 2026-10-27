@@ -135,7 +135,7 @@ describe("AnalysisService with real SQLite", () => {
       status: "requires_input",
       missingInputs: ["seeds", "scope"],
       arguments: {
-        id: "graph-none-research-session",
+        id: expect.stringMatching(/^analysis-research-[a-f0-9]{64}$/),
         workspaceId: "workspace-1",
         goal: "Understand how to market AI education",
         expansion: false,
@@ -204,14 +204,14 @@ describe("AnalysisService with real SQLite", () => {
       const argumentsWithContext = { ...action.arguments, ...context(`wrapped-${inputMode}`) };
       if (inputMode === "links") {
         expect(ingestContentLinksInputSchema.parse(argumentsWithContext)).toMatchObject({
-          id: "graph-links-content-ingestion",
+          id: expect.stringMatching(/^analysis-content-[a-f0-9]{64}$/),
           workspaceId: "workspace-1",
           links: [{ url: "https://example.com/research", fields: { price: ".price" } }],
         });
       }
       if (inputMode === "api") {
         expect(ingestTemporaryApiInputSchema.parse(argumentsWithContext)).toMatchObject({
-          id: "graph-api-temporary-api-ingestion",
+          id: expect.stringMatching(/^analysis-api-[a-f0-9]{64}$/),
           workspaceId: "workspace-1",
           url: "https://example.com/metrics.json",
           ownership: "authorized",
@@ -223,6 +223,33 @@ describe("AnalysisService with real SQLite", () => {
       expect(graph.recommendedActions).toEqual([]);
     }
     expect(graph.recommendedActions.map((action) => action.tool)).not.toContain("metric_compute");
+  });
+
+  it.each(["links", "api"] as const)("derives bounded, distinct %s action IDs from maximum-length graph IDs", async (inputMode) => {
+    const input = {
+      inputMode,
+      ...(inputMode === "links" ? {
+        links: [{ url: "https://example.com/research" }],
+      } : {
+        url: "https://example.com/metrics.json",
+        ownership: "owned",
+        expiresAt: "2026-10-27T13:00:00.000Z",
+      }),
+    };
+    const first = await start("a".repeat(256), input);
+    const second = await start("b".repeat(256), input);
+    const firstArguments = first.recommendedActions[0]!.arguments!;
+    const secondArguments = second.recommendedActions[0]!.arguments!;
+
+    expect(firstArguments.id).toMatch(/^analysis-(?:content|api)-[a-f0-9]{64}$/);
+    expect(String(firstArguments.id).length).toBeLessThanOrEqual(256);
+    expect(secondArguments.id).not.toBe(firstArguments.id);
+    const withContext = { ...firstArguments, ...context(`wrapped-long-${inputMode}`) };
+    if (inputMode === "links") {
+      expect(ingestContentLinksInputSchema.parse(withContext).id).toBe(firstArguments.id);
+    } else {
+      expect(ingestTemporaryApiInputSchema.parse(withContext).id).toBe(firstArguments.id);
+    }
   });
 
   it("rejects missing or unsafe links/API inputs before creating a graph", async () => {
