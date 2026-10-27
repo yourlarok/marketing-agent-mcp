@@ -423,19 +423,47 @@ function metricFollowupActions(
   workspaceId: string,
   graphVersion: number,
   metricNodeId: string,
+  context: CommandContext,
 ): AnalysisRecommendedAction[] {
+  const bind = (
+    tool: "metric_scenario_create" | "metric_monitor_compare",
+    arguments_: AnalysisPayload,
+  ): AnalysisPayload => {
+    const bound: AnalysisPayload = { ...arguments_, actor: context.actor };
+    for (const field of ["requestId", "idempotencyKey"] as const) {
+      const identity = JSON.stringify([
+        graphId,
+        metricNodeId,
+        tool,
+        field,
+        context[field],
+      ]);
+      bound[field] = `analysis-${field}-${createHash("sha256").update(identity).digest("hex")}`;
+    }
+    return bound;
+  };
   return [
     {
       tool: "metric_scenario_create",
       description: "Create a conditional arithmetic scenario for this metric; this is not a performance guarantee.",
-      arguments: { id: graphId, workspaceId, expectedVersion: graphVersion, metricNodeId },
+      arguments: bind("metric_scenario_create", {
+        id: graphId,
+        workspaceId,
+        expectedVersion: graphVersion,
+        metricNodeId,
+      }),
       status: "requires_input",
       missingInputs: ["label", "targetValue", "projectedDenominator"],
     },
     {
       tool: "metric_monitor_compare",
       description: "Recompute the same definition from a new verified snapshot and compare it with this baseline.",
-      arguments: { id: graphId, workspaceId, expectedVersion: graphVersion, baselineMetricNodeId: metricNodeId },
+      arguments: bind("metric_monitor_compare", {
+        id: graphId,
+        workspaceId,
+        expectedVersion: graphVersion,
+        baselineMetricNodeId: metricNodeId,
+      }),
       status: "requires_input",
       missingInputs: ["batchId", "datasetId", "evidenceId", "assetId"],
     },
@@ -701,6 +729,15 @@ async function datasetMetricActions(
   });
 }
 
+function startElementId(
+  graphId: string,
+  role: "question" | "research" | "dataset" | "edge-question-research" | "edge-question-dataset",
+): string {
+  const identity = JSON.stringify([graphId, role]);
+  const prefix = role.startsWith("edge-") ? "edge" : role;
+  return `${prefix}-${createHash("sha256").update(identity).digest("hex")}`;
+}
+
 function startGraph(
   input: StartAnalysis & { inputMode: NonNullable<StartAnalysis["inputMode"]> },
   timestamp: string,
@@ -708,7 +745,7 @@ function startGraph(
   metricActions: AnalysisRecommendedAction[] = [],
 ): AnalysisGraph {
   const question: AnalysisGraphNode = {
-    id: `${input.id}-question`,
+    id: startElementId(input.id, "question"),
     kind: "question",
     payload: {
       objective: input.objective,
@@ -722,15 +759,15 @@ function startGraph(
     },
   };
   const branch: AnalysisGraphNode = input.inputMode === "dataset" ? {
-    id: `${input.id}-dataset`,
+    id: startElementId(input.id, "dataset"),
     kind: "dataset",
     payload: { datasetId: input.referenceId!, status: "available" },
   } : input.inputMode === "api" ? {
-    id: `${input.id}-dataset`,
+    id: startElementId(input.id, "dataset"),
     kind: "dataset",
     payload: { inputMode: "api", status: "ready_to_ingest" },
   } : {
-    id: `${input.id}-research`,
+    id: startElementId(input.id, "research"),
     kind: "research",
     payload: {
       mode: input.inputMode === "links" ? "content_links" : "public_research",
@@ -744,7 +781,10 @@ function startGraph(
     createdAt: timestamp,
     nodes: [question, branch],
     edges: [{
-      id: `${input.id}-edge-question-${branch.kind}`,
+      id: startElementId(
+        input.id,
+        branch.kind === "dataset" ? "edge-question-dataset" : "edge-question-research",
+      ),
       fromNodeId: question.id,
       toNodeId: branch.id,
     }],
@@ -907,6 +947,7 @@ export class AnalysisService {
               current.workspaceId,
               current.expectedVersion + 1,
               nodeId,
+              command.context,
             ),
           ],
           current.id,
@@ -1086,11 +1127,14 @@ export class AnalysisService {
     });
   }
 
-  expand(command: Command<ExpandAnalysisGraph>): Promise<AnalysisGraph> {
+  async expand(command: Command<ExpandAnalysisGraph>): Promise<AnalysisGraph> {
     const input = command.input;
     assertExpectedVersion(input.expectedVersion);
     if (!Array.isArray(input.nodes) || !Array.isArray(input.edges)) {
       invalid("nodes and edges must be arrays");
+    }
+    if (input.nodes.some((node) => ["metric", "scenario", "monitor"].includes(node.kind))) {
+      invalid("Metric, Scenario, and Monitor nodes can only be created by their compute commands");
     }
     if (input.recommendedActions !== undefined && !Array.isArray(input.recommendedActions)) {
       invalid("recommendedActions must be an array");
@@ -1188,7 +1232,11 @@ export class AnalysisCapabilityService {
         description: "Atomically append controlled nodes and directed edges after any existing graph node.",
         requiredInputs: ["id", "workspaceId", "expectedVersion", "nodes", "edges", "actor", "requestId", "idempotencyKey"],
         availability: { state: "available", detail: "Uses optimistic graph versions and validates node references." },
-        limitations: ["Graphs must remain acyclic with unique IDs and no orphan edges.", "No branch merge is provided."],
+        limitations: [
+          "Graphs must remain acyclic with unique IDs and no orphan edges.",
+          "Metric, Scenario, and Monitor nodes are created only by their compute commands.",
+          "No branch merge is provided.",
+        ],
       }),
       capability({
         id: "analysis.fork",

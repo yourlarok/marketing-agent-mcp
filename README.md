@@ -169,7 +169,7 @@ SQLite、实体版本、审计和幂等结果在同一数据目录重启后保�
 - `marketing_analysis_start`：按 `none|links|dataset|api` 创建分析图和结构化 recommended actions；`dataset` 模式用 `referenceId` 引用已导入 Dataset。
 - `marketing_capability_list`：发现真实能力、配置和边界，不是安装或健康证明。
 - `analysis_graph_get`：按 `workspaceId` 与图 ID 恢复完整图、节点 payload、边和引用。
-- `analysis_graph_expand`：用当前 `expectedVersion` 原子追加受控节点/边，可从任意现有节点扩展；拒绝环、重复和孤儿引用。
+- `analysis_graph_expand`：用当前 `expectedVersion` 原子追加受控节点/边，可从任意现有节点扩展；拒绝环、重复和孤儿引用。通用扩展只允许调用方创建 `question|research|dataset|decision`，`metric|scenario|monitor` 只能由对应真实计算命令生成。
 - `analysis_graph_fork`：深拷贝独立分支并记录 `parentGraphId`、`parentVersion`、`forkNodeId`；父图不变，本批不做分支合并。
 - `metric_compute`：从同 batch 的 Dataset、Evidence 与 `normalized_jsonl` 计算受控指标，并校验 hash、字节数和质量报告。
 - `metric_scenario_create`：从当前 Metric 节点创建明确假设的条件化算术情景。

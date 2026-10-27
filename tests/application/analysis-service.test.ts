@@ -105,10 +105,14 @@ describe("AnalysisService with real SQLite", () => {
     });
     expect(graph.nodes.map((node) => node.kind)).toEqual(["question", "research"]);
     expect(graph.edges).toEqual([{
-      id: "graph-none-edge-question-research",
-      fromNodeId: "graph-none-question",
-      toNodeId: "graph-none-research",
+      id: expect.stringMatching(/^edge-[a-f0-9]{64}$/),
+      fromNodeId: graph.nodes[0]!.id,
+      toNodeId: graph.nodes[1]!.id,
     }]);
+    expect(graph.nodes.map((node) => node.id)).toEqual([
+      expect.stringMatching(/^question-[a-f0-9]{64}$/),
+      expect.stringMatching(/^research-[a-f0-9]{64}$/),
+    ]);
     expect(graph.nodes[0]!.payload).toMatchObject({
       objective: "Understand how to market AI education",
       channel: null,
@@ -339,7 +343,7 @@ describe("AnalysisService with real SQLite", () => {
           { id: "research-follow-up", kind: "research", payload: { status: "planned" } },
         ] satisfies AnalysisGraphNode[],
         edges: [
-          { id: "edge-decision", fromNodeId: "graph-expand-research", toNodeId: "decision-manual" },
+          { id: "edge-decision", fromNodeId: created.nodes[1]!.id, toNodeId: "decision-manual" },
           { id: "edge-follow-up", fromNodeId: "decision-manual", toNodeId: "research-follow-up" },
         ],
         recommendedActions: [{ tool: "host.web_search", description: "Research the follow-up question" }],
@@ -350,8 +354,7 @@ describe("AnalysisService with real SQLite", () => {
     const expanded = await service.expand(command);
     expect(expanded).toMatchObject({ version: 2, updatedAt: now });
     expect(expanded.nodes.map((node) => node.id)).toEqual([
-      "graph-expand-question",
-      "graph-expand-research",
+      ...created.nodes.map((node) => node.id),
       "decision-manual",
       "research-follow-up",
     ]);
@@ -365,6 +368,102 @@ describe("AnalysisService with real SQLite", () => {
       { action: "analysis_graph.start" },
       { action: "analysis_graph.expand" },
     ]);
+  });
+
+  it("rejects direct writes of server-derived nodes while preserving arbitrary legitimate branches", async () => {
+    const created = await start("graph-derived-write-guard");
+    for (const [index, kind] of (["metric", "scenario", "monitor"] as const).entries()) {
+      await expect(service.expand({
+        input: {
+          id: created.id,
+          workspaceId: created.workspaceId,
+          expectedVersion: 1,
+          nodes: [{
+            id: `forged-${kind}`,
+            kind,
+            payload: kind === "metric" ? {
+              metricId: "ctr_v1",
+              numerator: 100,
+              denominator: 1000,
+              value: 0.5,
+              referenceAssessment: { level: "high" },
+            } : { metricNodeId: `forged-metric`, value: 0.5 },
+          }],
+          edges: [{
+            id: `forged-edge-${index}`,
+            fromNodeId: created.nodes[1]!.id,
+            toNodeId: `forged-${kind}`,
+          }],
+        },
+        context: context(`forged-${kind}`),
+      })).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    }
+    await expect(service.get({ id: created.id, workspaceId: created.workspaceId }))
+      .resolves.toEqual(created);
+
+    const expanded = await service.expand({
+      input: {
+        id: created.id,
+        workspaceId: created.workspaceId,
+        expectedVersion: 1,
+        nodes: [
+          { id: "another-question", kind: "question", payload: { objective: "Compare audiences" } },
+          { id: "another-research", kind: "research", payload: { status: "planned" } },
+          { id: "external-dataset", kind: "dataset", payload: { status: "pending" } },
+          { id: "another-decision", kind: "decision", payload: { statement: "Keep investigating" } },
+        ],
+        edges: [
+          { id: "question-edge", fromNodeId: created.nodes[1]!.id, toNodeId: "another-question" },
+          { id: "research-edge", fromNodeId: "another-question", toNodeId: "another-research" },
+          { id: "dataset-edge", fromNodeId: "another-research", toNodeId: "external-dataset" },
+          { id: "decision-edge", fromNodeId: "external-dataset", toNodeId: "another-decision" },
+        ],
+      },
+      context: context("legitimate-expand"),
+    });
+    expect(expanded.nodes.slice(-4).map((node) => node.kind)).toEqual([
+      "question", "research", "dataset", "decision",
+    ]);
+  });
+
+  it("reads and references legacy long node IDs while keeping newly derived IDs bounded", async () => {
+    const created = await start("graph-legacy-long-node");
+    const legacyNodeId = `${created.id}-legacy-${"n".repeat(300)}`;
+    await store.transaction(async (repos) => {
+      await repos.analysisGraphs.update({
+        ...created,
+        version: 2,
+        nodes: [...created.nodes, { id: legacyNodeId, kind: "decision", payload: { legacy: true } }],
+        edges: [...created.edges, {
+          id: "legacy-long-node-edge",
+          fromNodeId: created.nodes[1]!.id,
+          toNodeId: legacyNodeId,
+        }],
+      }, 1);
+    });
+
+    const expanded = await service.expand({
+      input: {
+        id: created.id,
+        workspaceId: created.workspaceId,
+        expectedVersion: 2,
+        nodes: [{ id: "after-legacy", kind: "research", payload: { status: "planned" } }],
+        edges: [{ id: "after-legacy-edge", fromNodeId: legacyNodeId, toNodeId: "after-legacy" }],
+      },
+      context: context("expand-legacy-long-node"),
+    });
+    const forked = await service.fork({
+      input: {
+        id: "fork-legacy-long-node",
+        workspaceId: created.workspaceId,
+        parentGraphId: created.id,
+        expectedVersion: expanded.version,
+        forkNodeId: legacyNodeId,
+      },
+      context: context("fork-legacy-long-node"),
+    });
+    expect(forked.forkNodeId).toBe(legacyNodeId);
+    expect(forked.nodes).toEqual(expanded.nodes);
   });
 
   it("rolls back an invalid expansion and rejects stale versions without extra audit or idempotency", async () => {
@@ -403,7 +502,7 @@ describe("AnalysisService with real SQLite", () => {
         workspaceId: "workspace-1",
         parentGraphId: parent.id,
         expectedVersion: 1,
-        forkNodeId: "graph-parent-research",
+        forkNodeId: parent.nodes[1]!.id,
       },
       context: context("fork"),
     };
@@ -414,7 +513,7 @@ describe("AnalysisService with real SQLite", () => {
       version: 1,
       parentGraphId: parent.id,
       parentVersion: 1,
-      forkNodeId: "graph-parent-research",
+      forkNodeId: parent.nodes[1]!.id,
     });
     expect(fork.nodes).toEqual(parent.nodes);
     expect(fork.nodes).not.toBe(parent.nodes);
@@ -448,7 +547,7 @@ describe("AnalysisService with real SQLite", () => {
         workspaceId: "workspace-2",
         parentGraphId: graph.id,
         expectedVersion: 1,
-        forkNodeId: "graph-isolated-research",
+        forkNodeId: graph.nodes[1]!.id,
       },
       context: context("cross-fork"),
     })).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
@@ -458,7 +557,7 @@ describe("AnalysisService with real SQLite", () => {
         workspaceId: "workspace-1",
         parentGraphId: graph.id,
         expectedVersion: 2,
-        forkNodeId: "graph-isolated-research",
+        forkNodeId: graph.nodes[1]!.id,
       },
       context: context("stale-fork"),
     })).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });

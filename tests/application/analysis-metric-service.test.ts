@@ -191,7 +191,7 @@ describe("AnalysisService real metric computation", () => {
     const ctr = metricNode(ctrGraph);
     expect(ctrGraph.version).toBe(2);
     expect(ctrGraph.edges.at(-1)).toMatchObject({
-      fromNodeId: `${graph.id}-dataset`,
+      fromNodeId: graph.nodes.find((node) => node.kind === "dataset")!.id,
       toNodeId: ctr.id,
     });
     expect(ctr.payload).toMatchObject({
@@ -412,7 +412,7 @@ describe("AnalysisService real metric computation", () => {
         workspaceId: parent.workspaceId,
         parentGraphId: parent.id,
         expectedVersion: parent.version,
-        forkNodeId: `${parent.id}-dataset`,
+        forkNodeId: parent.nodes.find((node) => node.kind === "dataset")!.id,
       },
       context: context("fork-action-bind"),
     });

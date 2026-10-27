@@ -7,6 +7,7 @@ export const MAX_SERIALIZED_INPUT_BYTES = 64 * 1024;
 export const MAX_COLLECTION_ENTRIES = 1_000;
 export const MAX_KEY_LENGTH = 128;
 export const MAX_ID_LENGTH = 256;
+export const MAX_ANALYSIS_NODE_REFERENCE_LENGTH = MAX_ID_LENGTH * 2;
 
 export type JsonValue =
   | string
@@ -452,6 +453,7 @@ const analysisComparabilitySchema = z.enum(["not_assessed", "comparable", "not_c
 const analysisPayloadSchema = z
   .record(z.string().max(MAX_KEY_LENGTH), jsonValueSchema)
   .superRefine(checkObjectKeys);
+const analysisNodeReferenceSchema = z.string().trim().min(1).max(MAX_ANALYSIS_NODE_REFERENCE_LENGTH);
 const analysisNodeSchema = z.strictObject({
   id: idSchema,
   kind: z.enum(["question", "research", "dataset", "metric", "scenario", "monitor", "decision"]),
@@ -459,8 +461,8 @@ const analysisNodeSchema = z.strictObject({
 });
 const analysisEdgeSchema = z.strictObject({
   id: idSchema,
-  fromNodeId: idSchema,
-  toNodeId: idSchema,
+  fromNodeId: analysisNodeReferenceSchema,
+  toNodeId: analysisNodeReferenceSchema,
 });
 const analysisRecommendedActionSchema = z.strictObject({
   tool: z.string().trim().min(1).max(1_024),
@@ -507,7 +509,7 @@ export const analysisGraphForkInputSchema = z.strictObject({
   workspaceId: idSchema,
   parentGraphId: idSchema,
   expectedVersion: positiveIntegerSchema,
-  forkNodeId: idSchema,
+  forkNodeId: analysisNodeReferenceSchema,
   ...commandContextInput,
 });
 export const metricComputeInputSchema = z.strictObject({
@@ -526,7 +528,7 @@ export const metricScenarioCreateInputSchema = z.strictObject({
   id: idSchema,
   workspaceId: idSchema,
   expectedVersion: positiveIntegerSchema,
-  metricNodeId: idSchema,
+  metricNodeId: analysisNodeReferenceSchema,
   targetValue: z.number().finite().nonnegative(),
   projectedDenominator: z.number().finite().nonnegative(),
   label: z.enum(["conservative", "base", "optimistic"]),
@@ -536,12 +538,12 @@ export const metricMonitorCompareInputSchema = z.strictObject({
   id: idSchema,
   workspaceId: idSchema,
   expectedVersion: positiveIntegerSchema,
-  baselineMetricNodeId: idSchema,
+  baselineMetricNodeId: analysisNodeReferenceSchema,
   batchId: idSchema,
   datasetId: idSchema,
   evidenceId: idSchema,
   assetId: idSchema,
-  scenarioNodeId: idSchema.optional(),
+  scenarioNodeId: analysisNodeReferenceSchema.optional(),
   comparability: analysisComparabilitySchema.optional(),
   ...commandContextInput,
 });

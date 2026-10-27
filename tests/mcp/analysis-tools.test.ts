@@ -15,7 +15,11 @@ import type { Evidence } from "../../src/domain/model.js";
 import { ArtifactStore } from "../../src/infrastructure/artifact-store.js";
 import { canonicalJson } from "../../src/infrastructure/sqlite.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
-import { MAX_SERIALIZED_INPUT_BYTES } from "../../src/mcp/schemas.js";
+import {
+  analysisGraphExpandInputSchema,
+  analysisGraphForkInputSchema,
+  MAX_SERIALIZED_INPUT_BYTES,
+} from "../../src/mcp/schemas.js";
 import { createMcpServer } from "../../src/mcp/server.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
 
@@ -182,6 +186,43 @@ describe("analysis MCP tools and initialization", () => {
     }
   });
 
+  it("separates bounded legacy node references from new entity IDs", () => {
+    const fork = {
+      id: "graph-legacy-reference-fork",
+      workspaceId: "workspace-1",
+      parentGraphId: "graph-legacy-reference",
+      expectedVersion: 1,
+      ...context("legacy-reference-fork"),
+    };
+    expect(analysisGraphForkInputSchema.safeParse({
+      ...fork,
+      forkNodeId: "l".repeat(265),
+    }).success).toBe(true);
+    expect(analysisGraphForkInputSchema.safeParse({
+      ...fork,
+      forkNodeId: "l".repeat(512),
+    }).success).toBe(true);
+    expect(analysisGraphForkInputSchema.safeParse({
+      ...fork,
+      forkNodeId: "l".repeat(513),
+    }).success).toBe(false);
+
+    const expand = {
+      id: "graph-legacy-reference",
+      workspaceId: "workspace-1",
+      expectedVersion: 1,
+      nodes: [{ id: "n".repeat(257), kind: "decision", payload: {} }],
+      edges: [],
+      ...context("legacy-reference-expand"),
+    };
+    expect(analysisGraphExpandInputSchema.safeParse(expand).success).toBe(false);
+    expect(analysisGraphExpandInputSchema.safeParse({
+      ...expand,
+      nodes: [],
+      edges: [{ id: "legacy-edge", fromNodeId: "l".repeat(265), toNodeId: "decision" }],
+    }).success).toBe(true);
+  });
+
   it("starts without data, lists honest capabilities, expands, forks, and restores graphs", async () => {
     const started = await call<AnalysisGraph>("marketing_analysis_start", {
       id: "graph-public",
@@ -216,7 +257,7 @@ describe("analysis MCP tools and initialization", () => {
         statement: "Compare public positioning before choosing a channel",
         unknowns: ["Conversion performance is unknown"],
       } }],
-      edges: [{ id: "edge-decision-1", fromNodeId: "graph-public-research", toNodeId: "decision-1" }],
+      edges: [{ id: "edge-decision-1", fromNodeId: started.nodes[1]!.id, toNodeId: "decision-1" }],
       ...context("expand-public"),
     });
     expect(expanded).toMatchObject({ version: 2 });
@@ -245,6 +286,113 @@ describe("analysis MCP tools and initialization", () => {
       id: "graph-public-fork",
       workspaceId: "workspace-1",
     })).toEqual(forked);
+  });
+
+  it("rejects forged server-derived nodes through MCP without blocking legitimate expansion", async () => {
+    const started = await call<AnalysisGraph>("marketing_analysis_start", {
+      id: "graph-forbidden-derived",
+      workspaceId: "workspace-1",
+      objective: "Keep computed evidence authoritative",
+      ...context("start-forbidden-derived"),
+    });
+    for (const kind of ["metric", "scenario", "monitor"] as const) {
+      const result = await client.callTool({
+        name: "analysis_graph_expand",
+        arguments: {
+          id: started.id,
+          workspaceId: started.workspaceId,
+          expectedVersion: 1,
+          nodes: [{
+            id: `forged-${kind}`,
+            kind,
+            payload: kind === "metric" ? {
+              metricId: "ctr_v1",
+              numerator: 100,
+              denominator: 1000,
+              value: 0.5,
+              referenceAssessment: { level: "high" },
+            } : { metricNodeId: "forged-metric", value: 0.5 },
+          }],
+          edges: [{
+            id: `forged-${kind}-edge`,
+            fromNodeId: started.nodes[1]!.id,
+            toNodeId: `forged-${kind}`,
+          }],
+          ...context(`forged-${kind}`),
+        },
+      });
+      expect(result).toMatchObject({ isError: true });
+    }
+    expect(await call<AnalysisGraph>("analysis_graph_get", {
+      id: started.id,
+      workspaceId: started.workspaceId,
+    })).toEqual(started);
+
+    const legitimate = await call<AnalysisGraph>("analysis_graph_expand", {
+      id: started.id,
+      workspaceId: started.workspaceId,
+      expectedVersion: 1,
+      nodes: [
+        { id: "new-question", kind: "question", payload: { objective: "What remains unknown?" } },
+        { id: "new-research", kind: "research", payload: { status: "planned" } },
+        { id: "new-dataset", kind: "dataset", payload: { status: "pending" } },
+        { id: "new-decision", kind: "decision", payload: { statement: "Do not infer CTR" } },
+      ],
+      edges: [
+        { id: "new-question-edge", fromNodeId: started.nodes[1]!.id, toNodeId: "new-question" },
+        { id: "new-research-edge", fromNodeId: "new-question", toNodeId: "new-research" },
+        { id: "new-dataset-edge", fromNodeId: "new-research", toNodeId: "new-dataset" },
+        { id: "new-decision-edge", fromNodeId: "new-dataset", toNodeId: "new-decision" },
+      ],
+      ...context("legitimate-derived-guard"),
+    });
+    expect(legitimate.nodes.slice(-4).map((node) => node.kind)).toEqual([
+      "question", "research", "dataset", "decision",
+    ]);
+  });
+
+  it("expands and forks maximum-length graph IDs with bounded stable node references", async () => {
+    const graphId = "g".repeat(256);
+    const startArguments = {
+      id: graphId,
+      workspaceId: "workspace-1",
+      objective: "Bound generated graph identifiers",
+      ...context("start-maximum-graph"),
+    };
+    const started = await call<AnalysisGraph>("marketing_analysis_start", startArguments);
+    expect(await call<AnalysisGraph>("marketing_analysis_start", startArguments)).toEqual(started);
+    for (const node of started.nodes) expect(node.id.length).toBeLessThanOrEqual(80);
+    for (const edge of started.edges) expect(edge.id.length).toBeLessThanOrEqual(80);
+
+    const expanded = await call<AnalysisGraph>("analysis_graph_expand", {
+      id: graphId,
+      workspaceId: "workspace-1",
+      expectedVersion: 1,
+      nodes: [{ id: "maximum-graph-decision", kind: "decision", payload: { status: "planned" } }],
+      edges: [{
+        id: "maximum-graph-decision-edge",
+        fromNodeId: started.nodes[1]!.id,
+        toNodeId: "maximum-graph-decision",
+      }],
+      ...context("expand-maximum-graph"),
+    });
+    const forked = await call<AnalysisGraph>("analysis_graph_fork", {
+      id: "f".repeat(256),
+      workspaceId: "workspace-1",
+      parentGraphId: graphId,
+      expectedVersion: expanded.version,
+      forkNodeId: started.nodes[0]!.id,
+      ...context("fork-maximum-graph"),
+    });
+    expect(forked.forkNodeId).toBe(started.nodes[0]!.id);
+
+    const other = await call<AnalysisGraph>("marketing_analysis_start", {
+      id: "h".repeat(256),
+      workspaceId: "workspace-1",
+      objective: "Bound generated graph identifiers",
+      ...context("start-other-maximum-graph"),
+    });
+    expect(other.nodes.map((node) => node.id)).not.toEqual(started.nodes.map((node) => node.id));
   });
 
   it.each(["links", "api"] as const)("executes %s ready actions verbatim with derived command context", async (inputMode) => {
@@ -291,7 +439,7 @@ describe("analysis MCP tools and initialization", () => {
       }),
       ...context(`start-fork-execution-${inputMode}`),
     });
-    const branchNodeId = inputMode === "links" ? `${started.id}-research` : `${started.id}-dataset`;
+    const branchNodeId = started.nodes[1]!.id;
     const parent = await call<AnalysisGraph>("analysis_graph_expand", {
       id: started.id,
       workspaceId: "workspace-1",
@@ -422,6 +570,105 @@ describe("analysis MCP tools and initialization", () => {
     ]));
   });
 
+  it("executes and replays metric follow-up actions verbatim after expand and fork with isolated identities", async () => {
+    async function importCsv(id: string, fileName: string, content: string): Promise<IngestionBatch> {
+      await writeFile(join(tempDir, fileName), content);
+      return call<IngestionBatch>("ingest_files", {
+        id,
+        workspaceId: "workspace-1",
+        paths: [fileName],
+        ...context(id),
+      });
+    }
+    async function descriptors(batch: IngestionBatch) {
+      const evidence = await store.transaction((repos) =>
+        repos.evidence.get(batch.evidenceIds[0]!, "workspace-1")) as Evidence;
+      return {
+        batchId: batch.id,
+        datasetId: batch.datasetIds[0]!,
+        evidenceId: batch.evidenceIds[0]!,
+        assetId: evidence.assets!.find((asset) => asset.kind === "normalized_jsonl")!.id,
+      };
+    }
+
+    const baseline = await importCsv(
+      "batch-action-baseline", "action-baseline.csv", "clicks,impressions\n100,1000\n",
+    );
+    const current = await importCsv(
+      "batch-action-current", "action-current.csv", "clicks,impressions\n200,1000\n",
+    );
+    const started = await call<AnalysisGraph>("marketing_analysis_start", {
+      id: "graph-follow-up-actions",
+      workspaceId: "workspace-1",
+      objective: "Execute derived follow-up actions",
+      inputMode: "dataset",
+      referenceId: baseline.datasetIds[0]!,
+      ...context("start-follow-up-actions"),
+    });
+    const computeAction = started.recommendedActions.find((action) =>
+      action.tool === "metric_compute" && action.arguments?.metricId === "ctr_v1")!;
+    const computed = await call<AnalysisGraph>(computeAction.tool, computeAction.arguments!);
+    const expanded = await call<AnalysisGraph>("analysis_graph_expand", {
+      id: computed.id,
+      workspaceId: computed.workspaceId,
+      expectedVersion: computed.version,
+      nodes: [],
+      edges: [],
+      ...context("expand-follow-up-actions"),
+    });
+    const scenarioAction = expanded.recommendedActions.find((action) =>
+      action.tool === "metric_scenario_create")!;
+    const monitorBeforeFork = expanded.recommendedActions.find((action) =>
+      action.tool === "metric_monitor_compare")!;
+    for (const action of [scenarioAction, monitorBeforeFork]) {
+      expect(action.arguments).toMatchObject({ actor: "agent-1" });
+      for (const field of ["requestId", "idempotencyKey"] as const) {
+        expect(action.arguments?.[field]).toEqual(expect.any(String));
+        expect(String(action.arguments?.[field]).length).toBeLessThanOrEqual(256);
+        expect(action.arguments?.[field]).not.toBe(computeAction.arguments?.[field]);
+      }
+    }
+    expect(scenarioAction.arguments?.idempotencyKey).not.toBe(
+      monitorBeforeFork.arguments?.idempotencyKey,
+    );
+
+    const scenarioArguments = {
+      ...scenarioAction.arguments,
+      label: "base",
+      targetValue: 0.15,
+      projectedDenominator: 1000,
+    };
+    const scenarioGraph = await call<AnalysisGraph>(scenarioAction.tool, scenarioArguments);
+    expect(await call<AnalysisGraph>(scenarioAction.tool, scenarioArguments)).toEqual(scenarioGraph);
+
+    const forked = await call<AnalysisGraph>("analysis_graph_fork", {
+      id: "graph-follow-up-actions-fork",
+      workspaceId: scenarioGraph.workspaceId,
+      parentGraphId: scenarioGraph.id,
+      expectedVersion: scenarioGraph.version,
+      forkNodeId: scenarioGraph.nodes.find((node) => node.kind === "metric")!.id,
+      ...context("fork-follow-up-actions"),
+    });
+    const parentMonitor = scenarioGraph.recommendedActions.find((action) =>
+      action.tool === "metric_monitor_compare")!;
+    const childMonitor = forked.recommendedActions.find((action) =>
+      action.tool === "metric_monitor_compare")!;
+    expect(childMonitor.arguments?.actor).toBe("agent-1");
+    expect(childMonitor.arguments?.requestId).not.toBe(parentMonitor.arguments?.requestId);
+    expect(childMonitor.arguments?.idempotencyKey).not.toBe(parentMonitor.arguments?.idempotencyKey);
+
+    const parentMonitorArguments = { ...parentMonitor.arguments, ...await descriptors(current) };
+    const parentResult = await call<AnalysisGraph>(parentMonitor.tool, parentMonitorArguments);
+    expect(await call<AnalysisGraph>(parentMonitor.tool, parentMonitorArguments)).toEqual(parentResult);
+    const childMonitorArguments = { ...childMonitor.arguments, ...await descriptors(current) };
+    const childResult = await call<AnalysisGraph>(childMonitor.tool, childMonitorArguments);
+    expect(await call<AnalysisGraph>(childMonitor.tool, childMonitorArguments)).toEqual(childResult);
+    expect(childResult.id).toBe(forked.id);
+    expect(childResult.version).toBe(2);
+    expect(childResult.nodes.find((node) => node.kind === "monitor")?.payload)
+      .toMatchObject({ status: "ok", absoluteDelta: 0.1 });
+  });
+
   it("rejects a 65,724-byte __proto__ payload without advancing the graph", async () => {
     await call<AnalysisGraph>("marketing_analysis_start", {
       id: "graph-proto",
@@ -457,8 +704,8 @@ describe("analysis MCP tools and initialization", () => {
     });
     expect(graph.version).toBe(1);
     expect(graph.nodes.map((node) => node.id)).toEqual([
-      "graph-proto-question",
-      "graph-proto-research",
+      expect.stringMatching(/^question-[a-f0-9]{64}$/),
+      expect.stringMatching(/^research-[a-f0-9]{64}$/),
     ]);
   });
 
