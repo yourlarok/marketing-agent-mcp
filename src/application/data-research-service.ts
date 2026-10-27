@@ -1121,6 +1121,7 @@ export class DataResearchService {
           createdAt: timestamp,
           updatedAt: timestamp,
           sourceId: source.id,
+          ingestionBatchId: input.id,
           name: `${parsed.source.fileName}${parsed.source.sheetName ? `#${parsed.source.sheetName}` : ""}`,
           coverageStart: prepared.qualityReport.coverageStart,
           coverageEnd: prepared.qualityReport.coverageEnd,

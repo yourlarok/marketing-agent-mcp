@@ -8,8 +8,20 @@ import {
   type AnalysisPayload,
   type AnalysisRecommendedAction,
 } from "../domain/analysis-model.js";
+import type { IngestionBatch } from "../domain/data-research-model.js";
 import { DomainError } from "../domain/errors.js";
+import {
+  METRIC_CATALOG,
+  assessMetricReference,
+  computeMetric as calculateMetric,
+  getMetricDefinition,
+  type MetricComputation,
+  type ReferenceAssessment,
+} from "../domain/metric-catalog.js";
+import type { Dataset, Evidence, EvidenceAsset, Source } from "../domain/model.js";
 import { canonicalAcquisitionUrl } from "../infrastructure/acquisition-policy.js";
+import type { ArtifactStore } from "../infrastructure/artifact-store.js";
+import { MAX_DATASET_JSONL_BYTES } from "../infrastructure/file-ingestor.js";
 import { credentialEnvironmentVariable } from "../infrastructure/safe-http.js";
 import { assertUtcInstant } from "../infrastructure/sqlite.js";
 import {
@@ -20,6 +32,7 @@ import {
 import {
   ANALYSIS_INPUT_MODES,
   type AnalysisCapability,
+  type ComputeMetric,
   type ExpandAnalysisGraph,
   type ForkAnalysisGraph,
   type GetAnalysisGraph,
@@ -67,6 +80,232 @@ async function requireGraph(
     });
   }
   return graph;
+}
+
+interface MetricDescriptors {
+  graph: AnalysisGraph;
+  batch: IngestionBatch;
+  dataset: Dataset;
+  evidence: Evidence;
+  source: Source;
+  asset: EvidenceAsset;
+  qualityAsset: EvidenceAsset;
+}
+
+interface PreparedMetric {
+  descriptors: MetricDescriptors;
+  computation: MetricComputation;
+  referenceAssessment: ReferenceAssessment;
+  qualityLimitations: string[];
+}
+
+function conflict(message: string): never {
+  throw new DomainError("CONFLICT", message);
+}
+
+async function loadMetricDescriptors(
+  repos: Repositories,
+  input: ComputeMetric,
+): Promise<MetricDescriptors> {
+  await requireWorkspace(repos, input.workspaceId);
+  const graph = await requireGraph(repos, input.id, input.workspaceId);
+  if (graph.version !== input.expectedVersion) {
+    throw new DomainError("CONFLICT", "Analysis graph version does not match expectedVersion");
+  }
+  const batch = await repos.ingestionBatches.get(input.batchId, input.workspaceId) as
+    IngestionBatch | undefined;
+  if (!batch) {
+    throw new DomainError("NOT_FOUND", "Ingestion batch not found in workspace", false, {
+      batchId: input.batchId,
+      workspaceId: input.workspaceId,
+    });
+  }
+  const dataset = await repos.datasets.get(input.datasetId, input.workspaceId) as Dataset | undefined;
+  if (!dataset) {
+    throw new DomainError("NOT_FOUND", "Metric dataset not found in workspace", false, {
+      datasetId: input.datasetId,
+      workspaceId: input.workspaceId,
+    });
+  }
+  const evidence = await repos.evidence.get(input.evidenceId, input.workspaceId) as Evidence | undefined;
+  if (!evidence) {
+    throw new DomainError("NOT_FOUND", "Metric evidence not found in workspace", false, {
+      evidenceId: input.evidenceId,
+      workspaceId: input.workspaceId,
+    });
+  }
+  const datasetIndexes = batch.datasetIds.flatMap((id, index) => id === dataset.id ? [index] : []);
+  if (datasetIndexes.length !== 1 || batch.evidenceIds[datasetIndexes[0]!] !== evidence.id) {
+    invalid("Dataset and evidence must be paired in the specified ingestion batch");
+  }
+  if (dataset.sourceId !== evidence.sourceId || !batch.sourceIds.includes(dataset.sourceId)) {
+    invalid("Batch, dataset, and evidence must reference the same Source");
+  }
+  const source = await repos.sources.get(dataset.sourceId, input.workspaceId) as Source | undefined;
+  if (!source) {
+    throw new DomainError("NOT_FOUND", "Metric Source not found in workspace", false, {
+      sourceId: dataset.sourceId,
+      workspaceId: input.workspaceId,
+    });
+  }
+  const assets = evidence.assets ?? [];
+  const asset = assets.find((candidate) => candidate.id === input.assetId);
+  if (!asset || asset.kind !== "normalized_jsonl") {
+    invalid("assetId must identify a normalized_jsonl asset on the specified evidence");
+  }
+  const qualityAssets = assets.filter((candidate) => candidate.kind === "quality_report");
+  if (qualityAssets.length !== 1) {
+    conflict("Metric evidence must contain exactly one quality report asset");
+  }
+  for (const candidate of [asset, qualityAssets[0]!]) {
+    if (!/^[0-9a-f]{64}$/.test(candidate.contentHash) ||
+        !Number.isSafeInteger(candidate.byteLength) || candidate.byteLength < 0 ||
+        candidate.byteLength > MAX_DATASET_JSONL_BYTES) {
+      conflict("Evidence asset descriptor has an invalid hash or byte length");
+    }
+  }
+  if (evidence.contentHash !== asset.contentHash) {
+    conflict("Evidence hash must match its normalized_jsonl asset");
+  }
+  return { graph, batch, dataset, evidence, source, asset, qualityAsset: qualityAssets[0]! };
+}
+
+function assertCurrentMetricDescriptors(
+  current: MetricDescriptors,
+  prepared: MetricDescriptors,
+): void {
+  for (const key of ["graph", "batch", "dataset", "evidence", "source"] as const) {
+    if (current[key].version !== prepared[key].version) {
+      conflict(`Metric ${key} changed while its artifact was being read`);
+    }
+  }
+  for (const key of ["asset", "qualityAsset"] as const) {
+    if (current[key].id !== prepared[key].id ||
+        current[key].kind !== prepared[key].kind ||
+        current[key].contentHash !== prepared[key].contentHash ||
+        current[key].byteLength !== prepared[key].byteLength) {
+      conflict("Metric evidence assets changed while they were being read");
+    }
+  }
+}
+
+function decodeArtifact(content: Buffer, label: string): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch {
+    return conflict(`${label} must be valid UTF-8`);
+  }
+}
+
+function parseNormalizedRows(content: Buffer): Record<string, unknown>[] {
+  const text = decodeArtifact(content, "normalized_jsonl");
+  if (text.length === 0) return [];
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines.map((line, index) => {
+    let row: unknown;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      return conflict(`normalized_jsonl contains malformed JSON at row ${index}`);
+    }
+    if (row === null || typeof row !== "object" || Array.isArray(row)) {
+      return conflict(`normalized_jsonl row ${index} must be a JSON object`);
+    }
+    return row as Record<string, unknown>;
+  });
+}
+
+function parseQualityReport(content: Buffer): { stale: boolean; limitations: string[] } {
+  let report: unknown;
+  try {
+    report = JSON.parse(decodeArtifact(content, "quality_report"));
+  } catch {
+    return conflict("quality_report must contain valid JSON");
+  }
+  if (report === null || typeof report !== "object" || Array.isArray(report) ||
+      !Array.isArray((report as { issues?: unknown }).issues)) {
+    conflict("quality_report must contain an issues array");
+  }
+  const issues = (report as { issues: unknown[] }).issues;
+  if (issues.some((issue) => issue === null || typeof issue !== "object" || Array.isArray(issue))) {
+    conflict("quality_report issues must be objects");
+  }
+  return {
+    stale: issues.some((issue) => (issue as { code?: unknown }).code === "STALE_DATA"),
+    limitations: issues.flatMap((issue) => {
+      const message = (issue as { message?: unknown }).message;
+      return typeof message === "string" ? [message] : [];
+    }),
+  };
+}
+
+async function readMetric(
+  store: Store,
+  artifacts: ArtifactStore,
+  input: ComputeMetric,
+): Promise<PreparedMetric> {
+  const descriptors = await store.transaction((repos) => loadMetricDescriptors(repos, input));
+  const [normalized, quality] = await Promise.all([
+    artifacts.read(descriptors.asset.contentHash, MAX_DATASET_JSONL_BYTES),
+    artifacts.read(descriptors.qualityAsset.contentHash, MAX_DATASET_JSONL_BYTES),
+  ]);
+  if (normalized.length !== descriptors.asset.byteLength ||
+      quality.length !== descriptors.qualityAsset.byteLength) {
+    conflict("Evidence artifact byte length does not match its descriptor");
+  }
+  const qualityReport = parseQualityReport(quality);
+  const computation = calculateMetric(input.metricId, parseNormalizedRows(normalized));
+  const referenceAssessment = assessMetricReference(input.metricId, computation, {
+    ownership: descriptors.source.ownership,
+    stale: qualityReport.stale,
+    ...(input.comparability === undefined ? {} : { comparability: input.comparability }),
+  });
+  const datasetLimitations = Array.isArray(descriptors.dataset.limitations)
+    ? descriptors.dataset.limitations.filter((item): item is string => typeof item === "string")
+    : [];
+  return {
+    descriptors,
+    computation,
+    referenceAssessment,
+    qualityLimitations: [...new Set([...datasetLimitations, ...qualityReport.limitations])],
+  };
+}
+
+function metricNodeId(input: ComputeMetric): string {
+  const identity = JSON.stringify([
+    input.id,
+    input.batchId,
+    input.datasetId,
+    input.evidenceId,
+    input.assetId,
+    input.metricId,
+  ]);
+  return `metric-${createHash("sha256").update(identity).digest("hex")}`;
+}
+
+function metricPayload(prepared: PreparedMetric, input: ComputeMetric): AnalysisPayload {
+  const { descriptors, computation } = prepared;
+  const definition = getMetricDefinition(input.metricId);
+  return {
+    ...computation,
+    batchId: input.batchId,
+    datasetId: input.datasetId,
+    evidenceId: input.evidenceId,
+    assetId: input.assetId,
+    sourceId: descriptors.source.id,
+    evidenceHash: descriptors.evidence.contentHash,
+    assetKind: descriptors.asset.kind,
+    assetContentHash: descriptors.asset.contentHash,
+    assetByteLength: descriptors.asset.byteLength,
+    coverage: {
+      start: descriptors.dataset.coverageStart,
+      end: descriptors.dataset.coverageEnd,
+    },
+    qualityLimitations: prepared.qualityLimitations,
+    definitionLimitations: [...definition.limitations],
+    referenceAssessment: prepared.referenceAssessment,
+  } as unknown as AnalysisPayload;
 }
 
 function referencedIds(payload: AnalysisPayload, singular: string, plural: string): string[] {
@@ -176,9 +415,53 @@ function startActions(
   return [];
 }
 
+async function datasetMetricActions(
+  repos: Repositories,
+  input: StartAnalysis & { inputMode: "dataset" },
+): Promise<AnalysisRecommendedAction[]> {
+  const dataset = await repos.datasets.get(input.referenceId!, input.workspaceId) as Dataset;
+  const fields = Array.isArray(dataset.fieldDefinitions)
+    ? dataset.fieldDefinitions.flatMap((field) =>
+        field !== null && typeof field === "object" && !Array.isArray(field) &&
+        typeof (field as { name?: unknown }).name === "string"
+          ? [(field as { name: string }).name]
+          : [])
+    : [];
+  const batch = dataset.ingestionBatchId === undefined
+    ? undefined
+    : await repos.ingestionBatches.get(dataset.ingestionBatchId, input.workspaceId) as
+      IngestionBatch | undefined;
+  const datasetIndex = batch?.datasetIds.indexOf(dataset.id) ?? -1;
+  const evidence = batch && datasetIndex >= 0
+    ? await repos.evidence.get(batch.evidenceIds[datasetIndex]!, input.workspaceId) as Evidence | undefined
+    : undefined;
+  const asset = evidence?.assets?.find((candidate) => candidate.kind === "normalized_jsonl");
+  return Object.values(METRIC_CATALOG).flatMap((definition) => {
+    if (!definition.monitoring.requiredFields.every((field) => fields.includes(field))) return [];
+    const complete = batch && evidence && asset;
+    return [{
+      tool: "metric_compute",
+      description: `Compute ${definition.id} from the imported normalized dataset; no custom formula is accepted.`,
+      arguments: {
+        id: input.id,
+        workspaceId: input.workspaceId,
+        expectedVersion: 1,
+        datasetId: dataset.id,
+        metricId: definition.id,
+        ...(batch ? { batchId: batch.id } : {}),
+        ...(evidence ? { evidenceId: evidence.id } : {}),
+        ...(asset ? { assetId: asset.id } : {}),
+      },
+      status: complete ? "ready" as const : "requires_input" as const,
+      missingInputs: complete ? [] : ["batchId", "evidenceId", "assetId"],
+    }];
+  });
+}
+
 function startGraph(
   input: StartAnalysis & { inputMode: NonNullable<StartAnalysis["inputMode"]> },
   timestamp: string,
+  metricActions: AnalysisRecommendedAction[] = [],
 ): AnalysisGraph {
   const question: AnalysisGraphNode = {
     id: `${input.id}-question`,
@@ -221,7 +504,7 @@ function startGraph(
       fromNodeId: question.id,
       toNodeId: branch.id,
     }],
-    recommendedActions: startActions(input),
+    recommendedActions: [...startActions(input), ...metricActions],
   });
 }
 
@@ -232,6 +515,7 @@ export class AnalysisService {
     private readonly store: Store,
     private readonly clock: Clock,
     ids: IdGenerator,
+    private readonly artifacts?: ArtifactStore,
   ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
@@ -317,14 +601,16 @@ export class AnalysisService {
       context: command.context,
       write: async (repos, current, timestamp) => {
         await requireWorkspace(repos, current.workspaceId);
+        let metricActions: AnalysisRecommendedAction[] = [];
         if (current.inputMode === "dataset") {
           await requireReferences(repos, current.workspaceId, [{
             id: "dataset-reference",
             kind: "dataset",
             payload: { datasetId: current.referenceId! },
           }]);
+          metricActions = await datasetMetricActions(repos, { ...current, inputMode: "dataset" });
         }
-        return repos.analysisGraphs.insert(startGraph(current, timestamp));
+        return repos.analysisGraphs.insert(startGraph(current, timestamp, metricActions));
       },
     });
   }
@@ -333,6 +619,68 @@ export class AnalysisService {
     assertNonEmptyString(query.id, "id");
     assertNonEmptyString(query.workspaceId, "workspaceId");
     return this.store.transaction((repos) => requireGraph(repos, query.id, query.workspaceId));
+  }
+
+  computeMetric(command: Command<ComputeMetric>): Promise<AnalysisGraph> {
+    const input = command.input;
+    assertExpectedVersion(input.expectedVersion);
+    for (const field of ["batchId", "datasetId", "evidenceId", "assetId"] as const) {
+      assertNonEmptyString(input[field], field);
+    }
+    getMetricDefinition(input.metricId);
+    if (!this.artifacts) {
+      throw new Error("ArtifactStore is required for metric computation");
+    }
+    let prepared: PreparedMetric | undefined;
+    return this.commands.executeBatch({
+      workspaceId: input.workspaceId,
+      action: "analysis_graph.compute_metric",
+      entityType: "analysis_graph",
+      input,
+      context: command.context,
+      write: async (repos, current, timestamp) => {
+        if (!prepared) conflict("Metric artifact preparation did not complete");
+        const descriptors = await loadMetricDescriptors(repos, current);
+        assertCurrentMetricDescriptors(descriptors, prepared.descriptors);
+        const datasetNode = descriptors.graph.nodes.find((node) =>
+          node.kind === "dataset" && node.payload.datasetId === current.datasetId);
+        if (!datasetNode) {
+          invalid("The analysis graph must contain the metric dataset node");
+        }
+        const nodeId = metricNodeId(current);
+        const recommendedActions = descriptors.graph.recommendedActions.flatMap((action) => {
+          if (action.tool !== "metric_compute") return [action];
+          const args = action.arguments;
+          if (args?.metricId === current.metricId &&
+              args.datasetId === current.datasetId && args.evidenceId === current.evidenceId &&
+              args.assetId === current.assetId && args.batchId === current.batchId) {
+            return [];
+          }
+          return [{
+            ...action,
+            arguments: { ...args, expectedVersion: descriptors.graph.version + 1 },
+          }];
+        });
+        const expanded = expandAnalysisGraph(descriptors.graph, {
+          expectedVersion: current.expectedVersion,
+          updatedAt: timestamp,
+          nodes: [{
+            id: nodeId,
+            kind: "metric",
+            payload: metricPayload(prepared, current),
+          }],
+          edges: [{
+            id: `metric-edge-${nodeId.slice("metric-".length)}`,
+            fromNodeId: datasetNode.id,
+            toNodeId: nodeId,
+          }],
+          recommendedActions,
+        });
+        return repos.analysisGraphs.update(expanded, current.expectedVersion);
+      },
+    }, async () => {
+      prepared = await readMetric(this.store, this.artifacts!, input);
+    });
   }
 
   expand(command: Command<ExpandAnalysisGraph>): Promise<AnalysisGraph> {
@@ -443,6 +791,15 @@ export class AnalysisCapabilityService {
         requiredInputs: ["id", "workspaceId", "parentGraphId", "expectedVersion", "forkNodeId", "actor", "requestId", "idempotencyKey"],
         availability: { state: "available", detail: "Creates an independent graph and leaves the parent unchanged." },
         limitations: ["No branch merge is provided."],
+      }),
+      capability({
+        id: "metric.compute",
+        operation: "metric_compute",
+        description: "Compute a controlled metric from same-batch normalized evidence and atomically append its graph node.",
+        requiredInputs: ["id", "workspaceId", "expectedVersion", "batchId", "datasetId", "evidenceId", "assetId", "metricId", "actor", "requestId", "idempotencyKey"],
+        configuration: ["ctr_v1", "save_like_ratio_v1", "ArtifactStore with content-addressed normalized_jsonl and quality_report assets"],
+        availability: { state: "available", detail: "Reads verified artifacts outside SQLite write transactions and rechecks entity versions before commit." },
+        limitations: ["Only the controlled formulas are implemented.", "A zero denominator returns unknown.", "No scenario, monitor, scheduled comparison, or MCP registration is provided by this service."],
       }),
       capability({
         id: "host.search",

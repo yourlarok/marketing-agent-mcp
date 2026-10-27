@@ -40,7 +40,7 @@ export class ArtifactStore {
     }
   }
 
-  async read(contentHash: string): Promise<Buffer> {
+  async read(contentHash: string, maxBytes?: number): Promise<Buffer> {
     if (!/^[0-9a-f]{64}$/.test(contentHash)) {
       throw new DomainError("NOT_FOUND", "Evidence asset not found");
     }
@@ -53,9 +53,15 @@ export class ArtifactStore {
       if (!metadata.isFile()) {
         throw new DomainError("NOT_FOUND", "Evidence asset not found");
       }
+      if (maxBytes !== undefined && metadata.size > maxBytes) {
+        throw new DomainError("CONFLICT", "Evidence artifact exceeds the allowed byte limit");
+      }
       const content = await handle.readFile();
-      if (createHash("sha256").update(content).digest("hex") !== contentHash) {
-        throw new DomainError("CONFLICT", "Evidence artifact content hash does not match");
+      if (
+        (maxBytes !== undefined && content.length > maxBytes) ||
+        createHash("sha256").update(content).digest("hex") !== contentHash
+      ) {
+        throw new DomainError("CONFLICT", "Evidence artifact content does not match its descriptor");
       }
       return content;
     } catch (error) {

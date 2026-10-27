@@ -3,6 +3,7 @@ import type {
   AnalysisGraphNode,
   AnalysisRecommendedAction,
 } from "../domain/analysis-model.js";
+import type { MetricId, ReferenceComparability } from "../domain/metric-catalog.js";
 import type { IngestContentLinks, IngestTemporaryApi } from "./data-research-commands.js";
 
 export const ANALYSIS_INPUT_MODES = ["none", "links", "dataset", "api"] as const;
@@ -42,6 +43,18 @@ export interface ForkAnalysisGraph {
   parentGraphId: string;
   expectedVersion: number;
   forkNodeId: string;
+}
+
+export interface ComputeMetric {
+  id: string;
+  workspaceId: string;
+  expectedVersion: number;
+  batchId: string;
+  datasetId: string;
+  evidenceId: string;
+  assetId: string;
+  metricId: MetricId;
+  comparability?: ReferenceComparability;
 }
 
 export type AnalysisCapabilityAvailability =

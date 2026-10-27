@@ -20,6 +20,7 @@ export interface Source extends EntityRecord {
 
 export interface Dataset extends EntityRecord {
   sourceId: string;
+  ingestionBatchId?: string;
   name: string;
   coverageStart: string | null;
   coverageEnd: string | null;
