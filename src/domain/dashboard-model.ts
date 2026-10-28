@@ -307,8 +307,9 @@ function assertNonEmptyString(value: unknown, label: string): void {
 }
 
 function assertReferenceId(value: unknown, label: string): void {
-  if (typeof value !== "string" || value.trim().length === 0 ||
-      value.trim() !== value || value.length > 128) {
+  if (typeof value !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) ||
+      ["__proto__", "prototype", "constructor"].includes(value)) {
     invalid(`${label} must be a normalized entity reference ID`);
   }
 }

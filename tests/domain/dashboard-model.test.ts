@@ -173,6 +173,32 @@ describe("dashboard entity contract", () => {
   });
 
   it.each([
+    "__proto__",
+    "prototype",
+    "constructor",
+    "source/1",
+    "source\\1",
+    "source 1",
+    "source\t1",
+    "source\n1",
+    "source\u00001",
+    "source:1",
+    "source@1",
+    " source-1",
+    "source-1 ",
+    "",
+  ])("rejects unsafe persisted entity reference ID %j", (sourceId) => {
+    expectInvalid(() => dashboard({
+      views: [view(viewInputs[0]!, { sources: [{ sourceId, updatedAt: later }] })],
+      sourceIds: [sourceId],
+      sourceVersions: [
+        { entityType: "source", id: sourceId, version: 1 },
+        { entityType: "analysis_graph", id: "graph-1", version: 2 },
+      ],
+    }));
+  });
+
+  it.each([
     ["duplicate html", [dashboard().artifacts[0], { ...dashboard().artifacts[0]!, id: "other-html" }]],
     ["missing manifest", [dashboard().artifacts[0]]],
     ["extra artifact", [...dashboard().artifacts, { ...dashboard().artifacts[1]!, id: "extra" }]],

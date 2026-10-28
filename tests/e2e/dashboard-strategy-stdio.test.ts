@@ -23,7 +23,7 @@ const workspaceId = "workspace-dashboard-strategy-stdio";
 const dashboardId = "dashboard-strategy-stdio";
 const graphId = "graph-dashboard-strategy-stdio";
 const diffId = "diff-dashboard-strategy-stdio";
-const taskIds = ["task-strategy-a", "task-strategy-b", "task-strategy-c"] as const;
+const taskIds = ["task-strategy-a", "task-strategy-b", "task-strategy-0-c"] as const;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -215,13 +215,18 @@ describe("built dashboard and strategy stdio acceptance", () => {
     expect(JSON.stringify(result)).not.toContain(dataDir);
   }
 
-  async function descriptors(client: Client, batch: IngestionBatch): Promise<JsonRecord> {
+  async function ingestionDescriptors(client: Client, batch: { id: string }): Promise<JsonRecord> {
     const lineage = await call(client, "data_research_get", {
       entityType: "ingestion_batch",
       id: batch.id,
       workspaceId,
     });
-    const evidence = (lineage.descriptors as JsonRecord).evidence as JsonRecord[];
+    return lineage.descriptors as JsonRecord;
+  }
+
+  async function descriptors(client: Client, batch: IngestionBatch): Promise<JsonRecord> {
+    const persisted = await ingestionDescriptors(client, batch);
+    const evidence = persisted.evidence as JsonRecord[];
     const assets = evidence[0]!.assets as { id: string; kind: string }[];
     return {
       batchId: batch.id,
@@ -325,6 +330,8 @@ describe("built dashboard and strategy stdio acceptance", () => {
     expect(current).toMatchObject({ state: "completed", failures: [] });
     const baselineDescriptors = await descriptors(client, baseline);
     const currentDescriptors = await descriptors(client, current);
+    const baselineMetadata = await ingestionDescriptors(client, baseline);
+    const currentMetadata = await ingestionDescriptors(client, current);
 
     const started = await call<AnalysisGraph>(client, "marketing_analysis_start", {
       id: graphId,
@@ -478,6 +485,23 @@ describe("built dashboard and strategy stdio acceptance", () => {
       ],
     });
 
+    const competitorMetadata = await ingestionDescriptors(client, { id: links.id as string });
+    const viewSource = (source: JsonRecord): JsonRecord => ({
+      sourceId: source.id,
+      updatedAt: source.updatedAt,
+      name: source.name,
+      type: source.type,
+      ownership: source.ownership,
+    });
+    const latest = (records: JsonRecord[], field: string): string =>
+      records.map((record) => record[field] as string).sort().at(-1)!;
+    const baselineSource = (baselineMetadata.sources as JsonRecord[])[0]!;
+    const currentSource = (currentMetadata.sources as JsonRecord[])[0]!;
+    const baselineEvidence = (baselineMetadata.evidence as JsonRecord[])[0]!;
+    const currentEvidence = (currentMetadata.evidence as JsonRecord[])[0]!;
+    const competitorSources = competitorMetadata.sources as JsonRecord[];
+    const competitorEvidence = competitorMetadata.evidence as JsonRecord[];
+
     const renderV1Arguments = {
       id: dashboardId,
       workspaceId,
@@ -498,15 +522,41 @@ describe("built dashboard and strategy stdio acceptance", () => {
       status: "unverifiable",
       reasons: [{ code: "TASK_NOT_LINKED" }],
     });
-    for (const view of dashboardV1.views) {
-      expect(view.sourceUpdatedAt).toEqual(expect.any(String));
-      expect(view).toHaveProperty("dataAsOf");
-      expect(view.sources).toEqual(expect.any(Array));
-      expect(view.metrics).toEqual(expect.any(Array));
+    const baselineViewMetadata = {
+      sources: [viewSource(baselineSource)],
+      sourceUpdatedAt: baselineSource.updatedAt,
+      dataAsOf: baselineEvidence.observedAt,
+    };
+    for (const view of dashboardV1.views.slice(0, 3)) {
+      expect(view).toMatchObject(baselineViewMetadata);
     }
-    expect(dashboardV1.views[1]!.metrics).toEqual([
-      expect.objectContaining({ metricId: "ctr_v1", formula: "sum(clicks) / sum(impressions)" }),
-    ]);
+    expect(dashboardV1.views[0]!.metrics).toEqual([]);
+    expect(dashboardV1.views[1]!.metrics).toEqual([{
+      metricId: "ctr_v1",
+      formula: "sum(clicks) / sum(impressions)",
+      definitionVersion: metric.payload.definitionVersion,
+    }]);
+    expect(dashboardV1.views[2]!.metrics).toEqual([]);
+    expect(dashboardV1.views[3]).toMatchObject({
+      competitorDiffId: diffId,
+      sourceUpdatedAt: latest(competitorSources, "updatedAt"),
+      dataAsOf: latest(competitorEvidence, "observedAt"),
+      metrics: [],
+    });
+    expect(dashboardV1.views[3]!.sources).toHaveLength(2);
+    expect(dashboardV1.views[3]!.sources).toEqual(expect.arrayContaining(competitorSources.map(viewSource)));
+    for (const source of dashboardV1.views[3]!.sources as JsonRecord[]) {
+      expect(source.ownership).toBe("external_public");
+    }
+    expect(dashboardV1.views[4]).toMatchObject({
+      graphId,
+      taskIds: [],
+      monitorNodeIds: [monitor.id],
+      sourceUpdatedAt: dashboardV1.generatedAt,
+      dataAsOf: null,
+      sources: [],
+      metrics: [],
+    });
     expect(dashboardV1.artifacts.map((artifact) => artifact.kind).sort()).toEqual(["html", "manifest"]);
     for (const artifact of dashboardV1.artifacts) {
       expect(artifact.contentHash).toMatch(/^[0-9a-f]{64}$/);
@@ -522,11 +572,92 @@ describe("built dashboard and strategy stdio acceptance", () => {
     expect(manifest).toMatchObject({ dashboardId, workspaceId, renderer: dashboardV1.renderer });
     const manifestViews = manifest.views as JsonRecord[];
     expect(manifestViews).toHaveLength(5);
+    const assertBaselineDatum = (datum: JsonRecord, nodeId: string): void => {
+      expect(datum).toMatchObject({
+        datasetIds: [baseline.datasetIds[0]],
+        evidenceIds: [baseline.evidenceIds[0]],
+        analysisGraphRefs: [{
+          graphId,
+          graphVersion: monitorGraph.version,
+          nodeId,
+          kind: nodeId === metric.id ? "metric" : "analytics",
+        }],
+        datasets: [{
+          datasetId: baseline.datasetIds[0],
+          sourceId: baselineSource.id,
+        }],
+        evidence: [{
+          evidenceId: baseline.evidenceIds[0],
+          sourceId: baselineSource.id,
+          contentHash: baselineEvidence.contentHash,
+        }],
+      });
+    };
     const trendManifestData = manifestViews[0]!.data as JsonRecord[];
-    expect(trendManifestData[0]).toMatchObject({
-      datumId: `${trend.id}/point/0`,
-      formula: expect.any(String),
-      evidence: [expect.objectContaining({ evidenceId: baseline.evidenceIds[0] })],
+    expect(trendManifestData).toHaveLength(40);
+    for (const datum of trendManifestData) {
+      assertBaselineDatum(datum, trend.id);
+      expect(datum).toMatchObject({
+        formula: trend.payload.formula,
+        definitionVersion: trend.payload.definitionVersion,
+      });
+    }
+    expect(trendManifestData[0]).toMatchObject({ datumId: `${trend.id}/point/0` });
+    const structureManifestData = manifestViews[1]!.data as JsonRecord[];
+    expect(structureManifestData).toHaveLength(1);
+    assertBaselineDatum(structureManifestData[0]!, metric.id);
+    expect(structureManifestData[0]).toMatchObject({
+      datumId: metric.id,
+      metricId: "ctr_v1",
+      formula: "sum(clicks) / sum(impressions)",
+      definitionVersion: metric.payload.definitionVersion,
+    });
+    const funnelManifestData = manifestViews[2]!.data as JsonRecord[];
+    expect(funnelManifestData).toHaveLength(3);
+    for (const datum of funnelManifestData) {
+      assertBaselineDatum(datum, funnel.id);
+      expect(datum).toMatchObject({
+        formula: funnel.payload.formula,
+        definitionVersion: funnel.payload.definitionVersion,
+      });
+    }
+    const competitorManifestData = manifestViews[3]!.data as JsonRecord[];
+    expect(competitorManifestData).toHaveLength(3);
+    const diffEntries = diff.entries as JsonRecord[];
+    for (const [index, datum] of competitorManifestData.entries()) {
+      expect(datum).toMatchObject({
+        competitorDiffId: diffId,
+        datasetIds: [],
+        datasets: [],
+        analysisGraphRefs: [],
+      });
+      const expectedEvidenceIds = diffEntries[index]!.evidenceIds as string[];
+      expect(datum.evidenceIds).toEqual(expectedEvidenceIds);
+      expect(datum.evidence).toHaveLength(expectedEvidenceIds.length);
+      for (const evidenceId of expectedEvidenceIds) {
+        const evidence = competitorEvidence.find((candidate) => candidate.id === evidenceId)!;
+        expect(datum.evidence).toContainEqual(expect.objectContaining({
+          evidenceId,
+          sourceId: evidence.sourceId,
+          contentHash: evidence.contentHash,
+        }));
+      }
+    }
+    expect(competitorManifestData.slice(0, 2).every((datum) =>
+      (datum.evidenceIds as string[]).length === 2 &&
+      (datum.evidence as JsonRecord[]).length === 2
+    )).toBe(true);
+    expect(competitorManifestData[2]).toMatchObject({
+      result: "unknown",
+      evidenceIds: [],
+      evidence: [],
+      reasons: [expect.objectContaining({ code: "COMPETITOR_DIFF_UNKNOWN" })],
+    });
+    expect(manifestViews[4]).toMatchObject({
+      graphId,
+      taskIds: [],
+      monitorNodeIds: [monitor.id],
+      data: [],
     });
     expect(htmlV1.bytes.toString("utf8")).toContain("COMPETITOR_DIFF_UNKNOWN");
 
@@ -722,10 +853,10 @@ describe("built dashboard and strategy stdio acceptance", () => {
       reason: "Stale rejection must not apply.",
     });
 
-    const taskCArguments = taskArguments(taskIds[2], 2, "task-c-supplement");
+    const taskCArguments = taskArguments(taskIds[2], 1, "task-c-supplement");
     const taskC = await call(client, "strategy_task_supplement", taskCArguments);
     expect(await call(client, "strategy_task_supplement", taskCArguments)).toEqual(taskC);
-    expect(taskC).toMatchObject({ version: 1, state: "draft", rank: 2 });
+    expect(taskC).toMatchObject({ version: 1, state: "draft", rank: 1 });
 
     let transitioned = reordered;
     for (const [next, expectedVersion] of [["ready", 3], ["in_progress", 4], ["completed", 5]] as const) {
@@ -739,12 +870,17 @@ describe("built dashboard and strategy stdio acceptance", () => {
       expect(transitioned).toMatchObject({ state: next, version: expectedVersion + 1 });
     }
     const listed = await call(client, "strategy_task_list", { workspaceId, limit: 20 });
-    expect((listed.tasks as JsonRecord[]).map((task) => task.id)).toEqual([taskIds[1], taskIds[2], taskIds[0]]);
-    expect((listed.tasks as JsonRecord[]).map((task) => [task.rank, task.id])).toEqual([
+    const listedTasks = listed.tasks as JsonRecord[];
+    expect(listedTasks.map((task) => task.id)).toEqual([taskIds[2], taskIds[1], taskIds[0]]);
+    expect(listedTasks.map((task) => [task.rank, task.id])).toEqual([
+      [1, taskIds[2]],
       [1, taskIds[1]],
-      [2, taskIds[2]],
       [3, taskIds[0]],
     ]);
+    const rankOneIds = listedTasks.slice(0, 2).map((task) => task.id as string);
+    expect(rankOneIds).toEqual([taskIds[2], taskIds[1]]);
+    expect(rankOneIds).toEqual([...rankOneIds].sort());
+    expect(rankOneIds).not.toEqual([taskIds[1], taskIds[2]]);
     const fullTasks = await Promise.all(taskIds.map((id) => call(client, "strategy_task_get", { id, workspaceId })));
     for (const task of fullTasks) {
       expect(task).not.toHaveProperty("scheduledAt");
@@ -763,7 +899,24 @@ describe("built dashboard and strategy stdio acceptance", () => {
     expect(await call(client, "dashboard_render", renderV2Arguments)).toEqual(dashboardV2);
     expect(dashboardV2).toMatchObject({ version: 2 });
     const taskViewV2 = dashboardV2.views[4]!;
-    expect(taskViewV2).toMatchObject({ status: "ok", taskIds: [taskIds[0]] });
+    expect(taskViewV2).toMatchObject({
+      status: "ok",
+      graphId,
+      taskIds: [taskIds[0]],
+      monitorNodeIds: [monitor.id],
+      sourceUpdatedAt: latest([baselineSource, currentSource], "updatedAt"),
+      dataAsOf: latest([baselineEvidence, currentEvidence], "observedAt"),
+      metrics: [{
+        metricId: "ctr_v1",
+        formula: "sum(clicks) / sum(impressions)",
+        definitionVersion: monitor.payload.definitionVersion,
+      }],
+    });
+    expect(taskViewV2.sources).toHaveLength(2);
+    expect(taskViewV2.sources).toEqual(expect.arrayContaining([
+      viewSource(baselineSource),
+      viewSource(currentSource),
+    ]));
     const htmlDescriptorV2 = dashboardV2.artifacts.find((artifact) => artifact.kind === "html")!;
     const manifestDescriptorV2 = dashboardV2.artifacts.find((artifact) => artifact.kind === "manifest")!;
     expect(htmlDescriptorV2.contentHash).not.toBe(htmlDescriptorV1.contentHash);
@@ -772,14 +925,48 @@ describe("built dashboard and strategy stdio acceptance", () => {
     const manifestV2 = JSON.parse(manifestV2Bytes.bytes.toString("utf8")) as JsonRecord;
     const taskDataV2 = ((manifestV2.views as JsonRecord[])[4]!.data as JsonRecord[])[0]!;
     expect(taskDataV2).toMatchObject({
+      datumId: `${taskIds[0]}/recommendation-strategy/0/${monitor.id}`,
       taskId: taskIds[0],
       monitorNodeId: monitor.id,
+      metricId: "ctr_v1",
+      formula: "sum(clicks) / sum(impressions)",
+      definitionVersion: monitor.payload.definitionVersion,
       baselineValue: 0.1,
       currentValue: 0.2,
       absoluteDelta: 0.1,
       relativeDelta: 1,
       interpretation: "observed_change_not_causal",
+      analysisGraphRefs: [
+        { graphId, graphVersion: monitorGraph.version, nodeId: monitor.id, kind: "monitor" },
+        { graphId, graphVersion: monitorGraph.version, nodeId: metric.id, kind: "metric" },
+      ],
     });
+    expect(taskDataV2.datasetIds).toHaveLength(2);
+    expect(taskDataV2.datasetIds).toEqual(expect.arrayContaining([
+      baseline.datasetIds[0],
+      current.datasetIds[0],
+    ]));
+    expect(taskDataV2.evidenceIds).toHaveLength(2);
+    expect(taskDataV2.evidenceIds).toEqual(expect.arrayContaining([
+      baseline.evidenceIds[0],
+      current.evidenceIds[0],
+    ]));
+    expect(taskDataV2.datasets).toEqual(expect.arrayContaining([
+      expect.objectContaining({ datasetId: baseline.datasetIds[0], sourceId: baselineSource.id }),
+      expect.objectContaining({ datasetId: current.datasetIds[0], sourceId: currentSource.id }),
+    ]));
+    expect(taskDataV2.evidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        evidenceId: baseline.evidenceIds[0],
+        sourceId: baselineSource.id,
+        contentHash: baselineEvidence.contentHash,
+      }),
+      expect.objectContaining({
+        evidenceId: current.evidenceIds[0],
+        sourceId: currentSource.id,
+        contentHash: currentEvidence.contentHash,
+      }),
+    ]));
     const recommendationLineage = await call(client, "lineage_get", {
       entityType: "recommendation",
       id: "recommendation-strategy",
