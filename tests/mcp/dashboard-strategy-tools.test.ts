@@ -454,6 +454,29 @@ describe("dashboard and strategy MCP contracts", () => {
     expect(instructions).toMatch(/never automatically produce, approve, schedule, or publish/);
   });
 
+  it("omits uninstalled dashboard and strategy instructions for empty and legacy 35-tool servers", async () => {
+    const cases = [
+      { expectedTools: 0, legacyServer: createMcpServer() },
+      { expectedTools: 35, legacyServer: createMcpServer(marketing, dataResearch, analysis) },
+    ];
+    for (const { expectedTools, legacyServer } of cases) {
+      const legacyClient = new Client({ name: "legacy-test-client", version: "1.0.0" });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      try {
+        await legacyServer.connect(serverTransport);
+        await legacyClient.connect(clientTransport);
+        expect((await legacyClient.listTools()).tools).toHaveLength(expectedTools);
+        const instructions = legacyClient.getInstructions()!;
+        expect(instructions).not.toMatch(/dashboard_drilldown_get/);
+        expect(instructions).not.toMatch(/controlled HTML\/SVG/);
+        expect(instructions).not.toMatch(/user-controlled drafts/);
+        expect(instructions).not.toMatch(/Treat strategy tasks/);
+      } finally {
+        await Promise.all([legacyClient.close(), legacyServer.close()]);
+      }
+    }
+  });
+
   it("reports installed availability, required inputs, limits, and honest renderer and task limitations", async () => {
     const capabilities = await call<AnalysisCapability[]>("marketing_capability_list");
     const renderer = capabilities.find((capability) => capability.id === "dashboard.controlled_renderer")!;
