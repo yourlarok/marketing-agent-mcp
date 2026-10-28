@@ -192,14 +192,36 @@ function scenarioImpact(
   if (scenario.payload.metricNodeId !== baseline.id) {
     invalid("Scenario must reference the stated baseline Metric node");
   }
-  if (scenario.payload.status !== "ok" && scenario.payload.status !== "unknown") {
-    invalid("Scenario status must be supported");
+  if ((baseline.payload.status !== "ok" && baseline.payload.status !== "unknown") ||
+      (scenario.payload.status !== "ok" && scenario.payload.status !== "unknown")) {
+    invalid("Baseline Metric and Scenario statuses must be supported");
+  }
+  if (baseline.payload.status !== scenario.payload.status) {
+    invalid("Scenario and baseline Metric known/unknown statuses must match");
+  }
+  const baselineValue = nullableFinite(baseline.payload.value, "Baseline Metric value");
+  const baselineNumerator = nullableFinite(baseline.payload.numerator, "Baseline Metric numerator");
+  const baselineDenominator = nullableFinite(baseline.payload.denominator, "Baseline Metric denominator");
+  const scenarioBaselineValue = nullableFinite(scenario.payload.baselineValue, "Scenario baselineValue");
+  const scenarioBaselineNumerator = nullableFinite(scenario.payload.baselineNumerator, "Scenario baselineNumerator");
+  const scenarioBaselineDenominator = nullableFinite(scenario.payload.baselineDenominator, "Scenario baselineDenominator");
+  if (scenarioBaselineValue !== baselineValue ||
+      scenarioBaselineNumerator !== baselineNumerator ||
+      scenarioBaselineDenominator !== baselineDenominator) {
+    invalid("Scenario baseline value, numerator, and denominator must match its Metric node");
+  }
+  const status = scenario.payload.status;
+  if (status === "unknown") {
+    if (baselineValue !== null) {
+      invalid("An unknown baseline Metric cannot have a precise value");
+    }
+  } else if (baselineValue === null || baselineNumerator === null || baselineDenominator === null) {
+    invalid("A known baseline Metric requires value, numerator, and denominator");
   }
   if (!Array.isArray(scenario.payload.assumptions) ||
       scenario.payload.assumptions.some((value) => typeof value !== "string" || value.trim().length === 0)) {
     invalid("Scenario assumptions must be non-empty strings");
   }
-  const status = scenario.payload.status;
   const assumptions = scenario.payload.assumptions as string[];
   const unknownReason = status === "unknown"
     ? scenario.payload.relativeDeltaUnknownReason ?? "UNKNOWN_BASELINE"
@@ -207,15 +229,24 @@ function scenarioImpact(
   if (typeof unknownReason !== "string" && unknownReason !== null) {
     invalid("Scenario unknown reason must be explicit");
   }
+  const absoluteDelta = nullableFinite(scenario.payload.absoluteDelta, "Scenario absoluteDelta");
+  const relativeDelta = nullableFinite(scenario.payload.relativeDelta, "Scenario relativeDelta");
+  const projectedNumerator = nullableFinite(scenario.payload.projectedNumerator, "Scenario projectedNumerator");
+  const projectedNumeratorDelta = nullableFinite(scenario.payload.projectedNumeratorDelta, "Scenario projectedNumeratorDelta");
+  if (status === "unknown" &&
+      [absoluteDelta, relativeDelta, projectedNumerator, projectedNumeratorDelta]
+        .some((value) => value !== null)) {
+    invalid("An unknown Scenario baseline cannot produce precise deltas or projected numerator values");
+  }
   return {
     formula: definition.formula,
-    baselineValue: nullableFinite(scenario.payload.baselineValue, "Scenario baselineValue"),
+    baselineValue: scenarioBaselineValue,
     targetValue: requiredFinite(scenario.payload.targetValue, "Scenario targetValue"),
     projectedDenominator: requiredFinite(scenario.payload.projectedDenominator, "Scenario projectedDenominator"),
-    absoluteDelta: nullableFinite(scenario.payload.absoluteDelta, "Scenario absoluteDelta"),
-    relativeDelta: nullableFinite(scenario.payload.relativeDelta, "Scenario relativeDelta"),
-    projectedNumerator: nullableFinite(scenario.payload.projectedNumerator, "Scenario projectedNumerator"),
-    projectedNumeratorDelta: nullableFinite(scenario.payload.projectedNumeratorDelta, "Scenario projectedNumeratorDelta"),
+    absoluteDelta,
+    relativeDelta,
+    projectedNumerator,
+    projectedNumeratorDelta,
     assumptions: [...assumptions],
     status,
     unknownReason,

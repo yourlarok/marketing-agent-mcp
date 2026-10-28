@@ -339,6 +339,26 @@ describe("StrategyService evidence-bound recommendations and user-controlled tas
   });
 
   it.each([
+    ["baseline value", "baseline-node", { value: 0.1 }],
+    ["scenario absolute delta", "scenario-node", { absoluteDelta: 0.05 }],
+    ["scenario projected numerator", "scenario-node", { projectedNumerator: 150 }],
+  ])("rejects pseudo-precise unknown Scenario %s", async (_label, nodeId, payloadPatch) => {
+    const unknown = baselineComputation({
+      status: "unknown",
+      unknownReason: "ZERO_DENOMINATOR",
+      ...(nodeId === "baseline-node" ? {} : { value: null, numerator: 10, denominator: 0 }),
+    });
+    const nodes = graphNodes(unknown).map((node) => node.id === nodeId
+      ? { ...node, payload: { ...node.payload, ...payloadPatch } }
+      : node);
+    await insertGraph(`graph-pseudo-${_label.replaceAll(" ", "-")}`, "workspace-1", nodes);
+
+    await expect(generateRecommendation({
+      analysisGraphId: `graph-pseudo-${_label.replaceAll(" ", "-")}`,
+    })).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+  });
+
+  it.each([
     ["missing finding", { findingIds: ["finding-missing"] }, "NOT_FOUND"],
     ["missing graph", { analysisGraphId: "graph-missing" }, "NOT_FOUND"],
     ["missing supporting node", { analysisNodeIds: ["node-missing"] }, "NOT_FOUND"],
@@ -405,6 +425,11 @@ describe("StrategyService evidence-bound recommendations and user-controlled tas
     ["baseline kind", "baseline-node", { kind: "question" }],
     ["scenario kind", "scenario-node", { kind: "question" }],
     ["scenario baseline reference", "scenario-node", { payload: { metricNodeId: "another-node" } }],
+    ["scenario baseline value", "scenario-node", { payload: { baselineValue: 0.9 } }],
+    ["scenario baseline numerator", "scenario-node", { payload: { baselineNumerator: 900 } }],
+    ["scenario baseline denominator", "scenario-node", { payload: { baselineDenominator: 900 } }],
+    ["baseline known/unknown status", "baseline-node", { payload: { status: "unknown", unknownReason: "ZERO_DENOMINATOR" } }],
+    ["scenario known/unknown status", "scenario-node", { payload: { status: "unknown", relativeDeltaUnknownReason: "UNKNOWN_BASELINE" } }],
     ["scenario metric", "scenario-node", { payload: { metricId: "engagement_rate_v1" } }],
     ["baseline metric", "baseline-node", { payload: { metricId: "engagement_rate_v1" } }],
     ["scenario definition", "scenario-node", { payload: { definitionVersion: 2 } }],
