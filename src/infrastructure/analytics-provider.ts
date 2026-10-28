@@ -51,6 +51,84 @@ export interface McpAnalyticsProviderOptions {
   maxResponseBytes?: number;
 }
 
+const CLEANUP_GRACE_MS = 100;
+const CLEANUP_KILL_TIMEOUT_MS = 1_000;
+
+class BoundedStdioClientTransport extends StdioClientTransport {
+  private readonly exited: Promise<void>;
+  private exitedResolve!: () => void;
+  private processObserved = false;
+  private childPid: number | undefined;
+  private hasExited = false;
+
+  constructor(parameters: ConstructorParameters<typeof StdioClientTransport>[0]) {
+    super(parameters);
+    this.exited = new Promise((resolve) => {
+      this.exitedResolve = resolve;
+    });
+    this.onclose = () => {
+      this.hasExited = true;
+      this.exitedResolve();
+    };
+  }
+
+  override async start(): Promise<void> {
+    await super.start();
+    this.childPid = this.pid ?? undefined;
+    this.processObserved = this.childPid !== undefined;
+  }
+
+  get needsCleanup(): boolean {
+    return this.processObserved && !this.hasExited;
+  }
+
+  async waitForExit(timeoutMs: number): Promise<boolean> {
+    if (this.hasExited) return true;
+    return settlesWithin(this.exited, timeoutMs);
+  }
+
+  terminate(signal: NodeJS.Signals): void {
+    if (this.childPid === undefined || this.hasExited) return;
+    try {
+      process.kill(this.childPid, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise.then(() => true), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function closeProvider(client: Client, transport: BoundedStdioClientTransport): Promise<void> {
+  if (!transport.needsCleanup) return;
+  let closeFailure: unknown;
+  const closing = client.close().catch((error: unknown) => {
+    closeFailure = error;
+  });
+  if (!(await transport.waitForExit(CLEANUP_GRACE_MS))) {
+    transport.terminate("SIGTERM");
+    if (!(await transport.waitForExit(CLEANUP_GRACE_MS))) {
+      transport.terminate("SIGKILL");
+      if (!(await transport.waitForExit(CLEANUP_KILL_TIMEOUT_MS))) {
+        throw capabilityGap("mcp_cleanup_failed", "Professional analytics MCP process did not exit after SIGKILL");
+      }
+    }
+  }
+  if (!(await settlesWithin(closing, CLEANUP_KILL_TIMEOUT_MS)) || closeFailure !== undefined) {
+    throw capabilityGap("mcp_cleanup_failed", "Professional analytics MCP cleanup failed");
+  }
+}
+
 function capabilityGap(reason: string, message: string, retryable = false): DomainError {
   return new DomainError("CAPABILITY_UNAVAILABLE", message, retryable, {
     capability: "professional_analytics",
@@ -94,14 +172,19 @@ export class McpAnalyticsProvider implements AnalyticsProvider {
       const value = sourceEnvironment[name];
       if (/^[A-Z_][A-Z0-9_]*$/i.test(name) && typeof value === "string") environment[name] = value;
     }
-    const transport = new StdioClientTransport({
+    const timeout = this.options.timeoutMs ?? ANALYTICS_PROVIDER_LIMITS.timeoutMs;
+    const maxResponseBytes = this.options.maxResponseBytes ?? ANALYTICS_PROVIDER_LIMITS.maxResponseBytes;
+    let rawResponseTooLarge = false;
+    const transport = new BoundedStdioClientTransport({
       command: this.options.command!,
       args: this.options.args ?? [],
       env: environment,
       stderr: "ignore",
+      maxBufferSize: maxResponseBytes,
     });
-    const timeout = this.options.timeoutMs ?? ANALYTICS_PROVIDER_LIMITS.timeoutMs;
-    const maxResponseBytes = this.options.maxResponseBytes ?? ANALYTICS_PROVIDER_LIMITS.maxResponseBytes;
+    transport.onerror = (error) => {
+      if (error.message.includes("ReadBuffer exceeded maximum size")) rawResponseTooLarge = true;
+    };
     const abort = new AbortController();
     let timedOut = false;
     let timer: NodeJS.Timeout | undefined;
@@ -121,10 +204,6 @@ export class McpAnalyticsProvider implements AnalyticsProvider {
         }),
         deadline,
       ]);
-      const responseBytes = Buffer.byteLength(JSON.stringify(response));
-      if (responseBytes > maxResponseBytes) {
-        throw capabilityGap("mcp_response_too_large", "Professional analytics MCP response exceeds the byte limit");
-      }
       if (response.isError) {
         throw capabilityGap("mcp_unavailable", "Professional analytics MCP analyze failed");
       }
@@ -152,6 +231,9 @@ export class McpAnalyticsProvider implements AnalyticsProvider {
         toolVersion: client.getServerVersion()?.version ?? "unknown",
       };
     } catch (error) {
+      if (rawResponseTooLarge) {
+        throw capabilityGap("mcp_response_too_large", "Professional analytics MCP raw response exceeds the byte limit");
+      }
       if (error instanceof DomainError && error.code === "CAPABILITY_UNAVAILABLE") throw error;
       if (timedOut || abort.signal.aborted) {
         throw capabilityGap("mcp_timeout", "Professional analytics MCP timed out", true);
@@ -159,8 +241,7 @@ export class McpAnalyticsProvider implements AnalyticsProvider {
       throw capabilityGap("mcp_unavailable", "Professional analytics MCP is unavailable", true);
     } finally {
       if (timer) clearTimeout(timer);
-      const closing = client.close().catch(() => undefined);
-      if (!timedOut) await closing;
+      await closeProvider(client, transport);
     }
   }
 }

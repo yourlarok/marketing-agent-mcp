@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
@@ -9,8 +11,10 @@ import {
 } from "../../src/domain/analytics-model.js";
 import type { DomainError } from "../../src/domain/errors.js";
 import { McpAnalyticsProvider } from "../../src/infrastructure/analytics-provider.js";
+import { createTempDir, removeTempDir } from "../helpers.js";
 
 const fixture = fileURLToPath(new URL("../fixtures/professional-analytics-mcp.mjs", import.meta.url));
+const rawFixture = fileURLToPath(new URL("../fixtures/raw-analytics-mcp.mjs", import.meta.url));
 const rows: AnalyticsRow[] = [
   { observedAt: "2026-01-01T00:00:00.000Z", revenue: 10, impressions: 100, clicks: 20, conversions: 2 },
   { observedAt: "2026-01-01T01:00:00.000Z", revenue: 11, impressions: 100, clicks: 20, conversions: 2 },
@@ -35,7 +39,11 @@ const anomaly: AnalyticsOperation = {
   parameters: { valueField: "revenue" },
 };
 
-function provider(mode?: string, patch: { timeoutMs?: number; maxResponseBytes?: number } = {}) {
+function provider(
+  mode?: string,
+  patch: { timeoutMs?: number; maxResponseBytes?: number; pidFile?: string } = {},
+) {
+  const { pidFile, ...options } = patch;
   return new McpAnalyticsProvider({
     command: process.execPath,
     args: [fixture],
@@ -44,9 +52,10 @@ function provider(mode?: string, patch: { timeoutMs?: number; maxResponseBytes?:
       HOME: process.env.HOME,
       MARKETING_TEST_BUSINESS_SECRET: "must-not-reach-child",
       ...(mode === undefined ? {} : { ANALYTICS_FIXTURE_MODE: mode }),
+      ...(pidFile === undefined ? {} : { ANALYTICS_FIXTURE_PID_FILE: pidFile }),
     },
-    envAllowlist: ["ANALYTICS_FIXTURE_MODE"],
-    ...patch,
+    envAllowlist: ["ANALYTICS_FIXTURE_MODE", "ANALYTICS_FIXTURE_PID_FILE"],
+    ...options,
   });
 }
 
@@ -62,6 +71,15 @@ async function expectGap(
       configurationAction: "Configure MARKETING_ANALYTICS_MCP_COMMAND and MARKETING_ANALYTICS_MCP_ARGS in the trusted deployment environment",
     },
   });
+}
+
+async function latestPid(pidFile: string): Promise<number> {
+  const pids = (await readFile(pidFile, "utf8")).trim().split("\n");
+  return Number(pids.at(-1));
+}
+
+function expectProcessExited(pid: number): void {
+  expect(() => process.kill(pid, 0)).toThrowError(expect.objectContaining({ code: "ESRCH" }));
 }
 
 describe("real professional analytics stdio MCP provider", () => {
@@ -139,6 +157,48 @@ describe("real professional analytics stdio MCP provider", () => {
       "mcp_response_too_large",
     );
   });
+
+  it("bounds the raw JSON-RPC envelope before stdio message parsing", async () => {
+    const raw = new McpAnalyticsProvider({
+      command: process.execPath,
+      args: [rawFixture],
+      maxResponseBytes: 4_096,
+      timeoutMs: 2_000,
+    });
+    await expectGap(raw.analyze({ operation: trend, rows }), "mcp_response_too_large");
+  });
+
+  it("confirms process exit after repeated timeouts and SIGTERM escalation", async () => {
+    const tempDir = await createTempDir();
+    const pidFile = join(tempDir, "provider-pids");
+    try {
+      for (const mode of ["timeout", "timeout-ignore-sigterm", "timeout"]) {
+        await expectGap(
+          provider(mode, { timeoutMs: 100, pidFile }).analyze({ operation: trend, rows }),
+          "mcp_timeout",
+        );
+        expectProcessExited(await latestPid(pidFile));
+      }
+      const pids = (await readFile(pidFile, "utf8")).trim().split("\n");
+      expect(new Set(pids).size).toBe(3);
+    } finally {
+      await removeTempDir(tempDir);
+    }
+  }, 10_000);
+
+  it("bounds cleanup and confirms process exit after a successful result from a hanging fixture", async () => {
+    const tempDir = await createTempDir();
+    const pidFile = join(tempDir, "provider-pid");
+    const started = Date.now();
+    try {
+      const response = await provider("success-hang", { pidFile }).analyze({ operation: trend, rows });
+      expect(response.result.operation).toBe("trend_v1");
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expectProcessExited(await latestPid(pidFile));
+    } finally {
+      await removeTempDir(tempDir);
+    }
+  }, 10_000);
 
   it("times out and closes a real unresponsive fixture", async () => {
     const started = Date.now();

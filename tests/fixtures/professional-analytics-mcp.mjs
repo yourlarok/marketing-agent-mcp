@@ -1,8 +1,13 @@
 import { createHash } from "node:crypto";
+import { appendFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+
+if (process.env.ANALYTICS_FIXTURE_PID_FILE) {
+  await appendFile(process.env.ANALYTICS_FIXTURE_PID_FILE, `${process.pid}\n`, "utf8");
+}
 
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
@@ -104,7 +109,11 @@ server.registerTool("analyze", {
 }, async ({ operation, rows }) => {
   if (process.env.MARKETING_TEST_BUSINESS_SECRET) throw new Error("Business environment leaked into fixture");
   const mode = process.env.ANALYTICS_FIXTURE_MODE ?? "success";
-  if (mode === "timeout") await delay(5_000);
+  if (mode === "timeout-ignore-sigterm" || mode === "success-hang") {
+    process.on("SIGTERM", () => undefined);
+  }
+  if (mode === "timeout" || mode === "timeout-ignore-sigterm") await delay(5_000);
+  if (mode === "success-hang") setInterval(() => undefined, 1_000);
   const inputHash = createHash("sha256").update(JSON.stringify(canonical({ operation, rows }))).digest("hex");
   const result = analyze(operation, rows);
   let structuredContent = { inputHash, result };
