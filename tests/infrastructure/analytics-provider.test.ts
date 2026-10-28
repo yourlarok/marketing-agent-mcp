@@ -1,5 +1,6 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { copyFile, mkdtemp, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
@@ -41,12 +42,12 @@ const anomaly: AnalyticsOperation = {
 
 function provider(
   mode?: string,
-  patch: { timeoutMs?: number; maxResponseBytes?: number; pidFile?: string } = {},
+  patch: { timeoutMs?: number; maxResponseBytes?: number; pidFile?: string; fixturePath?: string } = {},
 ) {
-  const { pidFile, ...options } = patch;
+  const { pidFile, fixturePath, ...options } = patch;
   return new McpAnalyticsProvider({
     command: process.execPath,
-    args: [fixture],
+    args: [fixturePath ?? fixture],
     env: {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
@@ -80,6 +81,14 @@ async function latestPid(pidFile: string): Promise<number> {
 
 function expectProcessExited(pid: number): void {
   expect(() => process.kill(pid, 0)).toThrowError(expect.objectContaining({ code: "ESRCH" }));
+}
+
+function runningFixturePids(fixturePath: string): number[] {
+  const processes = execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" });
+  return processes.split("\n").flatMap((line) => {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    return match?.[2]?.includes(fixturePath) ? [Number(match[1])] : [];
+  });
 }
 
 describe("real professional analytics stdio MCP provider", () => {
@@ -169,20 +178,19 @@ describe("real professional analytics stdio MCP provider", () => {
   });
 
   it("confirms process exit after repeated timeouts and SIGTERM escalation", async () => {
-    const tempDir = await createTempDir();
-    const pidFile = join(tempDir, "provider-pids");
+    const fixtureDir = await mkdtemp(join(dirname(fixture), "timeout-fixture-"));
+    const fixturePath = join(fixtureDir, "timeout-fixture.mjs");
+    await copyFile(fixture, fixturePath);
     try {
       for (const mode of ["timeout", "timeout-ignore-sigterm", "timeout"]) {
         await expectGap(
-          provider(mode, { timeoutMs: 100, pidFile }).analyze({ operation: trend, rows }),
+          provider(mode, { timeoutMs: 100, fixturePath }).analyze({ operation: trend, rows }),
           "mcp_timeout",
         );
-        expectProcessExited(await latestPid(pidFile));
+        expect(runningFixturePids(fixturePath)).toEqual([]);
       }
-      const pids = (await readFile(pidFile, "utf8")).trim().split("\n");
-      expect(new Set(pids).size).toBe(3);
     } finally {
-      await removeTempDir(tempDir);
+      await removeTempDir(fixtureDir);
     }
   }, 10_000);
 
