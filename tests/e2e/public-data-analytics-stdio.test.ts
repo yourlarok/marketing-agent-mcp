@@ -433,6 +433,7 @@ describe("built public SQLite and analytics stdio contracts", () => {
       });
     }
 
+    const parentBeforeFork = structuredClone(analyzed);
     const forked = await call("analysis_graph_fork", {
       id: "stdio-analytics-graph-fork",
       workspaceId,
@@ -441,19 +442,85 @@ describe("built public SQLite and analytics stdio contracts", () => {
       forkNodeId: anomalyNode.id as string,
       ...context("fork"),
     });
-    expect(forked).toMatchObject({
+    expect(Object.keys(forked).sort()).toEqual([
+      "createdAt",
+      "edges",
+      "forkNodeId",
+      "id",
+      "nodes",
+      "parentGraphId",
+      "parentVersion",
+      "recommendedActions",
+      "updatedAt",
+      "version",
+      "workspaceId",
+    ]);
+    expect({
+      id: forked.id,
+      workspaceId: forked.workspaceId,
+      version: forked.version,
+      parentGraphId: forked.parentGraphId,
+      parentVersion: forked.parentVersion,
+      forkNodeId: forked.forkNodeId,
+    }).toEqual({
       id: "stdio-analytics-graph-fork",
+      workspaceId,
       version: 1,
       parentGraphId: analyzed.id,
       parentVersion: analyzed.version,
       forkNodeId: anomalyNode.id,
-      nodes: analyzed.nodes,
-      edges: analyzed.edges,
     });
+    expect(forked.createdAt).toBe(forked.updatedAt);
+    expect(forked.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(Date.parse(forked.createdAt as string)).toBeGreaterThanOrEqual(
+      Date.parse(parentBeforeFork.updatedAt as string),
+    );
+    expect(forked.nodes).toEqual(parentBeforeFork.nodes);
+    expect(forked.edges).toEqual(parentBeforeFork.edges);
+
+    const parentActions = parentBeforeFork.recommendedActions as JsonRecord[];
+    const forkActions = forked.recommendedActions as JsonRecord[];
+    const graphScopedTools = new Set([
+      "metric_compute",
+      "metric_scenario_create",
+      "metric_monitor_compare",
+    ]);
+    const forkNodeIds = new Set((forked.nodes as JsonRecord[]).map((node) => node.id));
+    expect(forkActions).toHaveLength(parentActions.length);
+    expect(forkActions.length).toBeGreaterThan(0);
+    for (const [index, parentAction] of parentActions.entries()) {
+      const forkAction = forkActions[index]!;
+      expect(graphScopedTools.has(parentAction.tool as string)).toBe(true);
+      const { arguments: parentArguments, ...parentMetadata } = parentAction;
+      const { arguments: forkArguments, ...forkMetadata } = forkAction;
+      expect(forkMetadata).toEqual(parentMetadata);
+      const parentArgs = parentArguments as JsonRecord;
+      const forkArgs = forkArguments as JsonRecord;
+      expect(parentArgs.id).toBe(parentBeforeFork.id);
+      expect(parentArgs.expectedVersion).toBe(parentBeforeFork.version);
+      expect(forkArgs.id).toBe(forked.id);
+      expect(forkArgs.expectedVersion).toBe(1);
+      const stableArguments = (args: JsonRecord): JsonRecord => Object.fromEntries(
+        Object.entries(args).filter(([key]) =>
+          !["id", "expectedVersion", "requestId", "idempotencyKey"].includes(key)),
+      );
+      expect(stableArguments(forkArgs)).toEqual(stableArguments(parentArgs));
+      for (const field of ["requestId", "idempotencyKey"]) {
+        expect(forkArgs[field]).toMatch(new RegExp(`^analysis-${field}-[a-f0-9]{64}$`));
+        expect(forkArgs[field]).not.toBe(parentArgs[field]);
+      }
+      for (const field of ["metricNodeId", "baselineMetricNodeId"]) {
+        if (Object.hasOwn(forkArgs, field)) {
+          expect(forkArgs[field]).toBe(parentArgs[field]);
+          expect(forkNodeIds).toContain(forkArgs[field]);
+        }
+      }
+    }
+    expect(analyzed).toEqual(parentBeforeFork);
     expect(await call("analysis_graph_get", {
       id: analyzed.id as string,
       workspaceId,
-    })).toEqual(analyzed);
+    })).toEqual(parentBeforeFork);
 
     const secret = "synthetic-stdio-public-tool-secret";
     for (const [name, arguments_] of [
@@ -547,17 +614,22 @@ describe("built public SQLite and analytics stdio contracts", () => {
     ] as const) {
       const unavailable = await client.callTool({ name, arguments: arguments_ });
       expect(unavailable).toMatchObject({ isError: true });
-      const error = JSON.stringify(unavailable);
-      expect(error).toContain("Capability unavailable");
-      expect(error).toContain("CAPABILITY_UNAVAILABLE");
-      if (name === "professional_analytics_compute") {
-        expect(error).toContain("mcp_not_configured");
-        expect(error).toContain("configurationAction");
-        expect(error).toContain("MARKETING_ANALYTICS_MCP_COMMAND");
-        expect(error).toContain("MARKETING_ANALYTICS_MCP_ARGS");
-      } else {
-        expect(error).toContain("MARKETING_DATABASE_ROOT");
-      }
+      expect(unavailable.content[0]).toMatchObject({ type: "text" });
+      const gap = JSON.parse((unavailable.content[0] as { text: string }).text) as JsonRecord;
+      expect(unavailable.structuredContent).toEqual(gap);
+      expect(gap).toEqual({
+        code: "CAPABILITY_UNAVAILABLE",
+        message: "Capability unavailable",
+        retryable: false,
+        ...(name === "professional_analytics_compute" ? {
+          capability: "professional_analytics",
+          reason: "mcp_not_configured",
+          configurationAction: "Configure MARKETING_ANALYTICS_MCP_COMMAND and MARKETING_ANALYTICS_MCP_ARGS in the trusted deployment environment",
+        } : {
+          capability: "sqlite",
+          configurationAction: "Configure MARKETING_DATABASE_ROOT in the trusted deployment environment",
+        }),
+      });
     }
     const raw = new DatabaseSync(join(dataDir, "marketing.db"), { readOnly: true });
     try {

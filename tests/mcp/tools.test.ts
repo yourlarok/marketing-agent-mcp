@@ -1029,6 +1029,50 @@ describe("MCP error contracts", () => {
     expect(JSON.stringify(mapped)).not.toContain("synthetic-key-secret");
   });
 
+  it("allowlists capability details instead of leaking paths, commands, env, or ordinary values", () => {
+    const details = JSON.parse(`{
+      "capability": "professional_analytics",
+      "reason": "mcp_not_configured",
+      "configurationAction": "attacker-controlled-action",
+      "path": "/private/sensitive/database.sqlite",
+      "command": "/private/sensitive/provider --token",
+      "env": "SECRET_ENV_VALUE",
+      "ordinaryKey": "secret-in-an-ordinary-key",
+      "code": "INTERNAL_ERROR",
+      "__proto__": "prototype-pollution-marker"
+    }`) as Record<string, string>;
+    const mapped = toMcpError(new DomainError(
+      "CAPABILITY_UNAVAILABLE",
+      "sensitive internal message",
+      false,
+      details,
+    ));
+    const serialized = JSON.stringify(mapped);
+
+    expect(mapped.message).toBe("MCP error -32603: Capability unavailable");
+    expect(mapped.data).toEqual({
+      code: "CAPABILITY_UNAVAILABLE",
+      retryable: false,
+      details: {
+        capability: "professional_analytics",
+        reason: "mcp_not_configured",
+        configurationAction: "Configure MARKETING_ANALYTICS_MCP_COMMAND and MARKETING_ANALYTICS_MCP_ARGS in the trusted deployment environment",
+      },
+    });
+    for (const forbidden of [
+      "/private/sensitive/database.sqlite",
+      "/private/sensitive/provider --token",
+      "SECRET_ENV_VALUE",
+      "secret-in-an-ordinary-key",
+      "attacker-controlled-action",
+      "prototype-pollution-marker",
+      "sensitive internal message",
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+    expect(Object.prototype).not.toHaveProperty("polluted");
+  });
+
   it("maps arbitrary exceptions to INTERNAL_ERROR without stacks or secrets", () => {
     const secret = "sk-test-do-not-expose";
     const mapped = toMcpError(

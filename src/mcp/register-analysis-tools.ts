@@ -3,7 +3,7 @@ import {
   AnalysisCapabilityService,
   type AnalysisService,
 } from "../application/analysis-service.js";
-import { toMcpError } from "./error-mapper.js";
+import { toCapabilityGapResult, toMcpError } from "./error-mapper.js";
 import { validateToolArguments } from "./register-tools.js";
 import { textResult } from "./results.js";
 import {
@@ -160,6 +160,8 @@ export function registerAnalysisTools(
           context: { actor, requestId, idempotencyKey },
         }));
       } catch (error) {
+        const gap = toCapabilityGapResult(error);
+        if (gap) return gap;
         throw toMcpError(error);
       }
     },

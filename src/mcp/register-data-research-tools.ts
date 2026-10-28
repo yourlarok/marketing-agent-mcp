@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DataResearchService } from "../application/data-research-service.js";
 import type { MarketingService } from "../application/marketing-service.js";
-import { toMcpError } from "./error-mapper.js";
+import { toCapabilityGapResult, toMcpError } from "./error-mapper.js";
 import { validateToolArguments } from "./register-tools.js";
 import { textResult } from "./results.js";
 import {
@@ -112,6 +112,8 @@ export function registerDataResearchTools(
           connectorSqliteDiscoverInputSchema.parse(validateToolArguments(arguments_)),
         ));
       } catch (error) {
+        const gap = toCapabilityGapResult(error);
+        if (gap) return gap;
         throw toMcpError(error);
       }
     },
@@ -132,6 +134,8 @@ export function registerDataResearchTools(
           context: { actor, requestId, idempotencyKey },
         }));
       } catch (error) {
+        const gap = toCapabilityGapResult(error);
+        if (gap) return gap;
         throw toMcpError(error);
       }
     },
