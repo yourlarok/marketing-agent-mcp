@@ -15,6 +15,10 @@ export interface AppConfig {
     command: string;
     args: string[];
   };
+  benchmarkMcp?: {
+    command: string;
+    args: string[];
+  };
   logLevel: "error" | "warn" | "info";
 }
 
@@ -40,6 +44,10 @@ export function parseContentMcpArguments(value: string | undefined): string[] {
 
 export function parseAnalyticsMcpArguments(value: string | undefined): string[] {
   return parseMcpArguments(value, "MARKETING_ANALYTICS_MCP_ARGS");
+}
+
+export function parseBenchmarkMcpArguments(value: string | undefined): string[] {
+  return parseMcpArguments(value, "MARKETING_BENCHMARK_MCP_ARGS");
 }
 
 export function parseCommaSeparatedList(value: string | undefined): string[] {
@@ -106,6 +114,13 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (!analyticsMcpCommand && env.MARKETING_ANALYTICS_MCP_ARGS) {
     throw new Error("MARKETING_ANALYTICS_MCP_COMMAND is required when MCP arguments are configured");
   }
+  const benchmarkMcpCommand = env.MARKETING_BENCHMARK_MCP_COMMAND;
+  if (!benchmarkMcpCommand && env.MARKETING_BENCHMARK_MCP_ARGS) {
+    throw new Error("MARKETING_BENCHMARK_MCP_COMMAND is required when MCP arguments are configured");
+  }
+  if (benchmarkMcpCommand !== undefined && benchmarkMcpCommand.trim().length === 0) {
+    throw new Error("MARKETING_BENCHMARK_MCP_COMMAND must not be empty");
+  }
   return {
     dataDir,
     ...(env.MARKETING_ARTIFACT_DIR ? { artifactDir: env.MARKETING_ARTIFACT_DIR } : {}),
@@ -123,6 +138,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
       analyticsMcp: {
         command: analyticsMcpCommand,
         args: parseAnalyticsMcpArguments(env.MARKETING_ANALYTICS_MCP_ARGS),
+      },
+    } : {}),
+    ...(benchmarkMcpCommand ? {
+      benchmarkMcp: {
+        command: benchmarkMcpCommand,
+        args: parseBenchmarkMcpArguments(env.MARKETING_BENCHMARK_MCP_ARGS),
       },
     } : {}),
     logLevel: "info",

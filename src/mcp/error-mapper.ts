@@ -24,6 +24,8 @@ const safeMessages = {
 
 const ANALYTICS_CONFIGURATION_ACTION =
   "Configure MARKETING_ANALYTICS_MCP_COMMAND and MARKETING_ANALYTICS_MCP_ARGS in the trusted deployment environment";
+const BENCHMARK_CONFIGURATION_ACTION =
+  "Configure MARKETING_BENCHMARK_MCP_COMMAND and MARKETING_BENCHMARK_MCP_ARGS in the trusted deployment environment";
 const SQLITE_CONFIGURATION_ACTION =
   "Configure MARKETING_DATABASE_ROOT in the trusted deployment environment";
 const ANALYTICS_GAP_REASONS = new Set([
@@ -35,6 +37,19 @@ const ANALYTICS_GAP_REASONS = new Set([
   "mcp_input_hash_mismatch",
   "mcp_response_too_large",
   "mcp_result_mismatch",
+]);
+const BENCHMARK_GAP_REASONS = new Set([
+  "mcp_not_configured",
+  "mcp_cleanup_failed",
+  "mcp_timeout",
+  "mcp_unavailable",
+  "mcp_invalid_response",
+  "mcp_input_hash_mismatch",
+  "mcp_response_too_large",
+  "image_observation_missing",
+  "video_frames_missing",
+  "asr_transcript_missing",
+  "video_understanding_missing",
 ]);
 
 function safeDetails(
@@ -66,6 +81,12 @@ function safeCapabilityDetails(
     safe.capability = "professional_analytics";
     safe.configurationAction = ANALYTICS_CONFIGURATION_ACTION;
     if (typeof details.reason === "string" && ANALYTICS_GAP_REASONS.has(details.reason)) {
+      safe.reason = details.reason;
+    }
+  } else if (details?.capability === "benchmark_reverse") {
+    safe.capability = "benchmark_reverse";
+    safe.configurationAction = BENCHMARK_CONFIGURATION_ACTION;
+    if (typeof details.reason === "string" && BENCHMARK_GAP_REASONS.has(details.reason)) {
       safe.reason = details.reason;
     }
   } else if (details?.capability === "sqlite") {
