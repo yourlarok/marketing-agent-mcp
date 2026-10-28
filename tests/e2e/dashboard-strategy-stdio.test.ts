@@ -677,10 +677,11 @@ describe("built dashboard and strategy stdio acceptance", () => {
       expect(await page.locator("body").textContent()).toContain("TASK_NOT_LINKED");
       expect(await page.locator("body").textContent()).toContain("COMPETITOR_DIFF_UNKNOWN");
       const datumId = `${trend.id}/point/0`;
-      const anchor = `drill-trend-view-${datumId}`;
+      const rawAnchor = `drill-trend-view-${datumId}`;
+      const anchor = encodeURIComponent(rawAnchor);
       const link = page.locator(`a[href="#${anchor}"]`);
       await link.click();
-      expect(await page.evaluate(() => decodeURIComponent(location.hash.slice(1)))).toBe(anchor);
+      expect(await page.evaluate(() => decodeURIComponent(location.hash.slice(1)))).toBe(rawAnchor);
       expect(await page.locator(`[id="${anchor}"]`).isVisible()).toBe(true);
       const captured = await link.evaluate((element) => ({
         viewId: element.closest("svg")?.getAttribute("data-view-id"),

@@ -1,7 +1,8 @@
 import { DomainError } from "../domain/errors.js";
-import type {
-  AnalysisGraph,
-  AnalysisGraphNode,
+import {
+  analysisPayloadReferenceIds,
+  type AnalysisGraph,
+  type AnalysisGraphNode,
 } from "../domain/analysis-model.js";
 import { getMetricDefinition } from "../domain/metric-catalog.js";
 import type {
@@ -135,19 +136,7 @@ function requireNode(graph: AnalysisGraph, nodeId: string): AnalysisGraphNode {
 }
 
 function nodeEvidenceIds(node: AnalysisGraphNode): string[] {
-  const ids: string[] = [];
-  for (const field of ["evidenceId", "evidenceIds"] as const) {
-    const value = node.payload[field];
-    if (value === undefined || value === null) continue;
-    if (field === "evidenceId") {
-      assertNonEmptyString(value, `Analysis node ${field}`);
-      ids.push(value);
-    } else {
-      assertStringArray(value, `Analysis node ${field}`);
-      ids.push(...value);
-    }
-  }
-  return ids;
+  return analysisPayloadReferenceIds(node.payload).evidenceIds;
 }
 
 function nullableFinite(value: unknown, field: string): number | null {

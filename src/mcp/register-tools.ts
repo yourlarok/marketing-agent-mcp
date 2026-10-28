@@ -3,6 +3,7 @@ import type { MarketingService } from "../application/marketing-service.js";
 import { DomainError } from "../domain/errors.js";
 import { canonicalJson } from "../infrastructure/sqlite.js";
 import { toMcpError } from "./error-mapper.js";
+import { textResult } from "./results.js";
 import {
   capabilityListInputSchema,
   capabilityListToolSchema,
@@ -276,9 +277,7 @@ export function registerTools(server: McpServer, service: MarketingService): voi
       try {
         const query = lineageGetInputSchema.parse(validateToolArguments(arguments_));
         const lineage = await service.getLineage(query);
-        return {
-          content: [{ type: "text" as const, text: canonicalJson(lineage) }],
-        };
+        return textResult(lineage);
       } catch (error) {
         throw toMcpError(error);
       }

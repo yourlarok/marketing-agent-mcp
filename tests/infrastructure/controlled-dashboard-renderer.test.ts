@@ -295,8 +295,9 @@ describe("ControlledDashboardRenderer", () => {
     expect(html).toContain("owned");
     expect(html).toContain("likes");
     expect(html).toContain("comments");
-    expect(html).toContain('href="#drill-trend-view-trend-ok/point/0"');
-    expect(html).toContain('id="drill-trend-view-trend-ok/point/0"');
+    const trendAnchor = encodeURIComponent("drill-trend-view-trend-ok/point/0");
+    expect(html).toContain(`href="#${trendAnchor}"`);
+    expect(html).toContain(`id="${trendAnchor}"`);
     expect(html).toContain("evidence-1");
     expect(html).toContain("dataset-1");
     expect(html).toContain("graph-1");
@@ -380,7 +381,7 @@ describe("ControlledDashboardRenderer", () => {
     expect(first.manifest).toEqual(second.manifest);
     const html = new TextDecoder().decode(first.html);
     for (const datum of data) {
-      const anchor = `drill-task-view-${datum.datumId}`;
+      const anchor = encodeURIComponent(`drill-task-view-${datum.datumId}`);
       expect(html.split(`id="${anchor}"`)).toHaveLength(2);
       expect(html.split(`href="#${anchor}"`)).toHaveLength(2);
       expect(datum.analysisGraphRefs).toEqual([
@@ -426,6 +427,76 @@ describe("ControlledDashboardRenderer", () => {
     const result = render(incomparable);
     expect(result.views[0]).toMatchObject({ status: "unverifiable" });
     expect(result.views[0]?.reasons).toContainEqual(expect.objectContaining({ code: "COMPARABILITY_NOT_COMPARABLE" }));
+  });
+
+  it.each([
+    "STALE_DATA",
+    "SAMPLE_BELOW_MINIMUM",
+    "COMPARABILITY_NOT_ASSESSED",
+  ])("keeps Structure reference reason %s on the datum and downgrades a numeric view", (code) => {
+    const input = snapshot();
+    input.views = [{ id: "structure-view", kind: "structure", graphId: "graph-1", nodeIds: ["metric-ok"] }];
+    input.graphs[0]!.nodes.find((node) => node.id === "metric-ok")!.payload.referenceAssessment = {
+      level: "low",
+      reasons: [{ code, message: `${code} message` }],
+    };
+
+    const result = render(input);
+    expect(result.views[0]).toMatchObject({ status: "partial" });
+    expect(result.views[0]?.reasons).toContainEqual({ code, message: `${code} message` });
+    expect(result.manifestModel.views[0]?.data[0]).toMatchObject({
+      status: "ok",
+      value: 0.1,
+      reasons: [{ code, message: `${code} message` }],
+    });
+  });
+
+  it.each([
+    ["STALE_DATA", "baseline"],
+    ["SAMPLE_BELOW_MINIMUM", "current"],
+    ["COMPARABILITY_NOT_ASSESSED", "current"],
+  ] as const)("keeps Task observation %s reference reason from %s and downgrades the view", (code, location) => {
+    const input = snapshot();
+    input.views = [{ id: "task-view", kind: "task_effect", graphId: "graph-1", taskIds: ["task-1"], monitorNodeIds: ["monitor-1"] }];
+    const assessment = { level: "low", reasons: [{ code, message: `${code} message` }] };
+    if (location === "baseline") {
+      input.graphs[0]!.nodes.find((node) => node.id === "metric-ok")!.payload.referenceAssessment = assessment;
+    } else {
+      const monitor = input.graphs[0]!.nodes.find((node) => node.id === "monitor-1")!;
+      (monitor.payload.current as Record<string, unknown>).referenceAssessment = assessment;
+    }
+
+    const result = render(input);
+    expect(result.views[0]).toMatchObject({ status: "partial" });
+    expect(result.views[0]?.reasons).toContainEqual({ code, message: `${code} message` });
+    expect(result.manifestModel.views[0]?.data[0]).toMatchObject({
+      status: "ok",
+      baselineValue: 0.1,
+      currentValue: 0.2,
+      reasons: [{ code, message: `${code} message` }],
+    });
+  });
+
+  it("renders migrated legacy IDs with unique safe anchors and unchanged drilldown IDs", () => {
+    const input = snapshot();
+    const graphId = "9 legacy/graph:1";
+    const datumId = `${"m".repeat(250)} /:idx`;
+    input.graphs[0]!.id = graphId;
+    input.graphs[0]!.nodes.find((node) => node.id === "metric-ok")!.id = datumId;
+    input.views = [{ id: "structure-view", kind: "structure", graphId, nodeIds: [datumId] }];
+
+    const result = render(input);
+    const rawAnchor = `drill-structure-view-${datumId}`;
+    const safeAnchor = encodeURIComponent(rawAnchor);
+    const html = new TextDecoder().decode(result.html);
+    expect(result.manifestModel.views[0]?.data[0]?.datumId).toBe(datumId);
+    expect(result.manifestModel.workspaceId).toBe("workspace-1");
+    expect(html.split(`id="${safeAnchor}"`)).toHaveLength(2);
+    expect(html.split(`href="#${safeAnchor}"`)).toHaveLength(2);
+    expect(html).not.toContain(`id="${rawAnchor}"`);
+    expect(html).not.toContain(`href="#${rawAnchor}"`);
+    expect(html).toContain(`data-datum-id="${datumId}"`);
+    expect(safeAnchor).not.toMatch(/[\s/:#]/);
   });
 
   it("bounds data and fails oversized artifacts before persistence", () => {

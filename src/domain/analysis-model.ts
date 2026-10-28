@@ -16,6 +16,53 @@ export type AnalysisNodeKind = (typeof ANALYSIS_NODE_KINDS)[number];
 
 export type AnalysisPayload = Record<string, JsonValue>;
 
+export interface AnalysisPayloadReferenceIds {
+  datasetIds: string[];
+  evidenceIds: string[];
+}
+
+export function analysisPayloadReferenceIds(payload: AnalysisPayload): AnalysisPayloadReferenceIds {
+  const references: AnalysisPayloadReferenceIds = { datasetIds: [], evidenceIds: [] };
+  const seen = { datasetIds: new Set<string>(), evidenceIds: new Set<string>() };
+  const scopes = [payload];
+  for (const key of ["provenance", "current"] as const) {
+    const value = payload[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "object" || Array.isArray(value)) {
+      throw new DomainError("INVALID_INPUT", `Analysis payload ${key} must be an object`);
+    }
+    scopes.push(value as AnalysisPayload);
+  }
+  for (const scope of scopes) {
+    for (const [singular, plural, key] of [
+      ["datasetId", "datasetIds", "datasetIds"],
+      ["evidenceId", "evidenceIds", "evidenceIds"],
+    ] as const) {
+      for (const field of [singular, plural]) {
+        const value = scope[field];
+        if (value === undefined || value === null) continue;
+        const ids = field === singular ? [value] : value;
+        if (!Array.isArray(ids) || ids.length > 1000) {
+          throw new DomainError("INVALID_INPUT", `Analysis payload ${field} references must be a bounded ID array`);
+        }
+        for (const id of ids) {
+          if (typeof id !== "string" || id.trim().length === 0) {
+            throw new DomainError("INVALID_INPUT", `Analysis payload ${field} references must be non-empty string IDs`);
+          }
+          if (!seen[key].has(id)) {
+            if (seen[key].size >= 1000) {
+              throw new DomainError("INVALID_INPUT", "Analysis payload references exceed the controlled limit");
+            }
+            seen[key].add(id);
+            references[key].push(id);
+          }
+        }
+      }
+    }
+  }
+  return references;
+}
+
 export interface AnalysisGraphNode {
   id: string;
   kind: AnalysisNodeKind;

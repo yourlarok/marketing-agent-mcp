@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import type { AnalysisGraph } from "../domain/analysis-model.js";
+import { analysisPayloadReferenceIds, type AnalysisGraph } from "../domain/analysis-model.js";
 
 const migrations = [
   {
@@ -31,25 +31,12 @@ export function analysisGraphReferenceIds(graph: AnalysisGraph): AnalysisGraphRe
   const references: AnalysisGraphReferenceIds = { datasetIds: [], evidenceIds: [] };
   const seen = { datasetIds: new Set<string>(), evidenceIds: new Set<string>() };
   for (const node of graph.nodes) {
-    for (const [singular, plural, key] of [
-      ["datasetId", "datasetIds", "datasetIds"],
-      ["evidenceId", "evidenceIds", "evidenceIds"],
-    ] as const) {
-      for (const field of [singular, plural]) {
-        const value = node.payload[field];
-        if (value === undefined || value === null) continue;
-        const ids = field === singular ? [value] : value;
-        if (!Array.isArray(ids)) {
-          throw new TypeError(`Analysis graph ${field} references must be non-empty string IDs`);
-        }
-        for (const id of ids) {
-          if (typeof id !== "string" || id.trim().length === 0) {
-            throw new TypeError(`Analysis graph ${field} references must be non-empty string IDs`);
-          }
-          if (!seen[key].has(id)) {
-            seen[key].add(id);
-            references[key].push(id);
-          }
+    const nodeReferences = analysisPayloadReferenceIds(node.payload);
+    for (const key of ["datasetIds", "evidenceIds"] as const) {
+      for (const id of nodeReferences[key]) {
+        if (!seen[key].has(id)) {
+          seen[key].add(id);
+          references[key].push(id);
         }
       }
     }

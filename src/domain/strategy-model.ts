@@ -1,7 +1,7 @@
 import type { Recommendation, Task } from "./model.js";
 import {
   assertRecord,
-  assertStableId,
+  assertEntityReferenceId,
   invalid,
 } from "./contract-validation.js";
 import { METRIC_CATALOG, getMetricDefinition, type MetricId } from "./metric-catalog.js";
@@ -74,8 +74,8 @@ function validateExpectedMetric(metric: RecommendationExpectedMetric): void {
     if (metric.scenarioNodeId === undefined || metric.baselineMetricNodeId === undefined) {
       invalid("reach_scenario_target requires baselineMetricNodeId and scenarioNodeId");
     }
-    assertStableId(metric.scenarioNodeId, "Recommendation scenarioNodeId");
-    assertStableId(metric.baselineMetricNodeId, "Recommendation baselineMetricNodeId");
+    assertEntityReferenceId(metric.scenarioNodeId, "Recommendation scenarioNodeId");
+    assertEntityReferenceId(metric.baselineMetricNodeId, "Recommendation baselineMetricNodeId");
   } else if (metric.acceptance === "establish_baseline") {
     if (metric.baselineMetricNodeId !== undefined || metric.scenarioNodeId !== undefined) {
       invalid("establish_baseline forbids baselineMetricNodeId and scenarioNodeId");
@@ -156,8 +156,8 @@ export function validateRecommendationStrategy(recommendation: Recommendation): 
     const references = new Set<string>();
     for (const reference of recommendation.analysisNodeRefs) {
       assertRecord(reference, "Recommendation analysis node reference", ["graphId", "nodeId"]);
-      assertStableId(reference.graphId, "Recommendation graphId");
-      assertStableId(reference.nodeId, "Recommendation nodeId");
+      assertEntityReferenceId(reference.graphId, "Recommendation graphId");
+      assertEntityReferenceId(reference.nodeId, "Recommendation nodeId");
       const key = JSON.stringify([reference.graphId, reference.nodeId]);
       if (references.has(key)) invalid("Recommendation analysisNodeRefs must not contain duplicates");
       references.add(key);

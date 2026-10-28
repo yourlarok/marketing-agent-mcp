@@ -6,6 +6,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MarketingService } from "../../src/application/marketing-service.js";
 import { loadConfig } from "../../src/config.js";
+import { createDashboard, createDashboardView } from "../../src/domain/dashboard-model.js";
 import { DomainError } from "../../src/domain/errors.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
 import {
@@ -651,6 +652,108 @@ describe("MCP server", () => {
             (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
         ).get()).toEqual({ workspaces: 0, audits: 0, idempotency: 0 });
         expect(raw.prepare("SELECT id FROM workspaces WHERE id = ?").get("workspace-oversized")).toBeUndefined();
+      } finally {
+        raw.close();
+      }
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+      store.close();
+      await removeTempDir(tempDir);
+    }
+  });
+
+  it("rejects an oversized Dashboard lineage without partial JSON or write side effects", async () => {
+    const tempDir = await createTempDir();
+    const databasePath = join(tempDir, "store.db");
+    const store = openStore(databasePath);
+    const service = new MarketingService(store, new SystemClock(), new SystemIdGenerator());
+    const server = createMcpServer(service);
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const now = "2026-10-28T12:00:00.000Z";
+    const evidenceIds = Array.from({ length: 500 }, (_, index) => `evidence-${index}`);
+
+    try {
+      await store.transaction(async (repos) => {
+        await repos.workspaces.insert({
+          id: "workspace-1", workspaceId: "workspace-1", version: 1,
+          createdAt: now, updatedAt: now, name: "Workspace",
+        });
+        await repos.sources.insert({
+          id: "source-1", workspaceId: "workspace-1", version: 1,
+          createdAt: now, updatedAt: now, name: "Source", type: "database", ownership: "owned",
+        });
+        for (const [index, id] of evidenceIds.entries()) {
+          await repos.evidence.insert({
+            id, workspaceId: "workspace-1", version: 1, createdAt: now, updatedAt: now,
+            sourceId: "source-1", sourceLocator: `warehouse/${index}`, observedAt: now,
+            summary: `Evidence ${index}`, contentHash: "a".repeat(64), classification: "owned_operating",
+          });
+        }
+        await repos.analysisGraphs.insert({
+          id: "graph-1", workspaceId: "workspace-1", version: 1, createdAt: now, updatedAt: now,
+          parentGraphId: null, parentVersion: null, forkNodeId: null, edges: [], recommendedActions: [],
+          nodes: [{ id: "metric-1", kind: "metric", payload: {} }],
+        });
+        await repos.dashboards.insert(createDashboard({
+          id: "dashboard-large",
+          workspaceId: "workspace-1",
+          createdAt: now,
+          generatedAt: now,
+          renderer: { type: "controlled_renderer", id: "controlled_html_svg_v1", professionalTool: false },
+          views: [createDashboardView({
+            id: "structure-view",
+            kind: "structure",
+            graphId: "graph-1",
+            nodeIds: ["metric-1"],
+            sourceUpdatedAt: now,
+            sources: [{ sourceId: "source-1", updatedAt: now }],
+            metrics: [{ metricId: "ctr_v1", formula: "sum(clicks) / sum(impressions)" }],
+          })],
+          artifacts: [
+            { id: "html", kind: "html", contentHash: "a".repeat(64), byteLength: 1, mediaType: "text/html; charset=utf-8" },
+            { id: "manifest", kind: "manifest", contentHash: "b".repeat(64), byteLength: 1, mediaType: "application/json" },
+          ],
+          sourceIds: ["source-1"],
+          datasetIds: [],
+          evidenceIds,
+          graphIds: ["graph-1"],
+          competitorDiffIds: [],
+          taskIds: [],
+          sourceVersions: [
+            { entityType: "source", id: "source-1", version: 1 },
+            { entityType: "analysis_graph", id: "graph-1", version: 1 },
+            ...evidenceIds.map((id) => ({ entityType: "evidence" as const, id, version: 1 })),
+          ],
+        }));
+      });
+      const lineage = await service.getLineage({
+        entityType: "dashboard", id: "dashboard-large", workspaceId: "workspace-1",
+      });
+      expect(lineage.nodes.length).toBeLessThan(1000);
+      expect(Buffer.byteLength(JSON.stringify(lineage), "utf8")).toBeGreaterThan(64 * 1024);
+      await Promise.all([
+        client.connect(clientTransport),
+        server.connect(serverTransport),
+      ]);
+
+      const result = await client.callTool({
+        name: "lineage_get",
+        arguments: { entityType: "dashboard", id: "dashboard-large", workspaceId: "workspace-1" },
+      });
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toContain("Resource conflict");
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).not.toContain('"nodes"');
+      expect(text).not.toContain('"edges"');
+      const raw = new DatabaseSync(databasePath);
+      try {
+        expect(raw.prepare(
+          `SELECT
+            (SELECT COUNT(*) FROM dashboards) AS dashboards,
+            (SELECT COUNT(*) FROM audit_records) AS audits,
+            (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
+        ).get()).toEqual({ dashboards: 1, audits: 0, idempotency: 0 });
       } finally {
         raw.close();
       }

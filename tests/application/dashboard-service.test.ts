@@ -325,7 +325,7 @@ describe("DashboardService", () => {
     const htmlDescriptor = dashboard.artifacts.find((artifact) => artifact.kind === "html")!;
     const html = (await artifacts.read(htmlDescriptor.contentHash)).toString("utf8");
     for (const datumId of datumIds) {
-      const anchor = `drill-task-view-${datumId}`;
+      const anchor = encodeURIComponent(`drill-task-view-${datumId}`);
       expect(html.split(`id="${anchor}"`)).toHaveLength(2);
       expect(html.split(`href="#${anchor}"`)).toHaveLength(2);
       const drilldown = await service.getDrilldown({

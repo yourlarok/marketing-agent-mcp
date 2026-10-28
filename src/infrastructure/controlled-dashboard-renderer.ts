@@ -1,7 +1,8 @@
-import type {
-  AnalysisGraph,
-  AnalysisGraphNode,
-  AnalysisPayload,
+import {
+  analysisPayloadReferenceIds,
+  type AnalysisGraph,
+  type AnalysisGraphNode,
+  type AnalysisPayload,
 } from "../domain/analysis-model.js";
 import {
   MAX_DASHBOARD_ARTIFACT_BYTES,
@@ -128,6 +129,16 @@ function reason(code: string, message = code): DashboardReason {
   return { code, message };
 }
 
+function referenceReasons(payload: Record<string, unknown>, label: string): DashboardReason[] {
+  if (payload.referenceAssessment === undefined) return [];
+  const reference = object(payload.referenceAssessment, `${label} referenceAssessment`);
+  if (!Array.isArray(reference.reasons)) invalid(`${label} reference reasons must be an array`);
+  return reference.reasons.map((value) => {
+    const item = object(value, `${label} reference reason`);
+    return reason(text(item.code, `${label} reference reason code`), text(item.message, `${label} reference reason message`));
+  });
+}
+
 function graph(snapshot: DashboardSnapshot, id: string): AnalysisGraph {
   return snapshot.graphs.find((candidate) => candidate.id === id) ??
     notFound("Dashboard analysis graph not found in snapshot");
@@ -157,22 +168,8 @@ function mergeGraphRefs(refs: DashboardAnalysisGraphRef[]): DashboardAnalysisGra
   });
 }
 
-function nestedPayload(payload: AnalysisPayload, key: string): AnalysisPayload | undefined {
-  const value = payload[key];
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as AnalysisPayload
-    : undefined;
-}
-
 function referenceIds(payload: AnalysisPayload): { datasetIds: string[]; evidenceIds: string[] } {
-  const datasetIds: string[] = [];
-  const evidenceIds: string[] = [];
-  for (const candidate of [payload, nestedPayload(payload, "provenance"), nestedPayload(payload, "current")]) {
-    if (!candidate) continue;
-    if (typeof candidate.datasetId === "string") datasetIds.push(candidate.datasetId);
-    if (typeof candidate.evidenceId === "string") evidenceIds.push(candidate.evidenceId);
-  }
-  return { datasetIds: unique(datasetIds), evidenceIds: unique(evidenceIds) };
+  return analysisPayloadReferenceIds(payload);
 }
 
 function sourceDescriptor(snapshot: DashboardSnapshot, sourceId: string): DashboardSourceDescriptor {
@@ -323,21 +320,20 @@ function buildStructure(snapshot: DashboardSnapshot, input: ViewInput< "structur
     datasetIds.push(...refs.datasetIds);
     evidenceIds.push(...refs.evidenceIds);
     analysisGraphRefs.push(graphRef(graphRecord, graphNode));
-    const reference = payload.referenceAssessment === undefined ? undefined : object(payload.referenceAssessment, "Metric referenceAssessment");
-    const referenceReasonValues = reference?.reasons;
-    const referenceReasons = Array.isArray(referenceReasonValues) ? referenceReasonValues.map((value) => {
-      const item = object(value, "Metric reference reason");
-      return reason(text(item.code, "Metric reference reason code"), text(item.message, "Metric reference reason message"));
-    }) : [];
-    if (referenceReasons.some((item) => item.code === "COMPARABILITY_NOT_COMPARABLE")) {
+    const metricReferenceReasons = referenceReasons(payload, "Metric");
+    if (metricReferenceReasons.some((item) => item.code === "COMPARABILITY_NOT_COMPARABLE")) {
       forceUnverifiable = true;
-      reasons.push(...referenceReasons.filter((item) => item.code === "COMPARABILITY_NOT_COMPARABLE"));
     }
+    reasons.push(...metricReferenceReasons);
     const value = nullableFinite(payload.value, "Metric value");
     const unknownReason = nullableText(payload.unknownReason, "Metric unknownReason");
     if (payload.status === "unknown" || unknownReason !== null) reasons.push(reason(unknownReason ?? "METRIC_UNKNOWN"));
+    const datumReasons = uniqueReasons([
+      ...metricReferenceReasons,
+      ...(unknownReason === null ? [] : [reason(unknownReason)]),
+    ]);
     data.push({
-      ...datumBase(snapshot, graphNode.id, payload.status === "ok" && value !== null ? "ok" : "unknown", unknownReason === null ? [] : [reason(unknownReason)], refs, [graphRef(graphRecord, graphNode)]),
+      ...datumBase(snapshot, graphNode.id, payload.status === "ok" && value !== null ? "ok" : "unknown", datumReasons, refs, [graphRef(graphRecord, graphNode)]),
       kind: "metric_category",
       category: graphNode.id,
       metricId,
@@ -522,7 +518,12 @@ function buildTask(snapshot: DashboardSnapshot, input: ViewInput< "task_effect">
         const relativeDelta = nullableFinite(payload.relativeDelta, "Monitor relativeDelta");
         const comparisonUnknownReason = nullableText(payload.comparisonUnknownReason, "Monitor comparisonUnknownReason");
         const relativeDeltaUnknownReason = nullableText(payload.relativeDeltaUnknownReason, "Monitor relativeDeltaUnknownReason");
+        const qualityReasons = uniqueReasons([
+          ...referenceReasons(baselineNode.payload, "Monitor baseline Metric"),
+          ...referenceReasons(current, "Monitor current"),
+        ]);
         const datumReasons = uniqueReasons([
+          ...qualityReasons,
           ...(comparisonUnknownReason ? [reason(comparisonUnknownReason)] : []),
           ...(relativeDeltaUnknownReason ? [reason(relativeDeltaUnknownReason)] : []),
         ]);
@@ -549,7 +550,15 @@ function buildTask(snapshot: DashboardSnapshot, input: ViewInput< "task_effect">
       }
     }
   }
-  return { data, reasons, datasetIds, evidenceIds, analysisGraphRefs, metrics };
+  return {
+    data,
+    reasons,
+    datasetIds,
+    evidenceIds,
+    analysisGraphRefs,
+    metrics,
+    forceUnverifiable: reasons.some((item) => item.code === "COMPARABILITY_NOT_COMPARABLE"),
+  };
 }
 
 function viewStatus(build: BuildResult): DashboardViewStatus {
@@ -598,6 +607,10 @@ function escape(value: unknown): string {
   })[character]!);
 }
 
+function drillAnchor(viewId: string, datumId: string): string {
+  return encodeURIComponent(`drill-${viewId}-${datumId}`);
+}
+
 function display(value: unknown): string {
   return value === null ? "不可验证" : typeof value === "object" ? canonicalJson(value) : String(value);
 }
@@ -641,7 +654,7 @@ function renderView(snapshot: DashboardSnapshot, view: DashboardManifestView): s
   }
   view.data.forEach((datum, index) => {
     const y = 52 + index * 48;
-    const anchor = `drill-${view.id}-${datum.datumId}`;
+    const anchor = drillAnchor(view.id, datum.datumId);
     const formula = "formula" in datum ? `；公式 v${datum.definitionVersion}: ${datum.formula}` : "";
     const unknown = datum.status === "unknown" || datum.reasons.length > 0
       ? `；不可验证 ${datum.reasons.map((item) => `${item.code}: ${item.message}`).join("; ")}`
@@ -654,7 +667,7 @@ function renderView(snapshot: DashboardSnapshot, view: DashboardManifestView): s
   });
   parts.push("</svg>");
   for (const datum of view.data) {
-    const anchor = `drill-${view.id}-${datum.datumId}`;
+    const anchor = drillAnchor(view.id, datum.datumId);
     const datasetText = datum.datasets.map((item) => `${item.datasetId} (Source ${item.sourceId})`).join(", ") || "无";
     const evidenceText = datum.evidence.map((item) => `${item.evidenceId} observedAt=${item.observedAt} hash=${item.contentHash} assets=${item.assets.map((asset) => `${asset.id}:${asset.contentHash}`).join(",")}`).join("; ") || "无";
     const graphText = datum.analysisGraphRefs.map((item) => `${item.graphId} v${item.graphVersion} node=${item.nodeId} kind=${item.kind}`).join("; ") || "无";

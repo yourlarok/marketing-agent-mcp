@@ -54,6 +54,13 @@ export function assertStableId(value: unknown, label: string): asserts value is 
   }
 }
 
+export function assertEntityReferenceId(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256 ||
+      value.trim() !== value || FORBIDDEN_KEYS.has(value)) {
+    invalid(`${label} must be a normalized public entity reference ID`);
+  }
+}
+
 export function assertDatabaseId(value: unknown): asserts value is string {
   if (typeof value !== "string" || value.length === 0 || value.length > 512 ||
       value.startsWith("/") || value.includes("\\") || value.includes("\0")) {

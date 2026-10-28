@@ -94,6 +94,27 @@ describe("strategy recommendation contract", () => {
     }))).not.toThrow();
   });
 
+  it.each(["graph 1", "graph/1", "graph:1", "9graph", "g".repeat(256)])(
+    "accepts legacy persisted graph and node reference ID %j",
+    (id) => {
+      expect(() => validateRecommendationStrategy(recommendation({
+        analysisNodeRefs: [{ graphId: id, nodeId: id }],
+        expectedMetrics: [{
+          metricId: "ctr_v1",
+          acceptance: "reach_scenario_target",
+          baselineMetricNodeId: id,
+          scenarioNodeId: id,
+        }],
+      }))).not.toThrow();
+    },
+  );
+
+  it.each(["__proto__", "prototype", "constructor"])("rejects prototype entity reference ID %s", (id) => {
+    expectInvalid(() => validateRecommendationStrategy(recommendation({
+      analysisNodeRefs: [{ graphId: id, nodeId: id }],
+    })));
+  });
+
   it.each([
     [{ metricId: "ctr_v1", acceptance: "reach_scenario_target" }],
     [{ metricId: "ctr_v1", acceptance: "reach_scenario_target", scenarioNodeId: "scenario-1" }],

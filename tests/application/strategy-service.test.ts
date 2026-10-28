@@ -292,6 +292,103 @@ describe("StrategyService evidence-bound recommendations and user-controlled tas
     });
   });
 
+  it("generates recommendations with migrated legacy graph and node IDs unchanged", async () => {
+    const graphId = "9 legacy/graph:1";
+    const supportingNodeId = "supporting node/1";
+    const baselineMetricNodeId = "baseline node/1";
+    const scenarioNodeId = "s".repeat(256);
+    const ids = new Map([
+      ["supporting-node", supportingNodeId],
+      ["baseline-node", baselineMetricNodeId],
+      ["scenario-node", scenarioNodeId],
+    ]);
+    const nodes = graphNodes().map((node) => ({
+      ...node,
+      id: ids.get(node.id)!,
+      payload: node.id === "scenario-node"
+        ? { ...node.payload, metricNodeId: baselineMetricNodeId }
+        : node.payload,
+    }));
+    await insertGraph(graphId, "workspace-1", nodes);
+
+    const recommendation = await generateRecommendation({
+      analysisGraphId: graphId,
+      analysisNodeIds: [supportingNodeId],
+      expectedMetrics: [{
+        metricId: "ctr_v1",
+        acceptance: "reach_scenario_target",
+        baselineMetricNodeId,
+        scenarioNodeId,
+      }],
+    });
+    expect(recommendation.analysisNodeRefs).toEqual([
+      { graphId, nodeId: supportingNodeId },
+      { graphId, nodeId: baselineMetricNodeId },
+      { graphId, nodeId: scenarioNodeId },
+    ]);
+  });
+
+  it("derives independent Analytics evidence only from allowed provenance and current references", async () => {
+    for (const id of ["evidence-4", "evidence-5"]) {
+      await marketing.recordEvidence({
+        input: {
+          id, workspaceId: "workspace-1", sourceId: "source-owned", sourceLocator: `warehouse/${id}`,
+          observedAt: now, summary: `Analytics observation ${id}`, contentHash: id.slice(-1).repeat(64),
+          classification: "owned_operating",
+        },
+        context: nextContext(),
+      });
+    }
+    await insertGraph("graph-analytics", "workspace-1", [{
+      id: "analytics-node",
+      kind: "analytics",
+      payload: {
+        operation: "trend_v1",
+        provenance: { evidenceId: "evidence-4" },
+        current: { evidenceId: "evidence-5" },
+        untrusted: { evidenceId: "evidence-missing" },
+      },
+    }]);
+
+    const recommendation = await generateRecommendation({
+      analysisGraphId: "graph-analytics",
+      analysisNodeIds: ["analytics-node"],
+      expectedMetrics: [{ metricId: "ctr_v1", acceptance: "establish_baseline" }],
+    });
+    expect(recommendation.evidenceIds).toEqual(["evidence-2", "evidence-1", "evidence-4", "evidence-5"]);
+    expect(recommendation.analysisNodeRefs).toEqual([{ graphId: "graph-analytics", nodeId: "analytics-node" }]);
+  });
+
+  it("rejects public Analytics provenance evidence for owned conversion recommendations", async () => {
+    await marketing.registerSource({
+      input: {
+        id: "source-analytics-public", workspaceId: "workspace-1", name: "Public analytics",
+        type: "link", ownership: "external_public",
+      },
+      context: nextContext(),
+    });
+    await marketing.recordEvidence({
+      input: {
+        id: "evidence-analytics-public", workspaceId: "workspace-1", sourceId: "source-analytics-public",
+        sourceLocator: "https://example.test/public-analytics", observedAt: now,
+        summary: "Public analytics interactions", contentHash: "f".repeat(64), classification: "external_observation",
+      },
+      context: nextContext(),
+    });
+    await insertGraph("graph-public-analytics", "workspace-1", [{
+      id: "analytics-public",
+      kind: "analytics",
+      payload: { operation: "trend_v1", provenance: { evidenceId: "evidence-analytics-public" } },
+    }]);
+
+    await expect(generateRecommendation({
+      analysisGraphId: "graph-public-analytics",
+      analysisNodeIds: ["analytics-public"],
+      affectedStage: "purchase",
+      expectedMetrics: [{ metricId: "conversion_rate_v1", acceptance: "establish_baseline" }],
+    })).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+  });
+
   it("uses the catalog formula and explicit unknown expected space for establish_baseline", async () => {
     const recommendation = await generateRecommendation({
       analysisGraphId: undefined,

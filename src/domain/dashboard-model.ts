@@ -1,6 +1,7 @@
 import type { EntityRecord } from "../application/ports.js";
 import type { AnalysisGraph, AnalysisNodeKind } from "./analysis-model.js";
 import {
+  assertEntityReferenceId,
   assertRecord,
   assertStableId,
   assertUtcInstant,
@@ -307,11 +308,7 @@ function assertNonEmptyString(value: unknown, label: string): void {
 }
 
 function assertReferenceId(value: unknown, label: string): void {
-  if (typeof value !== "string" ||
-      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) ||
-      ["__proto__", "prototype", "constructor"].includes(value)) {
-    invalid(`${label} must be a normalized entity reference ID`);
-  }
+  assertEntityReferenceId(value, label);
 }
 
 function assertIdArray(value: unknown, label: string, nonEmpty = false): asserts value is string[] {
@@ -430,7 +427,7 @@ export function createDashboardView(input: CreateDashboardViewInput): DashboardV
 export function validateDashboard(dashboard: Dashboard): void {
   assertRecord(dashboard, "Dashboard");
   assertStableId(dashboard.id, "Dashboard ID");
-  assertStableId(dashboard.workspaceId, "Dashboard workspace ID");
+  assertReferenceId(dashboard.workspaceId, "Dashboard workspace ID");
   if (!Number.isSafeInteger(dashboard.version) || dashboard.version < 1) {
     invalid("Dashboard version must be a positive safe integer");
   }

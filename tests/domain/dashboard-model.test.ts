@@ -173,20 +173,31 @@ describe("dashboard entity contract", () => {
   });
 
   it.each([
+    "source 1",
+    "source/1",
+    "source:1",
+    "9source",
+    "s".repeat(256),
+  ])("accepts legacy public entity reference and workspace ID %j", (sourceId) => {
+    expect(dashboard({
+      workspaceId: sourceId,
+      views: [view(viewInputs[0]!, { sources: [{ sourceId, updatedAt: later }] })],
+      sourceIds: [sourceId],
+      sourceVersions: [
+        { entityType: "source", id: sourceId, version: 1 },
+        { entityType: "analysis_graph", id: "graph-1", version: 2 },
+      ],
+    }).sourceIds).toEqual([sourceId]);
+  });
+
+  it.each([
     "__proto__",
     "prototype",
     "constructor",
-    "source/1",
-    "source\\1",
-    "source 1",
-    "source\t1",
-    "source\n1",
-    "source\u00001",
-    "source:1",
-    "source@1",
     " source-1",
     "source-1 ",
     "",
+    "s".repeat(257),
   ])("rejects unsafe persisted entity reference ID %j", (sourceId) => {
     expectInvalid(() => dashboard({
       views: [view(viewInputs[0]!, { sources: [{ sourceId, updatedAt: later }] })],
@@ -194,6 +205,16 @@ describe("dashboard entity contract", () => {
       sourceVersions: [
         { entityType: "source", id: sourceId, version: 1 },
         { entityType: "analysis_graph", id: "graph-1", version: 2 },
+      ],
+    }));
+  });
+
+  it("keeps Dashboard display and artifact IDs strict while references accept legacy IDs", () => {
+    expectInvalid(() => dashboard({ id: "dashboard/1" }));
+    expectInvalid(() => dashboard({
+      artifacts: [
+        { ...dashboard().artifacts[0]!, id: "artifact/1" },
+        dashboard().artifacts[1]!,
       ],
     }));
   });
