@@ -464,6 +464,14 @@ export function validateBenchmarkAnalysis(analysis: BenchmarkAnalysis): void {
     assertNonEmptyString(gap.message, "Benchmark gap message");
   }
   assertStringArray(analysis.evidenceIds, "BenchmarkAnalysis evidenceIds", { nonEmpty: true, maximum: 10 });
+  const evidenceIds = new Set(analysis.evidenceIds);
+  for (const method of analysis.methods) {
+    for (const reference of method.evidenceAssetRefs) {
+      if (!evidenceIds.has(reference.evidenceId)) {
+        invalid("Benchmark method Evidence refs must be included in BenchmarkAnalysis evidenceIds");
+      }
+    }
+  }
   if (analysis.competitorDiffId !== null) {
     assertEntityReferenceId(analysis.competitorDiffId, "BenchmarkAnalysis competitorDiffId");
   }
@@ -730,6 +738,12 @@ export function validateAssetVersion(asset: AssetVersion): void {
   assertHash(asset.provider.inputHash, "AssetVersion provider inputHash");
   validateAssetValidation(asset.validation, asset.channel);
   assertStringArray(asset.evidenceIds, "AssetVersion evidenceIds", { maximum: 100 });
+  const evidenceIds = new Set(asset.evidenceIds);
+  for (const material of asset.sourceMaterials) {
+    if (material.role === "source" && !evidenceIds.has(material.source.evidenceId)) {
+      invalid("AssetVersion source material Evidence refs must be included in AssetVersion evidenceIds");
+    }
+  }
   assertSourceVersions(asset.sourceVersions);
   assertEntitySize(asset, "AssetVersion");
 }

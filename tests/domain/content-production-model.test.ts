@@ -269,6 +269,15 @@ describe("content production profiles and evidence contracts", () => {
     expect(() => benchmark(overrides)).toThrow();
   });
 
+  it("requires every Benchmark method Evidence ref to be declared in top-level evidenceIds", () => {
+    const nested = method({ evidenceAssetRefs: [assetRef({ evidenceId: "evidence-2" })] });
+    expect(() => benchmark({ methods: [nested] })).toThrow(/evidenceIds/i);
+    expect(benchmark({ evidenceIds: ["evidence-1", "evidence-2"], methods: [nested] }).evidenceIds).toEqual([
+      "evidence-1",
+      "evidence-2",
+    ]);
+  });
+
   it("keeps BenchmarkAnalysis below 64 KiB", () => {
     expect(() => benchmark({ methods: [method({ pattern: "x".repeat(MAX_ASSET_RESPONSE_BYTES) })] })).toThrow(/64/i);
   });
@@ -336,6 +345,19 @@ describe("AssetVersion contracts", () => {
     expect(asset().version).toBe(1);
     expect(asset({ sourceMaterials: [{ role: "source", source: assetRef(), ownership: "authorized" }] }).sourceMaterials[0]).toMatchObject({ ownership: "authorized" });
     expect(() => validateAssetVersion(asset())).not.toThrow();
+  });
+
+  it("requires every source material Evidence ref to be declared in top-level evidenceIds", () => {
+    const sourceMaterials = [{
+      role: "source" as const,
+      source: assetRef({ evidenceId: "evidence-2" }),
+      ownership: "owned" as const,
+    }];
+    expect(() => asset({ sourceMaterials })).toThrow(/evidenceIds/i);
+    expect(asset({ evidenceIds: ["evidence-1", "evidence-2"], sourceMaterials }).evidenceIds).toEqual([
+      "evidence-1",
+      "evidence-2",
+    ]);
   });
 
   it("accepts exact MP4 validation at the 60-second boundary", () => {

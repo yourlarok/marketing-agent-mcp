@@ -1137,6 +1137,46 @@ describe("content production SQLite persistence", () => {
     expect(await store.transaction((repos) => repos.assetVersions.get("asset-1", "ws-2"))).toBeUndefined();
   });
 
+  it("rejects nested Evidence refs omitted from top-level persistence and lineage", async () => {
+    const store = open();
+    await seedParents(store);
+    await store.transaction((repos) =>
+      repos.evidence.insert({ ...entity("evidence-2", "ws-1"), sourceId: "source-1" })
+    );
+    const benchmark = benchmarkRecord();
+    const method = benchmark.methods[0]!;
+    const nestedBenchmark: BenchmarkAnalysis = {
+      ...benchmark,
+      id: "benchmark-nested-evidence",
+      methods: [{
+        ...method,
+        evidenceAssetRefs: [{ ...method.evidenceAssetRefs[0]!, evidenceId: "evidence-2" }],
+      }],
+    };
+    const nestedAsset: AssetVersion = {
+      ...assetRecord(),
+      id: "asset-nested-evidence",
+      sourceMaterials: [{
+        role: "source",
+        source: {
+          sourceId: "source-1",
+          evidenceId: "evidence-2",
+          assetId: "asset-2",
+          kind: "original",
+          observedAt: now,
+          contentHash: "e".repeat(64),
+          byteLength: 100,
+        },
+        ownership: "owned",
+      }],
+    };
+
+    await expect(store.transaction((repos) => repos.benchmarkAnalyses.insert(nestedBenchmark))).rejects.toThrow(/evidenceIds/i);
+    await expect(store.transaction((repos) => repos.assetVersions.insert(nestedAsset))).rejects.toThrow(/evidenceIds/i);
+    expect(await store.transaction((repos) => repos.benchmarkAnalyses.get(nestedBenchmark.id, "ws-1"))).toBeUndefined();
+    expect(await store.transaction((repos) => repos.assetVersions.get(nestedAsset.id, "ws-1"))).toBeUndefined();
+  });
+
   it("upgrades every populated v4 payload without rewriting history", async () => {
     const raw = new DatabaseSync(databasePath);
     const payloadTables = [
