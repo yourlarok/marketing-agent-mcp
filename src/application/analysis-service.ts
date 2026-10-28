@@ -28,6 +28,7 @@ import {
   type ReferenceAssessment,
 } from "../domain/metric-catalog.js";
 import type { Dataset, Evidence, EvidenceAsset, Source } from "../domain/model.js";
+import { assessMetricProportion, type ProportionAssessment } from "../domain/proportion.js";
 import { canonicalAcquisitionUrl } from "../infrastructure/acquisition-policy.js";
 import type {
   AnalyticsProvider,
@@ -113,6 +114,7 @@ interface PreparedMetric {
   descriptors: MetricDescriptors;
   computation: MetricComputation;
   referenceAssessment: ReferenceAssessment;
+  proportionAssessment: ProportionAssessment;
   qualityLimitations: string[];
 }
 
@@ -296,6 +298,11 @@ async function readMetric(
     descriptors,
     computation,
     referenceAssessment,
+    proportionAssessment: assessMetricProportion(
+      input.metricId,
+      computation,
+      descriptors.source.ownership,
+    ),
     qualityLimitations: [...new Set([...datasetLimitations, ...qualityReport.limitations])],
   };
 }
@@ -397,6 +404,7 @@ function metricPayload(prepared: PreparedMetric, input: ComputeMetric): Analysis
     qualityLimitations: prepared.qualityLimitations,
     definitionLimitations: [...definition.limitations],
     referenceAssessment: prepared.referenceAssessment,
+    proportionAssessment: prepared.proportionAssessment,
   } as unknown as AnalysisPayload;
 }
 
@@ -1407,7 +1415,7 @@ export class AnalysisCapabilityService {
         operation: "metric_compute",
         description: "Compute a controlled metric from same-batch normalized evidence and atomically append its graph node.",
         requiredInputs: ["id", "workspaceId", "expectedVersion", "batchId", "datasetId", "evidenceId", "assetId", "metricId", "actor", "requestId", "idempotencyKey"],
-        configuration: ["ctr_v1", "save_like_ratio_v1", "ArtifactStore with content-addressed normalized_jsonl and quality_report assets"],
+        configuration: ["ctr_v1", "save_like_ratio_v1", "engagement_rate_v1", "conversion_rate_v1", "ArtifactStore with content-addressed normalized_jsonl and quality_report assets"],
         availability: { state: "available", detail: "Reads verified artifacts outside SQLite write transactions and rechecks entity versions before commit." },
         limitations: ["Only the controlled formulas are implemented.", "A zero denominator returns unknown.", "No MCP registration is provided by this service."],
       }),
