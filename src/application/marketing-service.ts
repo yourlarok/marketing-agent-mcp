@@ -160,7 +160,35 @@ function lineageReferences(record: EntityRecord, entityType: LineageEntityType):
       ...dependencyIds.map((id) => ({ entityType: "task" as const, id })),
     );
   }
-  return references;
+  if (entityType === "recommendation") {
+    const evidenceIds = record.evidenceIds;
+    const analysisNodeRefs = record.analysisNodeRefs;
+    if ((evidenceIds !== undefined &&
+        (!Array.isArray(evidenceIds) || evidenceIds.some((id) => typeof id !== "string"))) ||
+        (analysisNodeRefs !== undefined &&
+        (!Array.isArray(analysisNodeRefs) || analysisNodeRefs.some((reference) =>
+          reference === null || typeof reference !== "object" || Array.isArray(reference) ||
+          typeof reference.graphId !== "string" || typeof reference.nodeId !== "string")))) {
+      throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {
+        entityType,
+        id: record.id,
+      });
+    }
+    references.push(
+      ...(evidenceIds ?? []).map((id) => ({ entityType: "evidence" as const, id })),
+      ...(analysisNodeRefs ?? []).map((reference) => ({
+        entityType: "analysis_graph" as const,
+        id: reference.graphId,
+      })),
+    );
+  }
+  const seen = new Set<string>();
+  return references.filter((reference) => {
+    const key = JSON.stringify([reference.entityType, reference.id]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 async function requireWorkspace(

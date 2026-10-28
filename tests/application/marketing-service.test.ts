@@ -16,6 +16,7 @@ import {
   createAnalysisGraph,
   forkAnalysisGraph,
 } from "../../src/domain/analysis-model.js";
+import { createDashboard, createDashboardView } from "../../src/domain/dashboard-model.js";
 import type { ToolHealthEvidence } from "../../src/domain/model.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
 
@@ -1682,6 +1683,104 @@ describe("MarketingService recommendations and tasks", () => {
         { from: { entityType: "analysis_graph", id: parent.id }, to: { entityType: "analysis_graph", id: fork.id } },
       ],
     });
+  });
+
+  it("traverses declared Dashboard refs and structured Recommendation evidence/graph refs", async () => {
+    await createRecommendation();
+    await createTask("task-1");
+    await store.transaction(async (repos) => {
+      await repos.datasets.insert({
+        ...datasetInput(),
+        version: 1,
+        createdAt: firstNow,
+        updatedAt: firstNow,
+      });
+      await repos.analysisGraphs.insert(createAnalysisGraph({
+        id: "graph-structured",
+        workspaceId: "workspace-1",
+        createdAt: firstNow,
+        nodes: [{
+          id: "metric-structured",
+          kind: "metric",
+          payload: { datasetId: "dataset-1", evidenceId: "evidence-1" },
+        }],
+      }));
+      await repos.competitorDiffs.insert({
+        id: "diff-structured",
+        workspaceId: "workspace-1",
+        version: 1,
+        createdAt: firstNow,
+        updatedAt: firstNow,
+        competitorIds: [],
+        entries: [],
+        findingIds: ["finding-1"],
+      });
+      const recommendation = (await repos.recommendations.get("recommendation-1", "workspace-1"))!;
+      await repos.recommendations.update({
+        ...recommendation,
+        evidenceIds: ["evidence-1"],
+        analysisNodeRefs: [{ graphId: "graph-structured", nodeId: "metric-structured" }],
+      }, 1);
+      await repos.dashboards.insert(createDashboard({
+        id: "dashboard-structured",
+        workspaceId: "workspace-1",
+        createdAt: firstNow,
+        generatedAt: secondNow,
+        renderer: { type: "controlled_renderer", id: "controlled_html_svg_v1", professionalTool: false },
+        views: [createDashboardView({
+          id: "competitor-view",
+          kind: "competitor_comparison",
+          competitorDiffId: "diff-structured",
+          sourceUpdatedAt: secondNow,
+          sources: [{ sourceId: "source-1", updatedAt: firstNow }],
+          metrics: [],
+        })],
+        artifacts: [
+          { id: "dashboard-html", kind: "html", contentHash: "c".repeat(64), byteLength: 10, mediaType: "text/html; charset=utf-8" },
+          { id: "dashboard-manifest", kind: "manifest", contentHash: "d".repeat(64), byteLength: 10, mediaType: "application/json" },
+        ],
+        sourceIds: ["source-1"],
+        datasetIds: ["dataset-1"],
+        evidenceIds: ["evidence-1"],
+        graphIds: ["graph-structured"],
+        competitorDiffIds: ["diff-structured"],
+        taskIds: ["task-1"],
+        sourceVersions: [
+          { entityType: "source", id: "source-1", version: 1 },
+          { entityType: "dataset", id: "dataset-1", version: 1 },
+          { entityType: "evidence", id: "evidence-1", version: 1 },
+          { entityType: "analysis_graph", id: "graph-structured", version: 1 },
+          { entityType: "competitor_diff", id: "diff-structured", version: 1 },
+          { entityType: "task", id: "task-1", version: 1 },
+        ],
+      }));
+    });
+
+    const recommendationLineage = await service.getLineage({
+      entityType: "recommendation", id: "recommendation-1", workspaceId: "workspace-1",
+    });
+    expect(recommendationLineage.edges).toEqual(expect.arrayContaining([
+      { from: { entityType: "evidence", id: "evidence-1" }, to: { entityType: "recommendation", id: "recommendation-1" } },
+      { from: { entityType: "analysis_graph", id: "graph-structured" }, to: { entityType: "recommendation", id: "recommendation-1" } },
+    ]));
+
+    const dashboardLineage = await service.getLineage({
+      entityType: "dashboard", id: "dashboard-structured", workspaceId: "workspace-1",
+    });
+    expect(dashboardLineage.nodes.map((node) => [node.entityType, node.id])).toEqual(expect.arrayContaining([
+      ["source", "source-1"],
+      ["dataset", "dataset-1"],
+      ["evidence", "evidence-1"],
+      ["analysis_graph", "graph-structured"],
+      ["competitor_diff", "diff-structured"],
+      ["task", "task-1"],
+      ["dashboard", "dashboard-structured"],
+    ]));
+    expect(dashboardLineage.edges).toEqual(expect.arrayContaining([
+      { from: { entityType: "analysis_graph", id: "graph-structured" }, to: { entityType: "dashboard", id: "dashboard-structured" } },
+      { from: { entityType: "competitor_diff", id: "diff-structured" }, to: { entityType: "dashboard", id: "dashboard-structured" } },
+      { from: { entityType: "task", id: "task-1" }, to: { entityType: "dashboard", id: "dashboard-structured" } },
+    ]));
   });
 
   it("does not leak lineage across workspaces", async () => {

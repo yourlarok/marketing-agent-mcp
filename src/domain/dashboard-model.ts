@@ -1,11 +1,26 @@
 import type { EntityRecord } from "../application/ports.js";
+import type { AnalysisGraph, AnalysisNodeKind } from "./analysis-model.js";
 import {
   assertRecord,
   assertStableId,
   assertUtcInstant,
   invalid,
 } from "./contract-validation.js";
+import type { CompetitorDiff, CompetitorDiffResult } from "./data-research-model.js";
 import { getMetricDefinition, type MetricId } from "./metric-catalog.js";
+import type {
+  Dataset,
+  Evidence,
+  EvidenceAsset,
+  Recommendation,
+  Source,
+  SourceOwnership,
+  SourceType,
+  Task,
+} from "./model.js";
+
+export const MAX_DASHBOARD_ARTIFACT_BYTES = 1024 * 1024;
+export const MAX_DASHBOARD_DATA_PER_VIEW = 500;
 
 export const DASHBOARD_VIEW_KINDS = [
   "trend",
@@ -20,23 +35,32 @@ interface DashboardViewBase {
   id: string;
 }
 
-export type DashboardViewInput = DashboardViewBase & (
-  | {
-      kind: "trend" | "structure" | "funnel";
+export type DashboardViewInput =
+  | (DashboardViewBase & {
+      kind: "trend";
       graphId: string;
       nodeIds: string[];
-    }
-  | {
+    })
+  | (DashboardViewBase & {
+      kind: "structure";
+      graphId: string;
+      nodeIds: string[];
+    })
+  | (DashboardViewBase & {
+      kind: "funnel";
+      graphId: string;
+      nodeIds: string[];
+    })
+  | (DashboardViewBase & {
       kind: "competitor_comparison";
       competitorDiffId: string;
-    }
-  | {
+    })
+  | (DashboardViewBase & {
       kind: "task_effect";
       graphId: string;
       taskIds: string[];
       monitorNodeIds: string[];
-    }
-);
+    });
 
 export type DashboardViewStatus = "ok" | "partial" | "unverifiable";
 
@@ -48,11 +72,15 @@ export interface DashboardReason {
 export interface DashboardSourceDescriptor {
   sourceId: string;
   updatedAt: string;
+  name?: string;
+  type?: SourceType;
+  ownership?: SourceOwnership;
 }
 
 export interface DashboardMetricDescriptor {
   metricId: MetricId;
   formula: string;
+  definitionVersion?: number;
 }
 
 export type DashboardView = DashboardViewInput & {
@@ -96,6 +124,150 @@ export interface Dashboard extends EntityRecord {
   competitorDiffIds: string[];
   taskIds: string[];
   sourceVersions: DashboardEntityVersionRef[];
+}
+
+export interface DashboardAnalysisGraphRef {
+  graphId: string;
+  graphVersion: number;
+  nodeId: string;
+  kind: AnalysisNodeKind;
+}
+
+export interface DashboardDatasetDescriptor {
+  datasetId: string;
+  version: number;
+  sourceId: string;
+  name: string;
+  coverageStart: string | null;
+  coverageEnd: string | null;
+  updatedAt: string;
+}
+
+export interface DashboardEvidenceDescriptor {
+  evidenceId: string;
+  version: number;
+  sourceId: string;
+  observedAt: string;
+  contentHash: string;
+  classification: Evidence["classification"];
+  assets: EvidenceAsset[];
+  updatedAt: string;
+}
+
+export interface DashboardAnalyticsProvenance {
+  provider: string;
+  tool: string;
+  toolVersion: string;
+  inputHash: string;
+  rowCount: number;
+}
+
+export interface DashboardDatumBase {
+  datumId: string;
+  status: "ok" | "unknown";
+  reasons: DashboardReason[];
+  datasetIds: string[];
+  evidenceIds: string[];
+  analysisGraphRefs: DashboardAnalysisGraphRef[];
+  datasets: DashboardDatasetDescriptor[];
+  evidence: DashboardEvidenceDescriptor[];
+}
+
+export type DashboardDatum = DashboardDatumBase & (
+  | {
+      kind: "trend_point";
+      window: string;
+      value: number | null;
+      rowCount: number;
+      coverage: number;
+      formula: string;
+      definitionVersion: number;
+      provenance: DashboardAnalyticsProvenance;
+    }
+  | {
+      kind: "metric_category";
+      category: string;
+      metricId: MetricId;
+      definitionVersion: number;
+      formula: string;
+      value: number | null;
+      unknownReason: string | null;
+    }
+  | {
+      kind: "funnel_stage";
+      stageIndex: number;
+      field: string;
+      total: number;
+      conversionFromPrevious: number | null;
+      conversionUnknownReason: string | null;
+      overallConversion: number | null;
+      overallUnknownReason: string | null;
+      formula: string;
+      definitionVersion: number;
+    }
+  | {
+      kind: "competitor_entry";
+      competitorDiffId: string;
+      dimension: string;
+      result: CompetitorDiffResult;
+    }
+  | {
+      kind: "task_observation";
+      taskId: string;
+      monitorNodeId: string;
+      metricId: MetricId;
+      definitionVersion: number;
+      formula: string;
+      baselineValue: number | null;
+      currentValue: number | null;
+      absoluteDelta: number | null;
+      relativeDelta: number | null;
+      comparisonUnknownReason: string | null;
+      relativeDeltaUnknownReason: string | null;
+      interpretation: "observed_change_not_causal";
+    }
+);
+
+export type DashboardManifestView = DashboardView & {
+  data: DashboardDatum[];
+};
+
+export interface DashboardManifest {
+  schemaVersion: 1;
+  dashboardId: string;
+  workspaceId: string;
+  generatedAt: string;
+  renderer: DashboardRenderer;
+  sources: DashboardSourceDescriptor[];
+  datasets: DashboardDatasetDescriptor[];
+  evidence: DashboardEvidenceDescriptor[];
+  views: DashboardManifestView[];
+  graphIds: string[];
+  competitorDiffIds: string[];
+  taskIds: string[];
+  sourceVersions: DashboardEntityVersionRef[];
+}
+
+export interface DashboardSnapshot {
+  id: string;
+  workspaceId: string;
+  generatedAt: string;
+  views: DashboardViewInput[];
+  sources: Source[];
+  datasets: Dataset[];
+  evidence: Evidence[];
+  graphs: AnalysisGraph[];
+  competitorDiffs: CompetitorDiff[];
+  tasks: Task[];
+  recommendations: Recommendation[];
+  sourceVersions?: DashboardEntityVersionRef[];
+}
+
+export interface ControlledDashboardRenderResult {
+  html: Uint8Array;
+  manifest: Uint8Array;
+  manifestModel: DashboardManifest;
+  views: DashboardView[];
 }
 
 export type CreateDashboardViewInput = DashboardViewInput & {
@@ -190,9 +362,22 @@ function validateView(view: DashboardView): void {
   }
   const sourceIds = new Set<string>();
   for (const source of view.sources) {
-    assertRecord(source, "Dashboard source descriptor", ["sourceId", "updatedAt"]);
+    assertRecord(source, "Dashboard source descriptor", [
+      "sourceId",
+      "updatedAt",
+      "name",
+      "type",
+      "ownership",
+    ]);
     assertStableId(source.sourceId, "Dashboard source ID");
     assertUtcInstant(source.updatedAt, "Dashboard source updatedAt");
+    if (source.name !== undefined) assertNonEmptyString(source.name, "Dashboard source name");
+    if (source.type !== undefined && !["file", "link", "api", "manual", "database"].includes(source.type)) {
+      invalid("Dashboard source type must be supported");
+    }
+    if (source.ownership !== undefined && !["owned", "authorized", "external_public"].includes(source.ownership)) {
+      invalid("Dashboard source ownership must be supported");
+    }
     if (sourceIds.has(source.sourceId)) invalid("Dashboard source descriptors must not contain duplicates");
     sourceIds.add(source.sourceId);
   }
@@ -202,9 +387,12 @@ function validateView(view: DashboardView): void {
   }
   const metricIds = new Set<string>();
   for (const metric of view.metrics) {
-    assertRecord(metric, "Dashboard metric descriptor", ["metricId", "formula"]);
+    assertRecord(metric, "Dashboard metric descriptor", ["metricId", "formula", "definitionVersion"]);
     const definition = getMetricDefinition(metric.metricId);
     if (metric.formula !== definition.formula) invalid("Dashboard metric formula must match the controlled catalog");
+    if (metric.definitionVersion !== undefined && metric.definitionVersion !== definition.version) {
+      invalid("Dashboard metric definitionVersion must match the controlled catalog");
+    }
     if (metricIds.has(metric.metricId)) invalid("Dashboard metric descriptors must not contain duplicates");
     metricIds.add(metric.metricId);
   }
@@ -275,8 +463,9 @@ export function validateDashboard(dashboard: Dashboard): void {
     if (artifact.kind !== "html" && artifact.kind !== "manifest") invalid("Dashboard artifact kind must be supported");
     if (artifactKinds.has(artifact.kind)) invalid("Dashboard artifact kinds must not contain duplicates");
     if (!/^[0-9a-f]{64}$/i.test(artifact.contentHash)) invalid("Dashboard artifact contentHash must be SHA-256 hexadecimal");
-    if (!Number.isSafeInteger(artifact.byteLength) || artifact.byteLength < 1) {
-      invalid("Dashboard artifact byteLength must be a positive safe integer");
+    if (!Number.isSafeInteger(artifact.byteLength) || artifact.byteLength < 1 ||
+        artifact.byteLength > MAX_DASHBOARD_ARTIFACT_BYTES) {
+      invalid("Dashboard artifact byteLength must be between 1 and 1 MiB");
     }
     const expectedMediaType = artifact.kind === "html" ? "text/html; charset=utf-8" : "application/json";
     if (artifact.mediaType !== expectedMediaType) invalid("Dashboard artifact mediaType does not match its kind");
