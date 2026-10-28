@@ -95,6 +95,7 @@ export interface CompareMetricMonitor {
 
 export type AnalysisCapabilityAvailability =
   | "available"
+  | "unavailable"
   | "host_provided"
   | "not_installed"
   | "not_implemented";

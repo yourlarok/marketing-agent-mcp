@@ -3,9 +3,9 @@ import {
   AnalysisCapabilityService,
   type AnalysisService,
 } from "../application/analysis-service.js";
-import { canonicalJson } from "../infrastructure/sqlite.js";
 import { toMcpError } from "./error-mapper.js";
 import { validateToolArguments } from "./register-tools.js";
+import { textResult } from "./results.js";
 import {
   analysisGraphExpandInputSchema,
   analysisGraphExpandToolSchema,
@@ -23,13 +23,9 @@ import {
   metricMonitorCompareToolSchema,
   metricScenarioCreateInputSchema,
   metricScenarioCreateToolSchema,
+  professionalAnalyticsComputeInputSchema,
+  professionalAnalyticsComputeToolSchema,
 } from "./schemas.js";
-
-function textResult(value: unknown): {
-  content: { type: "text"; text: string }[];
-} {
-  return { content: [{ type: "text", text: canonicalJson(value) }] };
-}
 
 export function registerAnalysisTools(
   server: McpServer,
@@ -140,6 +136,26 @@ export function registerAnalysisTools(
         const { actor, requestId, idempotencyKey, ...input } =
           metricComputeInputSchema.parse(validateToolArguments(arguments_));
         return textResult(await analysis.computeMetric({
+          input,
+          context: { actor, requestId, idempotencyKey },
+        }));
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "professional_analytics_compute",
+    {
+      description: "Compute a controlled professional analytics result from verified evidence",
+      inputSchema: professionalAnalyticsComputeToolSchema,
+    },
+    async (arguments_) => {
+      try {
+        const { actor, requestId, idempotencyKey, ...input } =
+          professionalAnalyticsComputeInputSchema.parse(validateToolArguments(arguments_));
+        return textResult(await analysis.analyze({
           input,
           context: { actor, requestId, idempotencyKey },
         }));

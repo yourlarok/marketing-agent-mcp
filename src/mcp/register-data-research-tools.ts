@@ -1,14 +1,16 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DataResearchService } from "../application/data-research-service.js";
 import type { MarketingService } from "../application/marketing-service.js";
-import { canonicalJson } from "../infrastructure/sqlite.js";
 import { toMcpError } from "./error-mapper.js";
 import { validateToolArguments } from "./register-tools.js";
+import { textResult } from "./results.js";
 import {
   competitorConfirmInputSchema,
   competitorConfirmToolSchema,
   competitorDiffCreateInputSchema,
   competitorDiffCreateToolSchema,
+  connectorSqliteDiscoverInputSchema,
+  connectorSqliteDiscoverToolSchema,
   dataRequestDeclineInputSchema,
   dataRequestDeclineToolSchema,
   dataRequestPlanInputSchema,
@@ -21,6 +23,8 @@ import {
   ingestContentLinksToolSchema,
   ingestFilesInputSchema,
   ingestFilesToolSchema,
+  ingestSqliteInputSchema,
+  ingestSqliteToolSchema,
   ingestTemporaryApiInputSchema,
   ingestTemporaryApiToolSchema,
   researchPermissionSetInputSchema,
@@ -30,12 +34,6 @@ import {
   researchSessionRunInputSchema,
   researchSessionRunToolSchema,
 } from "./schemas.js";
-
-function textResult(value: unknown): {
-  content: { type: "text"; text: string }[];
-} {
-  return { content: [{ type: "text", text: canonicalJson(value) }] };
-}
 
 export function registerDataResearchTools(
   server: McpServer,
@@ -93,6 +91,43 @@ export function registerDataResearchTools(
         const { actor, requestId, idempotencyKey, ...input } =
           ingestFilesInputSchema.parse(validateToolArguments(arguments_));
         return textResult(await dataResearch.importFiles({
+          input,
+          context: { actor, requestId, idempotencyKey },
+        }));
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "connector_sqlite_discover",
+    {
+      description: "Discover the schema of an authorized SQLite database without reading rows",
+      inputSchema: connectorSqliteDiscoverToolSchema,
+    },
+    async (arguments_) => {
+      try {
+        return textResult(dataResearch.connectorSqliteDiscover(
+          connectorSqliteDiscoverInputSchema.parse(validateToolArguments(arguments_)),
+        ));
+      } catch (error) {
+        throw toMcpError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "ingest_sqlite",
+    {
+      description: "Import an authorized SQLite snapshot through a structured read-only query",
+      inputSchema: ingestSqliteToolSchema,
+    },
+    async (arguments_) => {
+      try {
+        const { actor, requestId, idempotencyKey, ...input } =
+          ingestSqliteInputSchema.parse(validateToolArguments(arguments_));
+        return textResult(await dataResearch.ingestSqlite({
           input,
           context: { actor, requestId, idempotencyKey },
         }));

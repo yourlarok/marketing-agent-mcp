@@ -1370,7 +1370,14 @@ function capability(
   };
 }
 
+export interface AnalysisCapabilityConfiguration {
+  sqliteConfigured?: boolean;
+  professionalAnalyticsConfigured?: boolean;
+}
+
 export class AnalysisCapabilityService {
+  constructor(private readonly configuration: AnalysisCapabilityConfiguration = {}) {}
+
   list(): AnalysisCapability[] {
     return [
       capability({
@@ -1486,6 +1493,54 @@ export class AnalysisCapabilityService {
         availability: { state: "available", detail: "Supports temporary snapshots, not persistent platform integration." },
         fallback: ["ingest_files with an exported snapshot"],
         limitations: ["Plaintext credentials are rejected.", "Only JSON arrays of flat objects or CSV are supported.", "No OAuth or live connector is installed."],
+      }),
+      capability({
+        id: "connector.sqlite.discover",
+        operation: "connector_sqlite_discover",
+        description: "Discover only the requested authorized SQLite database schema without reading rows.",
+        requiredInputs: ["databaseId"],
+        configuration: ["MARKETING_DATABASE_ROOT"],
+        availability: this.configuration.sqliteConfigured ? {
+          state: "available",
+          detail: "The authorized SQLite root is configured; only controlled relative database IDs are accepted.",
+        } : {
+          state: "unavailable",
+          detail: "SQLite discovery requires MARKETING_DATABASE_ROOT in the trusted deployment configuration.",
+        },
+        fallback: ["ingest.files with an exported snapshot"],
+        limitations: ["Schema discovery is read-only.", "No PostgreSQL, MySQL, GA4, OAuth, or arbitrary path access is provided."],
+      }),
+      capability({
+        id: "ingest.sqlite",
+        operation: "ingest_sqlite",
+        description: "Ingest a bounded SQLite snapshot using a structured schema-allowlisted read-only query.",
+        requiredInputs: ["id", "workspaceId", "query", "ownership", "actor", "requestId", "idempotencyKey"],
+        configuration: ["MARKETING_DATABASE_ROOT", "Structured columns, equality filters, stable order, and limit"],
+        availability: this.configuration.sqliteConfigured ? {
+          state: "available",
+          detail: "The authorized SQLite root is configured; ingestion uses the existing auditable command pipeline.",
+        } : {
+          state: "unavailable",
+          detail: "SQLite ingestion requires MARKETING_DATABASE_ROOT in the trusted deployment configuration.",
+        },
+        fallback: ["ingest.files with an exported snapshot"],
+        limitations: ["Only owned or authorized SQLite snapshots are supported.", "Arbitrary SQL, shell commands, dynamic paths, and code execution are rejected."],
+      }),
+      capability({
+        id: "analytics.professional",
+        operation: "professional_analytics_compute",
+        description: "Compute controlled trend, funnel, or anomaly analytics through the configured professional MCP provider.",
+        requiredInputs: ["id", "workspaceId", "expectedVersion", "batchId", "datasetId", "evidenceId", "assetId", "operation", "actor", "requestId", "idempotencyKey"],
+        configuration: ["MARKETING_ANALYTICS_MCP_COMMAND and MARKETING_ANALYTICS_MCP_ARGS in the trusted deployment environment"],
+        availability: this.configuration.professionalAnalyticsConfigured ? {
+          state: "available",
+          detail: "A professional analytics provider is configured; provider health and result verification occur on each explicit call.",
+        } : {
+          state: "unavailable",
+          detail: "Professional analytics requires a configured MCP provider; no local substitute is advertised.",
+        },
+        fallback: ["metric_compute for supported controlled metrics"],
+        limitations: ["Statistical output does not establish causality or future outcomes.", "No dynamic provider command, environment, code, or arbitrary rows are accepted through this tool."],
       }),
       capability({
         id: "connectors.live",

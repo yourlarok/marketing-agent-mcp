@@ -54,19 +54,24 @@ const analysisToolNames = [
   "analysis_graph_expand",
   "analysis_graph_fork",
   "analysis_graph_get",
+  "connector_sqlite_discover",
+  "ingest_sqlite",
   "marketing_analysis_start",
   "marketing_capability_list",
   "metric_compute",
   "metric_monitor_compare",
   "metric_scenario_create",
+  "professional_analytics_compute",
 ];
 const writeToolNames = [
   "analysis_graph_expand",
   "analysis_graph_fork",
+  "ingest_sqlite",
   "marketing_analysis_start",
   "metric_compute",
   "metric_monitor_compare",
   "metric_scenario_create",
+  "professional_analytics_compute",
 ];
 
 function context(suffix: string): CommandContext {
@@ -169,12 +174,12 @@ describe("analysis MCP tools and initialization", () => {
     expect(instructions).toMatch(/not installed|not available|do not claim/i);
   });
 
-  it("registers exactly the prior and eight analysis tools with strict schemas", async () => {
+  it("registers exactly the prior and public analysis tools with strict schemas", async () => {
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual(
       [...priorToolNames, ...analysisToolNames].sort(),
     );
-    expect(tools).toHaveLength(32);
+    expect(tools).toHaveLength(35);
     for (const tool of tools) {
       expect(tool.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
     }

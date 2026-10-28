@@ -36,12 +36,15 @@ async function run(): Promise<void> {
       clock,
       ids,
       artifacts,
-      new McpAnalyticsProvider({
-        ...(config.analyticsMcp ? { command: config.analyticsMcp.command } : {}),
-        ...(config.analyticsMcp ? { args: config.analyticsMcp.args } : {}),
-      }),
+      config.analyticsMcp ? new McpAnalyticsProvider({
+        command: config.analyticsMcp.command,
+        args: config.analyticsMcp.args,
+      }) : undefined,
     );
-    const server = createMcpServer(service, dataResearch, analysis);
+    const server = createMcpServer(service, dataResearch, analysis, {
+      sqliteConfigured: config.databaseRoot !== undefined,
+      professionalAnalyticsConfigured: config.analyticsMcp !== undefined,
+    });
     const transport = new StdioServerTransport();
     let shutdown: Promise<void> | undefined;
 

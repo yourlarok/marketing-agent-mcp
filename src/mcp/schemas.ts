@@ -4,6 +4,7 @@ import { isSecretLikeKey } from "../domain/secrets.js";
 export { isSecretLikeKey } from "../domain/secrets.js";
 
 export const MAX_SERIALIZED_INPUT_BYTES = 64 * 1024;
+export const MAX_SERIALIZED_OUTPUT_BYTES = 64 * 1024;
 export const MAX_COLLECTION_ENTRIES = 1_000;
 export const MAX_KEY_LENGTH = 128;
 export const MAX_ID_LENGTH = 256;
@@ -355,6 +356,39 @@ export const ingestFilesInputSchema = z.strictObject({
   ...commandContextInput,
 });
 
+const connectorIdentifierSchema = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/);
+const connectorDatabaseIdSchema = z.string().min(1).max(512)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,127})*$/)
+  .refine((value) => value.split("/").every((segment) => segment !== "." && segment !== ".."));
+const connectorScalarSchema = z.union([z.string(), z.number().finite(), z.boolean(), z.null()]);
+const structuredTableQueryInputSchema = z.strictObject({
+  databaseId: connectorDatabaseIdSchema,
+  table: connectorIdentifierSchema,
+  columns: z.array(connectorIdentifierSchema).min(1).max(500)
+    .refine((columns) => new Set(columns).size === columns.length),
+  filters: z.record(connectorIdentifierSchema, connectorScalarSchema),
+  order: z.array(z.strictObject({
+    column: connectorIdentifierSchema,
+    direction: z.enum(["asc", "desc"]),
+  })).max(500).refine((orders) =>
+    new Set(orders.map((order) => order.column)).size === orders.length),
+  limit: z.number().int().min(1).max(100_000),
+});
+
+export const connectorSqliteDiscoverInputSchema = z.strictObject({
+  databaseId: connectorDatabaseIdSchema,
+});
+export const ingestSqliteInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  query: structuredTableQueryInputSchema,
+  ownership: z.enum(["owned", "authorized"]),
+  planId: idSchema.optional(),
+  expectedPlanVersion: positiveIntegerSchema.optional(),
+  freshness: freshnessSchema.optional(),
+  ...commandContextInput,
+});
+
 export const ingestTemporaryApiInputSchema = z.strictObject({
   id: idSchema,
   workspaceId: idSchema,
@@ -524,6 +558,41 @@ export const metricComputeInputSchema = z.strictObject({
   comparability: analysisComparabilitySchema.optional(),
   ...commandContextInput,
 });
+const analyticsOperationInputSchema = z.discriminatedUnion("operation", [
+  z.strictObject({
+    operation: z.literal("trend_v1"),
+    datasetId: idSchema,
+    parameters: z.strictObject({
+      timeField: connectorIdentifierSchema,
+      valueField: connectorIdentifierSchema,
+      grain: z.enum(["day", "week"]),
+    }),
+  }),
+  z.strictObject({
+    operation: z.literal("funnel_v1"),
+    datasetId: idSchema,
+    parameters: z.strictObject({
+      stageFields: z.array(connectorIdentifierSchema).min(2).max(500)
+        .refine((fields) => new Set(fields).size === fields.length),
+    }),
+  }),
+  z.strictObject({
+    operation: z.literal("anomaly_v1"),
+    datasetId: idSchema,
+    parameters: z.strictObject({ valueField: connectorIdentifierSchema }),
+  }),
+]);
+export const professionalAnalyticsComputeInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  batchId: idSchema,
+  datasetId: idSchema,
+  evidenceId: idSchema,
+  assetId: idSchema,
+  operation: analyticsOperationInputSchema,
+  ...commandContextInput,
+});
 export const metricScenarioCreateInputSchema = z.strictObject({
   id: idSchema,
   workspaceId: idSchema,
@@ -623,6 +692,38 @@ export const metricComputeToolSchema = z.strictObject({
   assetId: rawStringSchema,
   metricId: rawStringSchema,
   comparability: rawStringSchema.optional(),
+  ...rawCommandContextInput,
+});
+const rawAnalyticsOperationSchema = z.discriminatedUnion("operation", [
+  z.strictObject({
+    operation: z.literal("trend_v1"),
+    datasetId: rawStringSchema,
+    parameters: z.strictObject({
+      timeField: rawStringSchema,
+      valueField: rawStringSchema,
+      grain: rawStringSchema,
+    }),
+  }),
+  z.strictObject({
+    operation: z.literal("funnel_v1"),
+    datasetId: rawStringSchema,
+    parameters: z.strictObject({ stageFields: z.array(rawStringSchema) }),
+  }),
+  z.strictObject({
+    operation: z.literal("anomaly_v1"),
+    datasetId: rawStringSchema,
+    parameters: z.strictObject({ valueField: rawStringSchema }),
+  }),
+]);
+export const professionalAnalyticsComputeToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  batchId: rawStringSchema,
+  datasetId: rawStringSchema,
+  evidenceId: rawStringSchema,
+  assetId: rawStringSchema,
+  operation: rawAnalyticsOperationSchema,
   ...rawCommandContextInput,
 });
 export const metricScenarioCreateToolSchema = z.strictObject({
@@ -832,6 +933,32 @@ export const ingestFilesToolSchema = z.strictObject({
   paths: z.array(rawStringSchema),
   ownership: rawStringSchema.optional(),
   limits: rawIngestLimitsSchema.optional(),
+  planId: rawStringSchema.optional(),
+  expectedPlanVersion: rawNumberSchema.optional(),
+  freshness: rawFreshnessSchema.optional(),
+  ...rawCommandContextInput,
+});
+const rawStructuredTableQuerySchema = z.strictObject({
+  databaseId: rawStringSchema,
+  table: rawStringSchema,
+  columns: z.array(rawStringSchema),
+  filters: z.record(rawStringSchema, z.union([
+    rawStringSchema,
+    rawNumberSchema,
+    z.boolean(),
+    z.null(),
+  ])),
+  order: z.array(z.strictObject({ column: rawStringSchema, direction: rawStringSchema })),
+  limit: rawNumberSchema,
+});
+export const connectorSqliteDiscoverToolSchema = z.strictObject({
+  databaseId: rawStringSchema,
+});
+export const ingestSqliteToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  query: rawStructuredTableQuerySchema,
+  ownership: rawStringSchema,
   planId: rawStringSchema.optional(),
   expectedPlanVersion: rawNumberSchema.optional(),
   freshness: rawFreshnessSchema.optional(),
