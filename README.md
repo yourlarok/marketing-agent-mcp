@@ -27,6 +27,7 @@ Linux 若缺少 Chromium 系统依赖，可按 Playwright 官方提示安装对�
 | --- | --- |
 | `MARKETING_DATA_DIR` | 必填，必须是已存在目录。SQLite 位于其中的 `marketing.db`。 |
 | `MARKETING_IMPORT_ROOT` | 文件导入必填，必须是已存在目录。`ingest_files.paths` 使用相对该目录的路径；绝对路径、`..` 和解析后越界的符号链接均不能绕过目录边界。 |
+| `MARKETING_DATABASE_ROOT` | SQLite discover/snapshot 必填，必须是已存在且明确授权的数据库目录。只允许读取 canonical path 仍位于该根内的普通 `.sqlite` / `.db` 文件。 |
 | `MARKETING_ARTIFACT_DIR` | 产生或读取证据资产时必填。首次使用时自动创建并设为私有目录权限；原始文件/API 响应、规范化 JSONL、质量报告、页面正文和 PNG 截图按 SHA-256 内容寻址保存。 |
 
 仅使用血缘工具时不需要 import/artifact root。import root 中的输入文件和 artifact root 中的证据应分别授权；不要因为导入目录可读就把证据目录暴露给其他用户。
@@ -158,20 +159,50 @@ API 还必须具有 `owned` 或 `authorized` 所有权，并提供未来的 UTC 
 
 SQLite、实体版本、审计和幂等结果在同一数据目录重启后保留；artifact 通过内容哈希重新读取。重启后可仅用 `data_research_get` 恢复 plan/session/diff payload 和资产描述，再用 `evidence_asset_get` 读取正文。
 
+## 授权 SQLite 快照
+
+`connector_sqlite_discover` 只发现 `MARKETING_DATABASE_ROOT` 中指定 database ID 的普通表结构，不读取业务行。`ingest_sqlite` 再通过结构化 query 读取快照并生成 Source、Dataset、Evidence、规范化 JSONL 和质量报告。典型顺序是先 discover，再以 `query: { databaseId, table, columns, filters, order, limit }` 调用 ingest，随后用 `data_research_get` 和 `evidence_asset_get` 恢复血缘与 snapshot 资产。
+
+- 授权根必须是部署方明确授权的已存在目录。database ID 只能是受控标识及可选 `.sqlite` / `.db` 后缀；绝对路径、`..`、根外解析、符号链接和非普通文件均被拒绝。打开时还会校验描述符与文件身份，并以只读、`query_only` 方式访问。
+- 这不是任意 SQL 接口。只能选择已发现表中的列、等值/`IS NULL` filters、受控升降序和行数 limit；server 构造参数化查询并追加稳定排序。调用方不能传 SQL 字符串、join、子查询、写语句或 PRAGMA。
+- 每次 ingest 都是调用时生成的**显式快照**，保存 query hash、observedAt、来源描述和内容 hash；不是实时同步、订阅或持续连接。源库之后的变化不会自动进入 Dataset，必须再次显式 ingest 形成新快照。
+- 仅接受 `owned` 或 `authorized` 数据。视图、BLOB、非有限数值和超出安全整数范围的 SQLite integer 不受支持；不能把它当作任意 SQLite 数据库的通用导入器。
+- 当前文件描述符传递实现依赖 POSIX 风格 `/dev/fd/<fd>`，供 `node:sqlite` 打开已经完成授权校验的描述符。没有兼容 `/dev/fd` 的平台（包括原生 Windows）不支持此 SQLite connector；这不是可移植的纯路径实现，也不影响不使用该 connector 的其他工具。
+
+## 外部分析 MCP
+
+`professional_analytics_compute` 不是内置统计按钮：它要求部署方另行安装、授权并信任一个真正提供 stdio `analyze` 工具的外部 MCP。项目不附带生产供应商，也不会在未配置时用内置参考函数冒充外部分析。
+
+```json
+{
+  "MARKETING_ANALYTICS_MCP_COMMAND": "/absolute/path/to/professional-analytics-mcp",
+  "MARKETING_ANALYTICS_MCP_ARGS": "[\"--stdio\"]"
+}
+```
+
+command 是受信任部署配置中的固定可执行文件；args 必须是 **JSON 字符串数组**，配置 args 时必须同时配置 command，不会拼接成 shell 命令。支持受控 `trend_v1`、`funnel_v1`、`anomaly_v1`，输入只能引用已导入且同 batch 配对的 Dataset/Evidence/normalized_jsonl。每次调用启动独立 provider 进程，结束后关闭 client，并在异常时按超时和退出边界清理；默认不转发业务环境变量或凭据。
+
+未配置时，`marketing_capability_list` 将 `analytics.professional` 标为 `unavailable`，真实公开工具返回 `CAPABILITY_UNAVAILABLE`、`mcp_not_configured` 和包含上述环境变量的 `configurationAction`，不会写入图或返回本地替代结果。provider 启动、协议、超时、响应校验或清理失败同样作为 capability gap 报告。
+
+server 对 canonical operation + rows 计算 SHA-256 `inputHash`，要求 provider 返回相同 hash，并用独立内置参考实现**复算核对**结果；hash 不符、结构不合法或数值不一致都会失败。复算只是验收外部结果，不是未配置 fallback。节点 provenance 保存 input hash、provider/tool version、行数以及 batch/dataset/evidence/asset ID 和内容 hash，便于重启后审计。
+
+硬上限为每次 100,000 行、provider 原始响应 16 MiB、15 秒超时；MCP 工具输出仍受 64 KiB 限制，trend 窗口、anomaly 数量和 funnel stage 也有边界。外部 MCP 的 command 属于受信任代码执行配置，响应校验与进程清理**不是 OS 沙箱**：部署方仍须用独立账户、容器和主机资源/网络策略限制 provider 的文件、进程和出站访问。
+
 ## 分析网络
 
 普通用户只需对 Agent 说一句话，例如：**“我没有业务数据，想了解 AI 教育怎么营销。”** Agent 应先调用 `marketing_analysis_start`；默认 `inputMode=none` 会创建 question 与 `public_research` 分支，最多提出一个可跳过的关键问题，并给出宿主搜索或限域研究的下一步。它不要求 CSV，也不会假装研究已经完成。自有数据是可选增强；公开互动不能推断成 CTR、转化或因果效果。
 
 `marketing_capability_list` 说明操作、所需输入/配置、可用性、fallback 与限制。`host_provided` 只表示能力须由宿主实际提供，`not_installed` 的 live connector 占位说明不能被当作已安装或可用能力。
 
-### 8 个分析工具
+### 9 个分析工具
 
 - `marketing_analysis_start`：按 `none|links|dataset|api` 创建分析图和结构化 recommended actions；`dataset` 模式用 `referenceId` 引用已导入 Dataset。
 - `marketing_capability_list`：发现真实能力、配置和边界，不是安装或健康证明。
 - `analysis_graph_get`：按 `workspaceId` 与图 ID 恢复完整图、节点 payload、边和引用。
-- `analysis_graph_expand`：用当前 `expectedVersion` 原子追加受控节点/边，可从任意现有节点扩展；拒绝环、重复和孤儿引用。通用扩展只允许调用方创建 `question|research|dataset|decision`，`metric|scenario|monitor` 只能由对应真实计算命令生成。
+- `analysis_graph_expand`：用当前 `expectedVersion` 原子追加受控节点/边，可从任意现有节点扩展；拒绝环、重复和孤儿引用。通用扩展只允许调用方创建 `question|research|dataset|decision`，`metric|analytics|scenario|monitor` 只能由对应真实计算命令生成。
 - `analysis_graph_fork`：深拷贝独立分支并记录 `parentGraphId`、`parentVersion`、`forkNodeId`；父图不变，本批不做分支合并。
 - `metric_compute`：从同 batch 的 Dataset、Evidence 与 `normalized_jsonl` 计算受控指标，并校验 hash、字节数和质量报告。
+- `professional_analytics_compute`：调用已配置的真实外部分析 MCP，复算核对 trend/funnel/anomaly 并保存完整证据 provenance；未配置时明确不可用。
 - `metric_scenario_create`：从当前 Metric 节点创建明确假设的条件化算术情景。
 - `metric_monitor_compare`：用新导入快照按同一定义重算并做一次显式对比，可链接同图 Scenario。
 
@@ -183,10 +214,18 @@ SQLite、实体版本、审计和幂等结果在同一数据目录重启后保�
 | --- | --- | --- | --- |
 | `ctr_v1` | `sum(clicks) / sum(impressions)` | 曝光到点击的过程效率；不是转化率，也不证明因果 | 1000 |
 | `save_like_ratio_v1` | `sum(saves) / sum(likes)` | 收藏相对点赞的互动构成；不是收藏率、转化率或 CTR | 30 |
+| `engagement_rate_v1` | `(sum(likes) + sum(saves) + sum(comments)) / sum(impressions)` | 复合互动效率；同一曝光可有多种互动，不是独立人数、转化率或因果效果 | 1000 |
+| `conversion_rate_v1` | `sum(conversions) / sum(clicks)` | 点击到转化的过程效率；只允许 owned/authorized，external_public 明确拒绝，不证明增量或因果 | 100 |
 
 只纳入同一行分子、分母均为有限非负数的 complete-case 行。数值必须是 number，或匹配严格十进制/科学计数法的字符串，再转换为 IEEE-754；缺失、空字符串、负数、非数值、NaN/Infinity 都排除，不得当作 0。结果保留总行数、纳入/排除行数和逐行排除原因，使用 `ieee754_compensated_sum` 补偿求和，不做未声明的显示舍入。
 
 没有有效行、分母合计为 0 或合计/比值超出有限数值范围时，`status=unknown`、`value=null`，分别给出 `NO_VALID_ROWS`、`ZERO_DENOMINATOR` 或 `NON_FINITE_TOTAL`；零分母不能返回 0。结果同时保存公式、定义版本、分子、分母、覆盖时间、输入 ID、证据 hash、质量限制和参考度。
+
+### Wilson 95% 区间与适用性
+
+`proportionAssessment` 对 eligible 的 CTR/conversion 计数给出 Wilson score 95% 区间。其假设是分子和分母来自**独立同分布（IID）Bernoulli trials**；区间只描述该比例的抽样不确定性，不是营销提升概率，只能作非因果解释，也不能证明增量效果。曝光、点击或用户之间相关、重复计数、归因口径不一致或试验条件不同时，即使返回算术区间也不能把它当作已满足这些统计假设。
+
+以下情况为 `not_applicable`、`interval=null`：engagement/save-like 等非 binomial eligible 指标，unknown/零分母/非有限合计，非安全整数计数，分子大于分母，以及分母低于上表 minimumDenominator。engagement 因一次曝光可产生多种互动而明确不适用 Wilson；conversion 除上述条件外仍受 owned/authorized 权限边界约束，不能从公开互动推导。
 
 ### 参考度 exact rubric
 
@@ -216,11 +255,13 @@ SQLite、实体版本、审计和幂等结果在同一数据目录重启后保�
 | --- | --- |
 | MCP 输入 | 完整序列化参数 64 KiB；集合通常最多 1,000 项；严格字段与嵌套秘密字段名检查 |
 | 文件/API 表格导入 | 单文件 25 MiB、100 文件、批次 100,000 行、500 列 |
+| SQLite 结构化快照 | 100,000 行、500 列、100 个等值 filters |
 | 规范化数据 | 单 Dataset JSONL 25 MiB；单批 JSONL 100 MiB |
+| 外部分析 MCP | 100,000 行；原始响应 16 MiB；15 秒超时；结果仍受 MCP 输出 64 KiB 限制 |
 | XLSX 解压 | 单 entry 64 MiB；workbook 合计 128 MiB |
 | 临时 API HTTP | 响应 10 MiB；请求超时 10 秒；最多 5 次重定向 |
 | 内容链接 | 每批 100 个；每页最多 50 个 CSS 字段 |
-| Chromium/MCP 采集 | 单次默认/最大 15 秒；PNG 截图最多 10 MiB |
+| Chromium/内容 MCP 采集 | 单次默认/最大 15 秒；PNG 截图最多 10 MiB |
 | 研究 session | `maxDepth` 2、`maxPages` 20、`maxDurationMs` 60,000、`maxBytes` 20 MiB |
 | 血缘读取 | 1,000 个节点 |
 
@@ -243,7 +284,7 @@ SQLite、实体版本、审计和幂等结果在同一数据目录重启后保�
 
 ## 持久化与关闭
 
-每次内容采集结束会关闭 Chromium、目标固定代理和专业 MCP client。server 响应 `SIGINT` / `SIGTERM`，关闭 MCP transport 和 SQLite 后退出；关闭 MCP client 也会触发 transport 清理。不要在写入或关闭过程中直接删除数据库或证据目录。
+每次内容采集结束会关闭 Chromium、目标固定代理和专业内容 MCP client；每次外部分析结束也会清理其独立 provider 进程。server 响应 `SIGINT` / `SIGTERM`，关闭 MCP transport 和 SQLite 后退出；关闭 MCP client 也会触发 transport 清理。不要在写入或关闭过程中直接删除数据库或证据目录。
 
 ## 工具总览
 
@@ -251,10 +292,10 @@ SQLite、实体版本、审计和幂等结果在同一数据目录重启后保�
 | --- | --- |
 | 工作区与营销血缘 | `workspace_create`、`source_register`、`dataset_register`、`evidence_record`、`finding_record`、`recommendation_create`、`task_create`、`task_transition`、`lineage_get` |
 | 外部能力元数据 | `capability_register`、`capability_health_record`、`capability_list` |
-| 数据计划与导入 | `data_request_plan`、`data_request_decline`、`ingest_files`、`ingest_temporary_api`、`ingest_content_links` |
+| 数据计划与导入 | `data_request_plan`、`data_request_decline`、`ingest_files`、`ingest_temporary_api`、`ingest_content_links`、`connector_sqlite_discover`、`ingest_sqlite` |
 | 公开研究 | `research_session_create`、`research_permission_set`、`research_session_run` |
 | 竞品与证据 | `competitor_confirm`、`competitor_diff_create`、`data_research_get`、`evidence_asset_get` |
-| 分析网络 | `marketing_analysis_start`、`marketing_capability_list`、`analysis_graph_get`、`analysis_graph_expand`、`analysis_graph_fork`、`metric_compute`、`metric_scenario_create`、`metric_monitor_compare` |
+| 分析网络 | `marketing_analysis_start`、`marketing_capability_list`、`analysis_graph_get`、`analysis_graph_expand`、`analysis_graph_fork`、`metric_compute`、`professional_analytics_compute`、`metric_scenario_create`、`metric_monitor_compare` |
 
 `capability_health_record` 只有在关联证据包含完全匹配的 `toolHealth` 时才能把能力置为 `verified`。健康检查必须由调用方实际完成；能力注册不等于安装、授权、执行或健康验证。`marketing_capability_list` 同样只是声明与路由目录，不会把未安装的 connector 变成可用能力。
 
@@ -270,22 +311,24 @@ npm run smoke
 `npm run smoke` 等价于：
 
 ```bash
-vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts
+vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/data-analytics-documentation.test.ts
 ```
 
-运行 smoke 前必须构建最新代码。三套验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client：
+运行 smoke 前必须构建最新代码。四套 stdio 验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client，另有 README/smoke 文档契约：
 
 - 原套件覆盖营销链、幂等、血缘、能力健康、输入边界、原始 malformed JSON、协议专用 stdout、启动失败和优雅关闭。
 - 数据研究套件启动本地 HTTP fixture 与真 Chromium，完成计划、CSV/XLSX 与质量资产、env-ref 认证临时 API、内容链接、研究权限与限域抓取、竞品确认/Diff、证据读取，并重启验证 plan/session/diff/artifact。loopback 仅在测试进程内显式 allowlist，测试凭据仅通过 env reference 使用。
 - 分析网络套件覆盖初始化 instructions、无数据公开研究分支、能力边界、公开/自有文件指标、条件情景、监控、expand/fork、幂等与父图不变，并在重启后仅通过 `analysis_graph_get` 恢复全部节点和引用；验证零分母 unknown、complete-case、公开来源参考度与不可比语义，不使用带外 SQL。
+- SQLite/外部分析套件使用临时真实 SQLite 和独立分析 MCP fixture，核对 discover、结构化 snapshot/ingest、engagement/conversion 数值、Wilson 适用性与区间、trend/funnel/anomaly 实质结果、input hash/证据 provenance、fork、重启恢复以及未配置 capability gap；每例使用独立目录和子进程环境，并关闭 server/provider。
 
 `npm test` 也包含这些 e2e 文件，因此同样要求最新 `dist` 和可用 Chromium。
 
 ## 当前不支持
 
-- 不做自动因果推断、保证性提升或商业结果承诺；条件情景和前后对比不能替代实验或因果分析。
+- 不做自动因果推断、保证性提升或商业结果承诺；条件情景、Wilson 区间和前后对比不能替代实验或因果分析。
 - 不提供仪表盘、内容生成、逆向制作、审批执行或发布。
-- 不安装或声明外部营销平台的 OAuth、账户同步、live connector，也不提供定时/自动调度监控；文件、临时授权 API 和公开链接快照不等于持续平台集成。
-- 不声明内置任何特定专业 MCP 供应商集成。
+- 不提供 PostgreSQL、MySQL、GA4 connector，不安装或声明外部营销平台的 OAuth、账户同步、live connector，也不提供定时/自动调度监控；文件、临时授权 API、SQLite 和公开链接快照不等于持续平台集成。
+- 不声明内置任何特定专业内容或分析 MCP 供应商集成；外部分析必须显式配置真实依赖，未配置时没有本地分析 fallback。
+- SQLite connector 不支持视图、BLOB、任意 SQL、实时同步或没有兼容 POSIX `/dev/fd` 的平台。
 - 不支持自动登录、CAPTCHA 绕过、文件下载、任意脚本执行、任意 SQL/Python/公式 DSL、跨 Dataset join、语义化竞品结论或把 `unknown` 当作事实。
-- 不提供跨工作区访问、多用户认证、远程传输、访问控制或数据库加密。
+- 不提供跨工作区访问、多用户认证、远程传输、访问控制、数据库加密或外部 MCP 的 OS 沙箱。

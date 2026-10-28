@@ -57,15 +57,20 @@ export function toMcpError(error: unknown): McpError {
     );
   }
 
+  const details = safeDetails(error.details);
+  const capabilityDetails = error.code === "CAPABILITY_UNAVAILABLE" && details &&
+      Object.keys(details).length > 0
+    ? ` ${JSON.stringify({ ...details, code: error.code })}`
+    : "";
   return new McpError(
     error.code === "INVALID_INPUT"
       ? ErrorCode.InvalidParams
       : ErrorCode.InternalError,
-    safeMessages[error.code],
+    `${safeMessages[error.code]}${capabilityDetails}`,
     {
       code: error.code,
       retryable: error.retryable,
-      details: safeDetails(error.details),
+      details,
     },
   );
 }

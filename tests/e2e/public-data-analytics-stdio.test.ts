@@ -1,4 +1,3 @@
-import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -42,7 +41,16 @@ function sqliteQuery(): JsonRecord {
   return {
     databaseId: "marketing",
     table: "daily_metrics",
-    columns: ["observedAt", "revenue"],
+    columns: [
+      "observedAt",
+      "impressions",
+      "likes",
+      "saves",
+      "comments",
+      "clicks",
+      "conversions",
+      "revenue",
+    ],
     filters: {},
     order: [{ column: "observedAt", direction: "asc" }],
     limit: 100,
@@ -64,10 +72,22 @@ describe("built public SQLite and analytics stdio contracts", () => {
     const database = new DatabaseSync(join(databaseRoot, "marketing.sqlite"));
     try {
       database.exec(`
-        CREATE TABLE daily_metrics (observedAt TEXT, revenue REAL);
+        CREATE TABLE daily_metrics (
+          observedAt TEXT,
+          impressions INTEGER,
+          likes INTEGER,
+          saves INTEGER,
+          comments INTEGER,
+          clicks INTEGER,
+          conversions INTEGER,
+          revenue REAL
+        );
         INSERT INTO daily_metrics VALUES
-          ('2026-01-01T00:00:00.000Z', 10),
-          ('2026-01-03T00:00:00.000Z', 20);
+          ('2026-01-01T00:00:00.000Z', 1000, 50, 10, 5, 100, 10, 10),
+          ('2026-01-02T00:00:00.000Z', 1000, 60, 10, 5, 100, 12, 11),
+          ('2026-01-03T00:00:00.000Z', 1000, 70, 10, 5, 100, 14, 12),
+          ('2026-01-04T00:00:00.000Z', 1000, 80, 10, 5, 100, 16, 13),
+          ('2026-01-06T00:00:00.000Z', 1000, 90, 10, 5, 100, 18, 100);
       `);
     } finally {
       database.close();
@@ -114,11 +134,11 @@ describe("built public SQLite and analytics stdio contracts", () => {
     expect(running.stderr()).not.toContain("MCP shutdown failed");
   }
 
-  it("lists raw schemas and executes discover, ingest, analytics, replay, and audit over real stdio", async () => {
+  it("runs SQLite metrics, Wilson, real MCP analytics, fork, and restart recovery", async () => {
     const running = await startClient();
     const { client } = running;
-    const call = async (name: string, arguments_: JsonRecord = {}): Promise<JsonRecord> =>
-      payload(await client.callTool({ name, arguments: arguments_ }));
+    const call = async (name: string, arguments_: JsonRecord = {}, target = client): Promise<JsonRecord> =>
+      payload(await target.callTool({ name, arguments: arguments_ }));
     const { tools } = await client.listTools();
     for (const name of [
       "connector_sqlite_discover",
@@ -149,7 +169,16 @@ describe("built public SQLite and analytics stdio contracts", () => {
       ...context("workspace"),
     });
     const discovery = await call("connector_sqlite_discover", { databaseId: "marketing" });
-    expect(discovery.tables).toHaveLength(1);
+    expect(discovery).toMatchObject({
+      databaseId: "marketing",
+      tables: [{
+        name: "daily_metrics",
+        columns: expect.arrayContaining([
+          { name: "impressions", type: "number" },
+          { name: "observedAt", type: "string" },
+        ]),
+      }],
+    });
     expect(JSON.stringify(discovery)).not.toContain(databaseRoot);
 
     const ingestArguments = {
@@ -172,41 +201,257 @@ describe("built public SQLite and analytics stdio contracts", () => {
       id: batch.id as string,
       workspaceId,
     });
-    const evidence = ((lineage.descriptors as JsonRecord).evidence as JsonRecord[])[0]!;
-    const assets = evidence.assets as { id: string; kind: string }[];
+    const descriptors = lineage.descriptors as JsonRecord;
+    const source = (descriptors.sources as JsonRecord[])[0]!;
+    const evidence = (descriptors.evidence as JsonRecord[])[0]!;
+    const assets = evidence.assets as {
+      id: string;
+      kind: string;
+      contentHash: string;
+      byteLength: number;
+    }[];
+    const normalizedAsset = assets.find((asset) => asset.kind === "normalized_jsonl")!;
+    const snapshotAsset = assets.find((asset) => asset.kind === "snapshot")!;
+    const snapshotResult = await call("evidence_asset_get", {
+      workspaceId,
+      evidenceId: evidence.id as string,
+      assetId: snapshotAsset.id,
+    });
+    const snapshot = JSON.parse(Buffer.from(snapshotResult.content as string, "base64").toString("utf8")) as JsonRecord;
+    expect(snapshot).toMatchObject({
+      sourceDescriptor: {
+        connectorId: "sqlite-readonly",
+        databaseId: "marketing",
+        table: "daily_metrics",
+        query: sqliteQuery(),
+      },
+      queryHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      rows: [
+        { observedAt: "2026-01-01T00:00:00.000Z", impressions: 1000, conversions: 10, revenue: 10 },
+        { observedAt: "2026-01-02T00:00:00.000Z", impressions: 1000, conversions: 12, revenue: 11 },
+        { observedAt: "2026-01-03T00:00:00.000Z", impressions: 1000, conversions: 14, revenue: 12 },
+        { observedAt: "2026-01-04T00:00:00.000Z", impressions: 1000, conversions: 16, revenue: 13 },
+        { observedAt: "2026-01-06T00:00:00.000Z", impressions: 1000, conversions: 18, revenue: 100 },
+      ],
+    });
+    expect(source).toMatchObject({
+      type: "database",
+      ownership: "authorized",
+      metadata: {
+        acquisition: "connector",
+        databaseId: "marketing",
+        table: "daily_metrics",
+        queryHash: snapshot.queryHash,
+      },
+    });
+    expect(JSON.stringify(lineage)).not.toContain(databaseRoot);
+
+    const datasetId = (batch.datasetIds as string[])[0]!;
     const graph = await call("marketing_analysis_start", {
       id: "stdio-analytics-graph",
       workspaceId,
       objective: "Analyze a real SQLite snapshot",
       inputMode: "dataset",
-      referenceId: (batch.datasetIds as string[])[0]!,
+      referenceId: datasetId,
       ...context("analytics-start"),
     });
-    const analyticsArguments = {
+    const evidenceSelector = {
       id: graph.id as string,
       workspaceId,
-      expectedVersion: graph.version as number,
       batchId: batch.id as string,
-      datasetId: (batch.datasetIds as string[])[0]!,
+      datasetId,
       evidenceId: evidence.id as string,
-      assetId: assets.find((asset) => asset.kind === "normalized_jsonl")!.id,
+      assetId: normalizedAsset.id,
+    };
+    const engagementGraph = await call("metric_compute", {
+      ...evidenceSelector,
+      expectedVersion: graph.version as number,
+      metricId: "engagement_rate_v1",
+      comparability: "comparable",
+      ...context("engagement"),
+    });
+    const engagementMetric = (engagementGraph.nodes as JsonRecord[]).find((node) =>
+      node.kind === "metric" && (node.payload as JsonRecord).metricId === "engagement_rate_v1")!;
+    expect(engagementMetric.payload).toMatchObject({
+      metricId: "engagement_rate_v1",
+      formula: "(sum(likes) + sum(saves) + sum(comments)) / sum(impressions)",
+      numerator: 425,
+      denominator: 5000,
+      value: 0.085,
+      status: "ok",
+      includedRowCount: 5,
+      excludedRowCount: 0,
+      evidenceId: evidence.id,
+      evidenceHash: evidence.contentHash,
+      assetContentHash: normalizedAsset.contentHash,
+      referenceAssessment: {
+        level: "high",
+        dimensions: {
+          provenance: "authorized",
+          sample: { status: "sufficient", denominator: 5000, minimumDenominator: 1000 },
+          comparability: "comparable",
+        },
+      },
+      proportionAssessment: {
+        status: "not_applicable",
+        reason: "METRIC_NOT_BINOMIAL_ELIGIBLE",
+        interval: null,
+      },
+    });
+
+    const conversionGraph = await call("metric_compute", {
+      ...evidenceSelector,
+      expectedVersion: engagementGraph.version as number,
+      metricId: "conversion_rate_v1",
+      comparability: "comparable",
+      ...context("conversion"),
+    });
+    const conversionMetric = (conversionGraph.nodes as JsonRecord[]).find((node) =>
+      node.kind === "metric" && (node.payload as JsonRecord).metricId === "conversion_rate_v1")!;
+    expect(conversionMetric.payload).toMatchObject({
+      metricId: "conversion_rate_v1",
+      formula: "sum(conversions) / sum(clicks)",
+      numerator: 70,
+      denominator: 500,
+      value: 0.14,
+      status: "ok",
+      evidenceId: evidence.id,
+      evidenceHash: evidence.contentHash,
+      assetContentHash: normalizedAsset.contentHash,
+      referenceAssessment: {
+        level: "high",
+        dimensions: {
+          provenance: "authorized",
+          sample: { status: "sufficient", denominator: 500, minimumDenominator: 100 },
+        },
+      },
+      proportionAssessment: {
+        status: "applicable",
+        reason: null,
+        interval: { method: "wilson_score", confidenceLevel: 0.95 },
+      },
+    });
+    const conversionPayload = conversionMetric.payload as JsonRecord;
+    const proportion = conversionPayload.proportionAssessment as JsonRecord;
+    const interval = proportion.interval as JsonRecord;
+    expect(interval.lower).toBeCloseTo(0.11232266018786358, 14);
+    expect(interval.upper).toBeCloseTo(0.17316686494445405, 14);
+    expect(proportion.assumptions).toEqual([
+      expect.stringMatching(/independent and identically distributed Bernoulli trials/),
+      expect.stringMatching(/not a probability of marketing lift or a causal interval/),
+    ]);
+
+    const runAnalytics = async (
+      current: JsonRecord,
+      operation: JsonRecord,
+      suffix: string,
+    ): Promise<JsonRecord> => call("professional_analytics_compute", {
+      ...evidenceSelector,
+      expectedVersion: current.version as number,
+      operation: { ...operation, datasetId },
+      ...context(suffix),
+    });
+    const trendArguments = {
+      ...evidenceSelector,
+      expectedVersion: conversionGraph.version as number,
       operation: {
         operation: "trend_v1",
-        datasetId: (batch.datasetIds as string[])[0]!,
+        datasetId,
         parameters: { timeField: "observedAt", valueField: "revenue", grain: "day" },
       },
-      ...context("professional-analytics"),
+      ...context("trend"),
     };
-    const analyzed = await call("professional_analytics_compute", analyticsArguments);
-    const analyticsNode = (analyzed.nodes as JsonRecord[])
-      .find((node) => node.kind === "analytics")!;
-    expect(analyticsNode.payload).toMatchObject({
+    const trendGraph = await call("professional_analytics_compute", trendArguments);
+    const trendNode = (trendGraph.nodes as JsonRecord[]).find((node) =>
+      node.kind === "analytics" && (node.payload as JsonRecord).operation === "trend_v1")!;
+    expect(trendNode.payload).toMatchObject({
       operation: "trend_v1",
-      provenance: { provider: "mcp", toolVersion: "1.0.0", rowCount: 2 },
+      status: "ok",
+      points: [
+        { window: "2026-01-01", value: 10, rowCount: 1 },
+        { window: "2026-01-02", value: 11, rowCount: 1 },
+        { window: "2026-01-03", value: 12, rowCount: 1 },
+        { window: "2026-01-04", value: 13, rowCount: 1 },
+        { window: "2026-01-05", value: null, rowCount: 0 },
+        { window: "2026-01-06", value: 100, rowCount: 1 },
+      ],
+      missingWindows: ["2026-01-05"],
+      coverage: 5 / 6,
     });
-    expect(await call("professional_analytics_compute", analyticsArguments)).toEqual(analyzed);
+
+    const funnelGraph = await runAnalytics(trendGraph, {
+      operation: "funnel_v1",
+      parameters: { stageFields: ["impressions", "clicks", "conversions"] },
+    }, "funnel");
+    const funnelNode = (funnelGraph.nodes as JsonRecord[]).find((node) =>
+      node.kind === "analytics" && (node.payload as JsonRecord).operation === "funnel_v1")!;
+    expect(funnelNode.payload).toMatchObject({
+      operation: "funnel_v1",
+      status: "ok",
+      stages: [
+        { field: "impressions", total: 5000, conversionFromPrevious: null },
+        { field: "clicks", total: 500, conversionFromPrevious: 0.1 },
+        { field: "conversions", total: 70, conversionFromPrevious: 0.14 },
+      ],
+      overallConversion: 0.014,
+      overallUnknownReason: null,
+    });
+
+    const analyzed = await runAnalytics(funnelGraph, {
+      operation: "anomaly_v1",
+      parameters: { valueField: "revenue" },
+    }, "anomaly");
+    const analyticsNodes = (analyzed.nodes as JsonRecord[]).filter((node) => node.kind === "analytics");
+    expect(analyticsNodes).toHaveLength(3);
+    const anomalyNode = analyticsNodes.find((node) =>
+      (node.payload as JsonRecord).operation === "anomaly_v1")!;
+    expect(anomalyNode.payload).toMatchObject({
+      operation: "anomaly_v1",
+      status: "ok",
+      median: 12,
+      mad: 1,
+      modifiedZScoreThreshold: 3.5,
+      anomalies: [{ index: 4, value: 100 }],
+    });
+    const anomalyPayload = anomalyNode.payload as JsonRecord;
+    expect(anomalyPayload.threshold).toBeCloseTo(3.5 / 0.6745, 14);
+    expect((anomalyPayload.anomalies as JsonRecord[])[0]!.modifiedZScore).toBeCloseTo(59.356, 12);
+    for (const node of analyticsNodes) {
+      expect((node.payload as JsonRecord).provenance).toMatchObject({
+        provider: "mcp",
+        tool: "analyze",
+        toolVersion: "1.0.0",
+        inputHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        rowCount: 5,
+        batchId: batch.id,
+        datasetId,
+        evidenceId: evidence.id,
+        assetId: normalizedAsset.id,
+        evidenceHash: evidence.contentHash,
+        assetContentHash: normalizedAsset.contentHash,
+        assetByteLength: normalizedAsset.byteLength,
+      });
+    }
+
+    const forked = await call("analysis_graph_fork", {
+      id: "stdio-analytics-graph-fork",
+      workspaceId,
+      parentGraphId: analyzed.id as string,
+      expectedVersion: analyzed.version as number,
+      forkNodeId: anomalyNode.id as string,
+      ...context("fork"),
+    });
+    expect(forked).toMatchObject({
+      id: "stdio-analytics-graph-fork",
+      version: 1,
+      parentGraphId: analyzed.id,
+      parentVersion: analyzed.version,
+      forkNodeId: anomalyNode.id,
+      nodes: analyzed.nodes,
+      edges: analyzed.edges,
+    });
     expect(await call("analysis_graph_get", {
-      id: graph.id as string,
+      id: analyzed.id as string,
       workspaceId,
     })).toEqual(analyzed);
 
@@ -215,7 +460,7 @@ describe("built public SQLite and analytics stdio contracts", () => {
       ["connector_sqlite_discover", { databaseId: "marketing", unexpected: true }],
       ["ingest_sqlite", { ...ingestArguments, query: { ...sqliteQuery(), sql: "DROP TABLE daily_metrics" } }],
       ["ingest_sqlite", { ...ingestArguments, query: { ...sqliteQuery(), filters: { apiKey: secret } } }],
-      ["professional_analytics_compute", { ...analyticsArguments, operation: { ...analyticsArguments.operation, shell: "id" } }],
+      ["professional_analytics_compute", { ...trendArguments, operation: { ...trendArguments.operation, shell: "id" } }],
     ] as const) {
       const result = await client.callTool({ name, arguments: arguments_ });
       expect(result).toMatchObject({ isError: true });
@@ -227,16 +472,37 @@ describe("built public SQLite and analytics stdio contracts", () => {
       expect(raw.prepare(
         "SELECT action, COUNT(*) AS count FROM audit_records WHERE action IN (?, ?) GROUP BY action",
       ).all("ingestion_batch.connector_sqlite", "analysis_graph.professional_analyze")).toEqual([
-        { action: "analysis_graph.professional_analyze", count: 1 },
+        { action: "analysis_graph.professional_analyze", count: 3 },
         { action: "ingestion_batch.connector_sqlite", count: 1 },
       ]);
     } finally {
       raw.close();
     }
+
     await stopClient(running);
+    const restarted = await startClient();
+    for (const expected of [analyzed, forked]) {
+      expect(await call("analysis_graph_get", {
+        id: expected.id as string,
+        workspaceId,
+      }, restarted.client)).toEqual(expected);
+    }
+    expect(await call("data_research_get", {
+      entityType: "ingestion_batch",
+      id: batch.id as string,
+      workspaceId,
+    }, restarted.client)).toEqual(lineage);
+    const restoredSnapshot = await call("evidence_asset_get", {
+      workspaceId,
+      evidenceId: evidence.id as string,
+      assetId: snapshotAsset.id,
+    }, restarted.client);
+    expect(JSON.parse(Buffer.from(restoredSnapshot.content as string, "base64").toString("utf8")))
+      .toEqual(snapshot);
+    await stopClient(restarted);
   }, 60_000);
 
-  it("reports both capabilities unavailable over stdio without configuration or writes", async () => {
+  it("reports capability gaps and configuration actions without configuration or writes", async () => {
     const running = await startClient(false);
     const { client } = running;
     const result = await client.callTool({ name: "marketing_capability_list", arguments: {} });
@@ -281,8 +547,17 @@ describe("built public SQLite and analytics stdio contracts", () => {
     ] as const) {
       const unavailable = await client.callTool({ name, arguments: arguments_ });
       expect(unavailable).toMatchObject({ isError: true });
-      expect(JSON.stringify(unavailable)).toContain("Capability unavailable");
-      expect(JSON.stringify(unavailable)).not.toContain("MARKETING_ANALYTICS_MCP_COMMAND");
+      const error = JSON.stringify(unavailable);
+      expect(error).toContain("Capability unavailable");
+      expect(error).toContain("CAPABILITY_UNAVAILABLE");
+      if (name === "professional_analytics_compute") {
+        expect(error).toContain("mcp_not_configured");
+        expect(error).toContain("configurationAction");
+        expect(error).toContain("MARKETING_ANALYTICS_MCP_COMMAND");
+        expect(error).toContain("MARKETING_ANALYTICS_MCP_ARGS");
+      } else {
+        expect(error).toContain("MARKETING_DATABASE_ROOT");
+      }
     }
     const raw = new DatabaseSync(join(dataDir, "marketing.db"), { readOnly: true });
     try {

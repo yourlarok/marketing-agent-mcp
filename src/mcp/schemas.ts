@@ -554,7 +554,7 @@ export const metricComputeInputSchema = z.strictObject({
   datasetId: idSchema,
   evidenceId: idSchema,
   assetId: idSchema,
-  metricId: z.enum(["ctr_v1", "save_like_ratio_v1"]),
+  metricId: z.enum(["ctr_v1", "save_like_ratio_v1", "engagement_rate_v1", "conversion_rate_v1"]),
   comparability: analysisComparabilitySchema.optional(),
   ...commandContextInput,
 });
