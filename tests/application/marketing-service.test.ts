@@ -17,6 +17,11 @@ import {
   forkAnalysisGraph,
 } from "../../src/domain/analysis-model.js";
 import { createDashboard, createDashboardView } from "../../src/domain/dashboard-model.js";
+import {
+  createAssetVersion,
+  createBenchmarkAnalysis,
+  createContentBrief,
+} from "../../src/domain/content-production-model.js";
 import type { ToolHealthEvidence } from "../../src/domain/model.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
 
@@ -2411,4 +2416,168 @@ describe("MarketingService capability registry", () => {
       expect(persisted.idempotency).toBeUndefined();
     },
   );
+});
+
+describe("MarketingService content production lineage", () => {
+  it("traverses benchmark, brief, source, strategy, and immutable parent references", async () => {
+    const store = openStore(":memory:");
+    try {
+      const clock = new TestClock();
+      const service = new MarketingService(store, clock, new TestIds(["audit-unused"]));
+      const base = { workspaceId: "workspace-1", version: 1, createdAt: firstNow, updatedAt: firstNow };
+      const benchmark = createBenchmarkAnalysis({
+        id: "benchmark-1",
+        workspaceId: "workspace-1",
+        createdAt: firstNow,
+        modality: "image",
+        status: "partial",
+        methods: [{
+          id: "method-1",
+          dimension: "layout",
+          pattern: "Observed structure",
+          transferableRule: "Transferable structure",
+          basis: "image",
+          confidence: "unknown",
+          evidenceAssetRefs: [{
+            sourceId: "source-1",
+            evidenceId: "evidence-1",
+            assetId: "asset-1",
+            kind: "screenshot",
+            observedAt: firstNow,
+            contentHash: "a".repeat(64),
+            byteLength: 10,
+          }],
+        }],
+        gaps: [{ code: "limited_sample", message: "One observation" }],
+        evidenceIds: ["evidence-1"],
+        competitorDiffId: "diff-1",
+        sourceVersions: [
+          { entityType: "source", id: "source-1", version: 1 },
+          { entityType: "evidence", id: "evidence-1", version: 1 },
+          { entityType: "competitor_diff", id: "diff-1", version: 1 },
+        ],
+        provider: {
+          type: "mcp",
+          tool: "reverse_engineer",
+          toolVersion: "fixture-1",
+          inputHash: "b".repeat(64),
+          analysisMethod: "fixture-v1",
+          humanReview: "not_performed",
+        },
+      });
+      const brief = createContentBrief({
+        id: "brief-1",
+        workspaceId: "workspace-1",
+        createdAt: firstNow,
+        channel: "xhs",
+        taskId: "task-1",
+        recommendationId: "recommendation-1",
+        benchmarkAnalysisId: "benchmark-1",
+        methodIds: ["method-1"],
+        objective: "Objective",
+        audience: "Audience",
+        copy: {
+          hook: { id: "hook", kind: "creative", text: "Hook" },
+          body: [{ id: "body", kind: "creative", text: "Body" }],
+          cta: { id: "cta", kind: "creative", text: "CTA" },
+        },
+        frames: [],
+        assetRequirements: [],
+        findingIds: [],
+        evidenceIds: ["evidence-1"],
+        sourceVersions: [
+          { entityType: "task", id: "task-1", version: 1 },
+          { entityType: "recommendation", id: "recommendation-1", version: 1 },
+          { entityType: "benchmark_analysis", id: "benchmark-1", version: 1 },
+          { entityType: "evidence", id: "evidence-1", version: 1 },
+          { entityType: "source", id: "source-1", version: 1 },
+        ],
+      });
+      const root = createAssetVersion({
+        id: "asset-1",
+        workspaceId: "workspace-1",
+        createdAt: firstNow,
+        contentId: "content-1",
+        channel: "xhs",
+        briefId: "brief-1",
+        briefVersion: 1,
+        taskId: "task-1",
+        recommendationId: "recommendation-1",
+        parentVersionId: null,
+        parentVersion: null,
+        artifact: { id: "primary", kind: "primary", mediaType: "image/png", contentHash: "c".repeat(64), byteLength: 10 },
+        sourceMaterials: [],
+        modification: { summary: "Initial", revisionInstructions: "Generate", actor: "agent", requestId: "request-1", createdAt: firstNow },
+        provider: { type: "mcp", tool: "render", toolVersion: "fixture-1", inputHash: "d".repeat(64) },
+        validation: {
+          status: "passed",
+          profileId: "xhs_png_1080x1440_v1",
+          guarantee: "internal_acceptance_only",
+          decoder: "playwright_chromium",
+          width: 1080,
+          height: 1440,
+          durationMs: null,
+          videoCodec: null,
+          audioCodec: null,
+        },
+        evidenceIds: ["evidence-1"],
+        sourceVersions: [
+          { entityType: "content_brief", id: "brief-1", version: 1 },
+          { entityType: "task", id: "task-1", version: 1 },
+          { entityType: "recommendation", id: "recommendation-1", version: 1 },
+          { entityType: "evidence", id: "evidence-1", version: 1 },
+          { entityType: "source", id: "source-1", version: 1 },
+        ],
+      });
+      const derivative = createAssetVersion({
+        ...root,
+        id: "asset-2",
+        version: 2,
+        createdAt: secondNow,
+        parentVersionId: "asset-1",
+        parentVersion: 1,
+        sourceMaterials: [{ role: "parent", assetVersionId: "asset-1", artifactId: "primary", mediaType: "image/png", contentHash: "c".repeat(64), byteLength: 10 }],
+        sourceVersions: [...root.sourceVersions, { entityType: "asset_version", id: "asset-1", version: 1 }],
+      });
+      await store.transaction(async (repos) => {
+        await repos.workspaces.insert({ ...base, id: "workspace-1", name: "Workspace" });
+        await repos.sources.insert({ ...base, id: "source-1", name: "Source", type: "manual", ownership: "owned" });
+        await repos.evidence.insert({ ...base, id: "evidence-1", sourceId: "source-1" });
+        await repos.findings.insert({ ...base, id: "finding-1", evidenceIds: ["evidence-1"] });
+        await repos.competitorDiffs.insert({ ...base, id: "diff-1", findingIds: ["finding-1"] });
+        await repos.recommendations.insert({ ...base, id: "recommendation-1", findingIds: ["finding-1"] });
+        await repos.tasks.insert({ ...base, id: "task-1", recommendationIds: ["recommendation-1"], dependencyIds: [] });
+        await repos.benchmarkAnalyses.insert(benchmark);
+        await repos.contentBriefs.insert(brief);
+        await repos.assetVersions.insert(root);
+        await repos.assetVersions.insert(derivative);
+      });
+
+      const lineage = await service.getLineage({ entityType: "asset_version", id: "asset-2", workspaceId: "workspace-1" });
+      expect(lineage.nodes.map((node) => [node.entityType, node.id])).toEqual(expect.arrayContaining([
+        ["source", "source-1"],
+        ["evidence", "evidence-1"],
+        ["finding", "finding-1"],
+        ["competitor_diff", "diff-1"],
+        ["recommendation", "recommendation-1"],
+        ["task", "task-1"],
+        ["benchmark_analysis", "benchmark-1"],
+        ["content_brief", "brief-1"],
+        ["asset_version", "asset-1"],
+        ["asset_version", "asset-2"],
+      ]));
+      expect(lineage.edges).toEqual(expect.arrayContaining([
+        { from: { entityType: "source", id: "source-1" }, to: { entityType: "benchmark_analysis", id: "benchmark-1" } },
+        { from: { entityType: "evidence", id: "evidence-1" }, to: { entityType: "benchmark_analysis", id: "benchmark-1" } },
+        { from: { entityType: "competitor_diff", id: "diff-1" }, to: { entityType: "benchmark_analysis", id: "benchmark-1" } },
+        { from: { entityType: "benchmark_analysis", id: "benchmark-1" }, to: { entityType: "content_brief", id: "brief-1" } },
+        { from: { entityType: "task", id: "task-1" }, to: { entityType: "content_brief", id: "brief-1" } },
+        { from: { entityType: "recommendation", id: "recommendation-1" }, to: { entityType: "content_brief", id: "brief-1" } },
+        { from: { entityType: "content_brief", id: "brief-1" }, to: { entityType: "asset_version", id: "asset-2" } },
+        { from: { entityType: "asset_version", id: "asset-1" }, to: { entityType: "asset_version", id: "asset-2" } },
+      ]));
+    } finally {
+      store.close();
+    }
+  });
 });

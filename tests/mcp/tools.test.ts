@@ -15,6 +15,10 @@ import {
 } from "../../src/infrastructure/system.js";
 import { toMcpError } from "../../src/mcp/error-mapper.js";
 import {
+  ASSET_ARTIFACT_CHUNK_MAX_BYTES,
+  MAX_ASSET_RESPONSE_BYTES,
+} from "../../src/domain/content-production-model.js";
+import {
   MAX_SERIALIZED_INPUT_BYTES,
   recordFindingInputSchema,
   resourceIdInputSchema,
@@ -958,6 +962,13 @@ describe("MCP server", () => {
 });
 
 describe("MCP input contracts", () => {
+  it("keeps asset chunk/response limits aligned without changing shared MCP guards", () => {
+    expect(ASSET_ARTIFACT_CHUNK_MAX_BYTES).toBe(32 * 1024);
+    expect(MAX_ASSET_RESPONSE_BYTES).toBe(64 * 1024);
+    expect(MAX_SERIALIZED_INPUT_BYTES).toBe(64 * 1024);
+    expect(MAX_ASSET_RESPONSE_BYTES).toBe(MAX_SERIALIZED_INPUT_BYTES);
+  });
+
   it("rejects unknown fields in explicit tool inputs", () => {
     expect(
       resourceIdInputSchema.safeParse({ id: "campaign-1", unexpected: true })

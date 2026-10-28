@@ -76,6 +76,9 @@ const lineageEntityTypes: Record<LineageEntityType, keyof Repositories> = {
   competitor_diff: "competitorDiffs",
   analysis_graph: "analysisGraphs",
   dashboard: "dashboards",
+  benchmark_analysis: "benchmarkAnalyses",
+  content_brief: "contentBriefs",
+  asset_version: "assetVersions",
 };
 
 function lineageReferences(record: EntityRecord, entityType: LineageEntityType): EntityRef[] {
@@ -100,6 +103,83 @@ function lineageReferences(record: EntityRecord, entityType: LineageEntityType):
         id: record.id,
       });
     }
+  }
+  if (entityType === "benchmark_analysis" || entityType === "content_brief" || entityType === "asset_version") {
+    const fail = (): never => {
+      throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {
+        entityType,
+        id: record.id,
+      });
+    };
+    const references: EntityRef[] = [];
+    const addIds = (key: string, referencedType: EntityRef["entityType"]) => {
+      const ids = record[key];
+      if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string" || id.trim().length === 0)) {
+        fail();
+      }
+      references.push(...(ids as string[]).map((id) => ({ entityType: referencedType, id })));
+    };
+    const addScalar = (key: string, referencedType: EntityRef["entityType"], nullable = false) => {
+      const id = record[key];
+      if (nullable && id === null) return;
+      if (typeof id !== "string" || id.trim().length === 0) fail();
+      references.push({ entityType: referencedType, id: id as string });
+    };
+    if (entityType === "benchmark_analysis") {
+      addIds("evidenceIds", "evidence");
+      addScalar("competitorDiffId", "competitor_diff", true);
+    } else if (entityType === "content_brief") {
+      addScalar("taskId", "task");
+      addScalar("recommendationId", "recommendation");
+      addScalar("benchmarkAnalysisId", "benchmark_analysis");
+      addIds("findingIds", "finding");
+      addIds("evidenceIds", "evidence");
+    } else {
+      addScalar("taskId", "task");
+      addScalar("recommendationId", "recommendation");
+      addScalar("briefId", "content_brief");
+      addScalar("parentVersionId", "asset_version", true);
+      addIds("evidenceIds", "evidence");
+    }
+    const sourceVersions = record.sourceVersions;
+    if (!Array.isArray(sourceVersions)) fail();
+    for (const reference of sourceVersions as unknown[]) {
+      if (reference === null || typeof reference !== "object" || Array.isArray(reference)) fail();
+      const sourceReference = reference as { entityType?: unknown; id?: unknown };
+      if (sourceReference.entityType === "source") {
+        if (typeof sourceReference.id !== "string" || sourceReference.id.trim().length === 0) fail();
+        references.push({ entityType: "source", id: sourceReference.id as string });
+      }
+    }
+    if (entityType === "benchmark_analysis") {
+      if (!Array.isArray(record.methods)) fail();
+      for (const method of record.methods as { evidenceAssetRefs?: { sourceId?: unknown }[] }[]) {
+        const assetRefs = method.evidenceAssetRefs;
+        if (!Array.isArray(assetRefs)) fail();
+        for (const reference of assetRefs as { sourceId?: unknown }[]) {
+          const sourceId = reference.sourceId;
+          if (typeof sourceId !== "string" || sourceId.trim().length === 0) fail();
+          references.push({ entityType: "source", id: sourceId as string });
+        }
+      }
+    }
+    if (entityType === "asset_version") {
+      if (!Array.isArray(record.sourceMaterials)) fail();
+      for (const material of record.sourceMaterials as { role?: unknown; source?: { sourceId?: unknown } }[]) {
+        if (material.role === "source") {
+          const sourceId = material.source?.sourceId;
+          if (typeof sourceId !== "string" || sourceId.trim().length === 0) fail();
+          references.push({ entityType: "source", id: sourceId as string });
+        }
+      }
+    }
+    const seen = new Set<string>();
+    return references.filter((reference) => {
+      const key = JSON.stringify([reference.entityType, reference.id]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
   if (entityType === "dataset" || entityType === "evidence") {
     if (typeof record.sourceId !== "string") {

@@ -7,6 +7,11 @@ import type {
 } from "../domain/data-research-model.js";
 import type { AnalysisGraph } from "../domain/analysis-model.js";
 import type { Dashboard } from "../domain/dashboard-model.js";
+import type {
+  AssetVersion,
+  BenchmarkAnalysis,
+  ContentBrief,
+} from "../domain/content-production-model.js";
 
 export type Id = string;
 export type Instant = string;
@@ -38,6 +43,12 @@ export interface AnalysisGraphRepository {
   get(id: Id, workspaceId: Id): Promise<AnalysisGraph | undefined>;
   insert(record: AnalysisGraph): Promise<AnalysisGraph>;
   update(record: AnalysisGraph, expectedVersion: number): Promise<AnalysisGraph>;
+}
+
+export interface AssetVersionRepository {
+  get(id: Id, workspaceId: Id): Promise<AssetVersion | undefined>;
+  insert(record: AssetVersion): Promise<AssetVersion>;
+  latest(contentId: Id, workspaceId: Id): Promise<AssetVersion | undefined>;
 }
 
 export interface TaskRepository extends EntityRepository {
@@ -73,7 +84,10 @@ export type LineageEntityType =
   | "competitor"
   | "competitor_diff"
   | "analysis_graph"
-  | "dashboard";
+  | "dashboard"
+  | "benchmark_analysis"
+  | "content_brief"
+  | "asset_version";
 
 export interface EntityRef {
   entityType: LineageEntityType;
@@ -134,6 +148,9 @@ export interface Repositories {
   competitorDiffs: EntityRepository<CompetitorDiff>;
   analysisGraphs: AnalysisGraphRepository;
   dashboards: EntityRepository<Dashboard>;
+  benchmarkAnalyses: EntityRepository<BenchmarkAnalysis>;
+  contentBriefs: EntityRepository<ContentBrief>;
+  assetVersions: AssetVersionRepository;
   capabilities: CapabilityRepository;
   audit: AuditRepository;
   idempotency: IdempotencyRepository;

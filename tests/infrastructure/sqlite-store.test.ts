@@ -21,6 +21,14 @@ import {
   createDashboardView,
   type Dashboard,
 } from "../../src/domain/dashboard-model.js";
+import {
+  createAssetVersion,
+  createBenchmarkAnalysis,
+  createContentBrief,
+  type AssetVersion,
+  type BenchmarkAnalysis,
+  type ContentBrief,
+} from "../../src/domain/content-production-model.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
 
 const now = "2026-10-26T12:30:00.000Z";
@@ -781,7 +789,7 @@ describe("transactional SQLite storage", () => {
 
     const migrated = new DatabaseSync(databasePath);
     try {
-      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 4 });
+      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 5 });
       expect(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'dashboards'").get()).toEqual({ name: "dashboards" });
     } finally {
       migrated.close();
@@ -874,6 +882,306 @@ describe("transactional SQLite storage", () => {
       expect(raw.prepare("SELECT COUNT(*) AS count FROM dashboards WHERE id LIKE 'cross-%'").get()).toEqual({ count: 0 });
     } finally {
       raw.close();
+    }
+  });
+});
+
+describe("content production SQLite persistence", () => {
+  let tempDir: string;
+  let databasePath: string;
+  let stores: Store[];
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    databasePath = join(tempDir, "store.db");
+    stores = [];
+  });
+
+  afterEach(async () => {
+    for (const store of stores) store.close();
+    await removeTempDir(tempDir);
+  });
+
+  function open(path = databasePath): Store {
+    const store = openStore(path);
+    stores.push(store);
+    return store;
+  }
+
+  function benchmarkRecord(overrides: Record<string, unknown> = {}): BenchmarkAnalysis {
+    return createBenchmarkAnalysis({
+      id: "benchmark-1",
+      workspaceId: "ws-1",
+      createdAt: now,
+      modality: "image",
+      status: "completed",
+      methods: [{
+        id: "method-1",
+        dimension: "layout",
+        pattern: "Observed visual sequence",
+        transferableRule: "Use a clear visual sequence",
+        basis: "image",
+        confidence: "unknown",
+        evidenceAssetRefs: [{
+          sourceId: "source-1",
+          evidenceId: "evidence-1",
+          assetId: "asset-1",
+          kind: "screenshot",
+          observedAt: now,
+          contentHash: "a".repeat(64),
+          byteLength: 100,
+        }],
+      }],
+      gaps: [],
+      evidenceIds: ["evidence-1"],
+      competitorDiffId: "diff-1",
+      sourceVersions: [
+        { entityType: "source", id: "source-1", version: 1 },
+        { entityType: "evidence", id: "evidence-1", version: 1 },
+        { entityType: "competitor_diff", id: "diff-1", version: 1 },
+      ],
+      provider: {
+        type: "mcp",
+        tool: "reverse_engineer",
+        toolVersion: "fixture-1",
+        inputHash: "b".repeat(64),
+        analysisMethod: "fixture-v1",
+        humanReview: "not_performed",
+      },
+      ...overrides,
+    });
+  }
+
+  function briefRecord(overrides: Record<string, unknown> = {}): ContentBrief {
+    return createContentBrief({
+      id: "brief-1",
+      workspaceId: "ws-1",
+      createdAt: now,
+      channel: "xhs",
+      taskId: "task-1",
+      recommendationId: "recommendation-1",
+      benchmarkAnalysisId: "benchmark-1",
+      methodIds: ["method-1"],
+      objective: "Objective",
+      audience: "Audience",
+      copy: {
+        hook: { id: "hook", kind: "creative", text: "Original hook" },
+        body: [{ id: "fact", kind: "fact", text: "Traceable fact", findingId: "finding-1" }],
+        cta: { id: "cta", kind: "creative", text: "Original CTA" },
+      },
+      frames: [],
+      assetRequirements: [],
+      findingIds: ["finding-1"],
+      evidenceIds: ["evidence-1"],
+      sourceVersions: [
+        { entityType: "task", id: "task-1", version: 1 },
+        { entityType: "recommendation", id: "recommendation-1", version: 1 },
+        { entityType: "benchmark_analysis", id: "benchmark-1", version: 1 },
+        { entityType: "finding", id: "finding-1", version: 1 },
+        { entityType: "evidence", id: "evidence-1", version: 1 },
+        { entityType: "source", id: "source-1", version: 1 },
+      ],
+      ...overrides,
+    });
+  }
+
+  function assetRecord(overrides: Record<string, unknown> = {}): AssetVersion {
+    return createAssetVersion({
+      id: "asset-1",
+      workspaceId: "ws-1",
+      createdAt: now,
+      contentId: "content-1",
+      channel: "xhs",
+      briefId: "brief-1",
+      briefVersion: 1,
+      taskId: "task-1",
+      recommendationId: "recommendation-1",
+      parentVersionId: null,
+      parentVersion: null,
+      artifact: {
+        id: "primary-1",
+        kind: "primary",
+        mediaType: "image/png",
+        contentHash: "c".repeat(64),
+        byteLength: 100,
+      },
+      sourceMaterials: [],
+      modification: {
+        summary: "Initial",
+        revisionInstructions: "Generate",
+        actor: "agent-1",
+        requestId: "request-1",
+        createdAt: now,
+      },
+      provider: { type: "mcp", tool: "render", toolVersion: "fixture-1", inputHash: "d".repeat(64) },
+      validation: {
+        status: "passed",
+        profileId: "xhs_png_1080x1440_v1",
+        guarantee: "internal_acceptance_only",
+        decoder: "playwright_chromium",
+        width: 1080,
+        height: 1440,
+        durationMs: null,
+        videoCodec: null,
+        audioCodec: null,
+      },
+      evidenceIds: ["evidence-1"],
+      sourceVersions: [
+        { entityType: "content_brief", id: "brief-1", version: 1 },
+        { entityType: "task", id: "task-1", version: 1 },
+        { entityType: "recommendation", id: "recommendation-1", version: 1 },
+        { entityType: "evidence", id: "evidence-1", version: 1 },
+        { entityType: "source", id: "source-1", version: 1 },
+      ],
+      ...overrides,
+    });
+  }
+
+  async function seedParents(store: Store): Promise<void> {
+    await store.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("ws-1"));
+      await repos.sources.insert(entity("source-1", "ws-1"));
+      await repos.evidence.insert({ ...entity("evidence-1", "ws-1"), sourceId: "source-1" });
+      await repos.findings.insert({ ...entity("finding-1", "ws-1"), evidenceIds: ["evidence-1"] });
+      await repos.competitorDiffs.insert({ ...entity("diff-1", "ws-1"), findingIds: [] });
+      await repos.recommendations.insert({ ...entity("recommendation-1", "ws-1"), findingIds: ["finding-1"] });
+      await repos.tasks.insert({ ...entity("task-1", "ws-1"), recommendationIds: ["recommendation-1"], dependencyIds: [] });
+      await repos.benchmarkAnalyses.insert(benchmarkRecord());
+      await repos.contentBriefs.insert(briefRecord());
+    });
+  }
+
+  it("persists immutable records, ordered refs, and root/derivative versions across reopen", async () => {
+    const first = open();
+    await seedParents(first);
+    const root = assetRecord();
+    const derivative = assetRecord({
+      id: "asset-2",
+      version: 2,
+      createdAt: later,
+      parentVersionId: "asset-1",
+      parentVersion: 1,
+      sourceMaterials: [{
+        role: "parent",
+        assetVersionId: "asset-1",
+        artifactId: "primary-1",
+        mediaType: "image/png",
+        contentHash: "c".repeat(64),
+        byteLength: 100,
+      }],
+      sourceVersions: [...root.sourceVersions, { entityType: "asset_version", id: "asset-1", version: 1 }],
+    });
+    await first.transaction(async (repos) => {
+      await repos.assetVersions.insert(root);
+      await repos.assetVersions.insert(derivative);
+    });
+    expect(await first.transaction((repos) => repos.assetVersions.latest("content-1", "ws-1"))).toEqual(derivative);
+    await first.transaction(async (repos) => {
+      expect(repos.assetVersions).not.toHaveProperty("update");
+    });
+    await expect(first.transaction((repos) => repos.assetVersions.insert(assetRecord({ id: "asset-duplicate-root" })))).rejects.toThrow();
+    await expect(first.transaction((repos) => repos.assetVersions.insert(assetRecord({
+      id: "asset-second-child",
+      version: 2,
+      parentVersionId: "asset-1",
+      parentVersion: 1,
+    })))).rejects.toThrow();
+    await expect(first.transaction((repos) => repos.assetVersions.insert(assetRecord({
+      id: "asset-stale-parent",
+      version: 2,
+      parentVersionId: "asset-2",
+      parentVersion: 1,
+    })))).rejects.toThrow(/version|parent/i);
+    await expect(first.transaction((repos) => repos.sources.update({ ...entity("source-1", "ws-1"), version: 2 }, 1))).resolves.toBeDefined();
+    await expect(first.transaction((repos) => repos.sources.insert({ ...entity("source-version-2", "ws-1"), version: 2 }))).rejects.toThrow(/version 1/i);
+    await expect(first.transaction((repos) => repos.benchmarkAnalyses.update(benchmarkRecord(), 1))).rejects.toThrow(/immutable/i);
+    await expect(first.transaction((repos) => repos.contentBriefs.update(briefRecord(), 1))).rejects.toThrow(/immutable/i);
+    first.close();
+
+    const second = open();
+    expect(await second.transaction((repos) => repos.benchmarkAnalyses.get("benchmark-1", "ws-1"))).toEqual(benchmarkRecord());
+    expect(await second.transaction((repos) => repos.contentBriefs.get("brief-1", "ws-1"))).toEqual(briefRecord());
+    expect(await second.transaction((repos) => repos.assetVersions.get("asset-1", "ws-1"))).toEqual(root);
+    expect(await second.transaction((repos) => repos.assetVersions.get("asset-2", "ws-1"))).toEqual(derivative);
+    const raw = new DatabaseSync(databasePath);
+    try {
+      expect(raw.prepare("SELECT evidence_id, position FROM content_brief_evidence WHERE brief_id = ? ORDER BY position").all("brief-1")).toEqual([{ evidence_id: "evidence-1", position: 0 }]);
+      expect(raw.prepare("SELECT source_id, position FROM benchmark_analysis_sources WHERE analysis_id = ? ORDER BY position").all("benchmark-1")).toEqual([{ source_id: "source-1", position: 0 }]);
+      expect(raw.prepare("SELECT content_id, version, parent_version_id FROM asset_versions ORDER BY version").all()).toEqual([
+        { content_id: "content-1", version: 1, parent_version_id: null },
+        { content_id: "content-1", version: 2, parent_version_id: "asset-1" },
+      ]);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("enforces workspace-scoped references and self-parent lineage", async () => {
+    const store = open();
+    await seedParents(store);
+    await store.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("ws-2"));
+      await repos.sources.insert(entity("source-other", "ws-2"));
+      await repos.evidence.insert({ ...entity("evidence-other", "ws-2"), sourceId: "source-other" });
+      await repos.competitorDiffs.insert({ ...entity("diff-other", "ws-2"), findingIds: [] });
+      await repos.tasks.insert({ ...entity("task-other", "ws-2"), recommendationIds: [], dependencyIds: [] });
+      await repos.assetVersions.insert(assetRecord());
+    });
+
+    await expect(store.transaction((repos) => repos.benchmarkAnalyses.insert(benchmarkRecord({ id: "cross-evidence", evidenceIds: ["evidence-other"] })))).rejects.toThrow();
+    await expect(store.transaction((repos) => repos.benchmarkAnalyses.insert(benchmarkRecord({ id: "cross-diff", competitorDiffId: "diff-other" })))).rejects.toThrow();
+    await expect(store.transaction((repos) => repos.contentBriefs.insert(briefRecord({ id: "cross-task", taskId: "task-other" })))).rejects.toThrow();
+    await expect(store.transaction((repos) => repos.assetVersions.insert(assetRecord({ id: "cross-parent", version: 2, parentVersionId: "asset-1", parentVersion: 1, workspaceId: "ws-2" })))).rejects.toThrow();
+    await expect(store.transaction((repos) => repos.assetVersions.insert(assetRecord({ id: "self-parent", version: 2, parentVersionId: "self-parent", parentVersion: 1 })))).rejects.toThrow(/parent|version/i);
+    await expect(store.transaction((repos) => repos.assetVersions.insert(assetRecord({ id: "wrong-parent-version", version: 2, parentVersionId: "asset-1", parentVersion: 2 })))).rejects.toThrow(/parent|version/i);
+    expect(await store.transaction((repos) => repos.assetVersions.get("asset-1", "ws-2"))).toBeUndefined();
+  });
+
+  it("upgrades every populated v4 payload without rewriting history", async () => {
+    const raw = new DatabaseSync(databasePath);
+    const payloadTables = [
+      "workspaces", "sources", "datasets", "evidence", "findings", "recommendations", "tasks",
+      "capabilities", "data_request_plans", "ingestion_batches", "research_sessions", "competitors",
+      "competitor_diffs", "analysis_graphs", "dashboards",
+    ];
+    try {
+      raw.exec("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+      for (const migration of ["001_initial.sql", "002_data_research.sql", "003_analysis_graphs.sql", "004_dashboard_strategy.sql"]) {
+        raw.exec(readFileSync(fileURLToPath(new URL(`../../migrations/${migration}`, import.meta.url)), "utf8"));
+      }
+      const insert = (table: string, id: string, referenceColumn?: string, referenceId?: string) => {
+        const columns = ["id", "workspace_id", ...(referenceColumn ? [referenceColumn] : []), "version", "created_at", "updated_at", "payload"];
+        const values = [id, "ws-1", ...(referenceId ? [referenceId] : []), "1", now, now, canonicalJson(entity(id, "ws-1"))];
+        raw.prepare(`INSERT INTO ${table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`).run(...values);
+      };
+      insert("workspaces", "ws-1");
+      insert("sources", "source-1");
+      insert("datasets", "dataset-1", "source_id", "source-1");
+      insert("evidence", "evidence-1", "source_id", "source-1");
+      for (const table of payloadTables.slice(4)) insert(table, `${table}-legacy`);
+      raw.exec("COMMIT");
+    } finally {
+      raw.close();
+    }
+    const before = new DatabaseSync(databasePath);
+    let oldPayloads: Record<string, unknown[]>;
+    try {
+      oldPayloads = Object.fromEntries(payloadTables.map((table) => [table, before.prepare(`SELECT id, payload FROM ${table} ORDER BY id`).all()]));
+    } finally {
+      before.close();
+    }
+
+    const store = open();
+    expect(await store.transaction((repos) => repos.workspaces.get("ws-1", "ws-1"))).toEqual(entity("ws-1"));
+    store.close();
+    const migrated = new DatabaseSync(databasePath);
+    try {
+      for (const table of payloadTables) {
+        expect(migrated.prepare(`SELECT id, payload FROM ${table} ORDER BY id`).all()).toEqual(oldPayloads[table]);
+      }
+      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 5 });
+    } finally {
+      migrated.close();
     }
   });
 });

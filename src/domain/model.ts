@@ -58,6 +58,9 @@ export const ARTIFACT_KINDS = [
   "screenshot",
   "api_response",
   "snapshot",
+  "video",
+  "video_frames",
+  "asr_transcript",
 ] as const;
 export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
 

@@ -3,8 +3,17 @@ import { DatabaseSync } from "node:sqlite";
 import { DomainError } from "../domain/errors.js";
 import { validateAnalysisGraph, type AnalysisGraph } from "../domain/analysis-model.js";
 import { validateDashboard, type Dashboard } from "../domain/dashboard-model.js";
+import {
+  validateAssetVersion,
+  validateBenchmarkAnalysis,
+  validateContentBrief,
+  type AssetVersion,
+  type BenchmarkAnalysis,
+  type ContentBrief,
+} from "../domain/content-production-model.js";
 import type {
   AnalysisGraphRepository,
+  AssetVersionRepository,
   AuditRecord,
   AuditRepository,
   CapabilityRepository,
@@ -64,10 +73,16 @@ interface ReferenceTable {
   recordKey: string;
 }
 
+interface ScalarReference {
+  column: string;
+  key: string;
+}
+
 interface EntityConfig {
   table: string;
   referenceColumn?: "source_id" | "evidence_id" | "parent_graph_id";
   referenceKey?: "sourceId" | "evidenceId" | "parentGraphId";
+  scalarReferences?: ScalarReference[];
   references?: ReferenceTable | ReferenceTable[];
 }
 
@@ -227,6 +242,52 @@ const entityConfigs: Record<string, EntityConfig> = {
       },
     ],
   },
+  benchmarkAnalyses: {
+    table: "benchmark_analyses",
+    scalarReferences: [{ column: "competitor_diff_id", key: "competitorDiffId" }],
+    references: [
+      {
+        table: "benchmark_analysis_evidence",
+        ownerColumn: "analysis_id",
+        targetColumn: "evidence_id",
+        recordKey: "evidenceIds",
+      },
+      {
+        table: "benchmark_analysis_sources",
+        ownerColumn: "analysis_id",
+        targetColumn: "source_id",
+        recordKey: "sourceIds",
+      },
+    ],
+  },
+  contentBriefs: {
+    table: "content_briefs",
+    scalarReferences: [
+      { column: "task_id", key: "taskId" },
+      { column: "recommendation_id", key: "recommendationId" },
+      { column: "benchmark_analysis_id", key: "benchmarkAnalysisId" },
+    ],
+    references: [
+      {
+        table: "content_brief_findings",
+        ownerColumn: "brief_id",
+        targetColumn: "finding_id",
+        recordKey: "findingIds",
+      },
+      {
+        table: "content_brief_evidence",
+        ownerColumn: "brief_id",
+        targetColumn: "evidence_id",
+        recordKey: "evidenceIds",
+      },
+      {
+        table: "content_brief_sources",
+        ownerColumn: "brief_id",
+        targetColumn: "source_id",
+        recordKey: "sourceIds",
+      },
+    ],
+  },
 };
 
 function assertId(value: string, name: string): void {
@@ -272,13 +333,13 @@ class SqliteEntityRepository implements EntityRepository {
     if (record.version !== 1) {
       throw new TypeError("New entities must have version 1");
     }
-    const reference = this.scalarReference(record);
-    const columns = ["id", "workspace_id"];
-    const values: (string | null)[] = [record.id, record.workspaceId];
-    if (this.config.referenceColumn) {
-      columns.push(this.config.referenceColumn);
-      values.push(reference);
-    }
+    const references = this.scalarReferences(record);
+    const columns = ["id", "workspace_id", ...references.map((reference) => reference.column)];
+    const values: (string | null)[] = [
+      record.id,
+      record.workspaceId,
+      ...references.map((reference) => reference.value),
+    ];
     columns.push("version", "created_at", "updated_at", "payload");
     values.push("1", record.createdAt, record.updatedAt, canonicalJson(record));
 
@@ -304,7 +365,7 @@ class SqliteEntityRepository implements EntityRepository {
       throw new TypeError("Expected version must be a positive integer");
     }
     const updated = { ...record, version: expectedVersion + 1 };
-    const reference = this.scalarReference(updated);
+    const references = this.scalarReferences(updated);
     const assignments = ["version = ?", "created_at = ?", "updated_at = ?", "payload = ?"];
     const values: (string | null)[] = [
       String(updated.version),
@@ -312,9 +373,9 @@ class SqliteEntityRepository implements EntityRepository {
       updated.updatedAt,
       canonicalJson(updated),
     ];
-    if (this.config.referenceColumn) {
-      assignments.push(`${this.config.referenceColumn} = ?`);
-      values.push(reference);
+    for (const reference of references) {
+      assignments.push(`${reference.column} = ?`);
+      values.push(reference.value);
     }
     values.push(record.id, record.workspaceId, String(expectedVersion));
 
@@ -330,18 +391,20 @@ class SqliteEntityRepository implements EntityRepository {
     return updated;
   }
 
-  private scalarReference(record: EntityRecord): string | null {
-    if (!this.config.referenceKey) {
-      return null;
-    }
-    const value = record[this.config.referenceKey];
-    if (value === undefined || value === null) {
-      return null;
-    }
-    if (typeof value !== "string") {
-      throw new TypeError(`${this.config.referenceKey} must be a string or null`);
-    }
-    return value;
+  private scalarReferences(record: EntityRecord): { column: string; value: string | null }[] {
+    const configured = [
+      ...(this.config.referenceColumn && this.config.referenceKey
+        ? [{ column: this.config.referenceColumn as string, key: this.config.referenceKey as string }]
+        : []),
+      ...(this.config.scalarReferences ?? []),
+    ];
+    return configured.map(({ column, key }) => {
+      const value = record[key];
+      if (value !== undefined && value !== null && typeof value !== "string") {
+        throw new TypeError(`${key} must be a string or null`);
+      }
+      return { column, value: value ?? null };
+    });
   }
 
   private referenceTables(): ReferenceTable[] {
@@ -409,6 +472,130 @@ class SqliteDashboardRepository extends SqliteEntityRepository {
   override async update(record: EntityRecord, expectedVersion: number): Promise<EntityRecord> {
     validateDashboard(record as unknown as Dashboard);
     return super.update(record, expectedVersion);
+  }
+}
+
+function contentSourceIds(record: EntityRecord): string[] {
+  const ids: string[] = [];
+  const add = (id: string) => {
+    if (!ids.includes(id)) ids.push(id);
+  };
+  const sourceVersions = record.sourceVersions as BenchmarkAnalysis["sourceVersions"] | undefined;
+  for (const reference of sourceVersions ?? []) {
+    if (reference.entityType === "source") add(reference.id);
+  }
+  const methods = record.methods as BenchmarkAnalysis["methods"] | undefined;
+  for (const method of methods ?? []) {
+    for (const reference of method.evidenceAssetRefs) add(reference.sourceId);
+  }
+  const materials = record.sourceMaterials as AssetVersion["sourceMaterials"] | undefined;
+  for (const material of materials ?? []) {
+    if (material.role === "source") add(material.source.sourceId);
+  }
+  return ids;
+}
+
+class SqliteBenchmarkAnalysisRepository extends SqliteEntityRepository {
+  override async insert(record: EntityRecord): Promise<EntityRecord> {
+    validateBenchmarkAnalysis(record as unknown as BenchmarkAnalysis);
+    return super.insert(record);
+  }
+
+  override async update(record: EntityRecord, expectedVersion: number): Promise<EntityRecord> {
+    validateBenchmarkAnalysis(record as unknown as BenchmarkAnalysis);
+    return super.update(record, expectedVersion);
+  }
+
+  protected override referenceIds(record: EntityRecord, recordKey: string): unknown {
+    return recordKey === "sourceIds" ? contentSourceIds(record) : super.referenceIds(record, recordKey);
+  }
+}
+
+class SqliteContentBriefRepository extends SqliteEntityRepository {
+  override async insert(record: EntityRecord): Promise<EntityRecord> {
+    validateContentBrief(record as unknown as ContentBrief);
+    return super.insert(record);
+  }
+
+  override async update(record: EntityRecord, expectedVersion: number): Promise<EntityRecord> {
+    validateContentBrief(record as unknown as ContentBrief);
+    return super.update(record, expectedVersion);
+  }
+
+  protected override referenceIds(record: EntityRecord, recordKey: string): unknown {
+    return recordKey === "sourceIds" ? contentSourceIds(record) : super.referenceIds(record, recordKey);
+  }
+}
+
+class SqliteAssetVersionRepository implements AssetVersionRepository {
+  constructor(private readonly database: DatabaseSync) {}
+
+  async get(id: string, workspaceId: string): Promise<AssetVersion | undefined> {
+    const row = this.database
+      .prepare("SELECT payload FROM asset_versions WHERE id = ? AND workspace_id = ?")
+      .get(id, workspaceId) as { payload: string } | undefined;
+    return row ? (JSON.parse(row.payload) as AssetVersion) : undefined;
+  }
+
+  async latest(contentId: string, workspaceId: string): Promise<AssetVersion | undefined> {
+    const row = this.database
+      .prepare("SELECT payload FROM asset_versions WHERE content_id = ? AND workspace_id = ? ORDER BY version DESC LIMIT 1")
+      .get(contentId, workspaceId) as { payload: string } | undefined;
+    return row ? (JSON.parse(row.payload) as AssetVersion) : undefined;
+  }
+
+  async insert(record: AssetVersion): Promise<AssetVersion> {
+    assertEntity(record);
+    validateAssetVersion(record);
+    if (record.version > 1) {
+      const parent = await this.get(record.parentVersionId!, record.workspaceId);
+      const latest = await this.latest(record.contentId, record.workspaceId);
+      if (!parent || latest?.id !== parent.id || parent.version !== record.parentVersion ||
+          parent.contentId !== record.contentId || parent.channel !== record.channel ||
+          parent.taskId !== record.taskId || parent.recommendationId !== record.recommendationId) {
+        throw new TypeError("Derivative AssetVersion must reference the latest matching parent version");
+      }
+    }
+    try {
+      this.database.prepare(
+        `INSERT INTO asset_versions (
+          id, workspace_id, content_id, brief_id, task_id, recommendation_id,
+          parent_version_id, version, created_at, updated_at, payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        record.id,
+        record.workspaceId,
+        record.contentId,
+        record.briefId,
+        record.taskId,
+        record.recommendationId,
+        record.parentVersionId,
+        String(record.version),
+        record.createdAt,
+        record.updatedAt,
+        canonicalJson(record),
+      );
+      this.insertReferences(record, "asset_version_evidence", "evidence_id", record.evidenceIds);
+      this.insertReferences(record, "asset_version_sources", "source_id", contentSourceIds(record));
+      return record;
+    } catch (error) {
+      if (hasMessage(error, "UNIQUE constraint failed")) {
+        throw conflict("AssetVersion already exists or parent already has a child", record.id);
+      }
+      throw error;
+    }
+  }
+
+  private insertReferences(
+    record: AssetVersion,
+    table: string,
+    targetColumn: string,
+    ids: string[],
+  ): void {
+    const statement = this.database.prepare(
+      `INSERT INTO ${table} (workspace_id, asset_version_id, ${targetColumn}, position) VALUES (?, ?, ?, ?)`,
+    );
+    ids.forEach((id, position) => statement.run(record.workspaceId, record.id, id, position));
   }
 }
 
@@ -653,7 +840,11 @@ class SqliteStore implements Store {
           ? new SqliteAnalysisGraphRepository(this.database, entityConfigs[name]!)
           : name === "dashboards"
             ? new SqliteDashboardRepository(this.database, entityConfigs[name]!)
-            : new SqliteEntityRepository(this.database, entityConfigs[name]!)) as unknown as EntityRepository<T>;
+            : name === "benchmarkAnalyses"
+              ? new SqliteBenchmarkAnalysisRepository(this.database, entityConfigs[name]!)
+              : name === "contentBriefs"
+                ? new SqliteContentBriefRepository(this.database, entityConfigs[name]!)
+                : new SqliteEntityRepository(this.database, entityConfigs[name]!)) as unknown as EntityRepository<T>;
     return {
       workspaces: repository("workspaces"),
       sources: repository("sources"),
@@ -669,6 +860,9 @@ class SqliteStore implements Store {
       competitorDiffs: repository("competitorDiffs"),
       analysisGraphs: repository("analysisGraphs") as unknown as AnalysisGraphRepository,
       dashboards: repository("dashboards"),
+      benchmarkAnalyses: repository("benchmarkAnalyses"),
+      contentBriefs: repository("contentBriefs"),
+      assetVersions: new SqliteAssetVersionRepository(this.database),
       capabilities: new SqliteCapabilityRepository(
         this.database,
         entityConfigs.capabilities!,
