@@ -1,8 +1,23 @@
 import { createHash } from "node:crypto";
+import { renameSync, symlinkSync, unlinkSync } from "node:fs";
 import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const sqliteControl = vi.hoisted(() => ({ beforeOpen: undefined as (() => void) | undefined }));
+vi.mock("node:sqlite", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:sqlite")>();
+  return {
+    ...actual,
+    DatabaseSync: class extends actual.DatabaseSync {
+      constructor(path: string, options?: { readOnly?: boolean }) {
+        sqliteControl.beforeOpen?.();
+        super(path, options ?? {});
+      }
+    },
+  };
+});
 import { loadConfig } from "../../src/config.js";
 import type { StructuredTableQuery } from "../../src/domain/connector-model.js";
 import { DomainError } from "../../src/domain/errors.js";
@@ -71,6 +86,7 @@ describe("SqliteConnector", () => {
   });
 
   afterEach(async () => {
+    sqliteControl.beforeOpen = undefined;
     await removeTempDir(tempDir);
   });
 
@@ -150,6 +166,55 @@ describe("SqliteConnector", () => {
     }
   });
 
+  it.each([
+    { table: "shadowed_rowid", declarations: "rowid INTEGER, value TEXT" },
+    { table: "shadowed_aliases", declarations: "rowid INTEGER, _rowid_ INTEGER, value TEXT" },
+  ])("uses an unshadowed hidden rowid alias for duplicate declared keys in $table", ({ table, declarations }) => {
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec(`
+        CREATE TABLE ${table} (${declarations});
+        CREATE INDEX ${table}_index ON ${table}(rowid);
+        INSERT INTO ${table} (rowid, value) VALUES
+          (1, 'first'),
+          (1, 'second'),
+          (1, 'third');
+      `);
+    } finally {
+      database.close();
+    }
+
+    const snapshot = connector.snapshot(query({
+      table,
+      columns: ["rowid", "value"],
+      order: [{ column: "rowid", direction: "desc" }],
+    }));
+    expect(snapshot.rows.map((row) => row.value)).toEqual(["first", "second", "third"]);
+  });
+
+  it("rejects ordering when every hidden rowid alias is shadowed and no unique key exists", () => {
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec(`
+        CREATE TABLE no_hidden_rowid (
+          rowid INTEGER,
+          _rowid_ INTEGER,
+          oid INTEGER,
+          value TEXT
+        );
+        INSERT INTO no_hidden_rowid VALUES (1, 2, 3, 'value');
+      `);
+    } finally {
+      database.close();
+    }
+
+    expect(() => connector.snapshot(query({
+      table: "no_hidden_rowid",
+      columns: ["value"],
+      order: [{ column: "value", direction: "asc" }],
+    }))).toThrowError(expect.objectContaining<Partial<DomainError>>({ code: "INVALID_INPUT" }));
+  });
+
   it("represents mixed SQLite value types as unknown instead of forging a scalar type", () => {
     const snapshot = connector.snapshot(query({
       table: "campaign_types",
@@ -185,6 +250,45 @@ describe("SqliteConnector", () => {
       );
     }
   });
+
+  it.each(["file", "directory"] as const)(
+    "keeps reads on the verified database when a %s is replaced before SQLite open",
+    (replacement) => {
+      const externalPath = join(
+        outside,
+        replacement === "file" ? "external.sqlite" : "marketing.sqlite",
+      );
+      const external = new DatabaseSync(externalPath);
+      try {
+        external.exec(`
+          CREATE TABLE daily_metrics (
+            id INTEGER,
+            day TEXT,
+            channel TEXT,
+            active BOOLEAN,
+            clicks INTEGER,
+            note TEXT
+          );
+          INSERT INTO daily_metrics VALUES
+            (999, '2030-01-01', 'external', 1, 999, 'unauthorized');
+        `);
+      } finally {
+        external.close();
+      }
+      sqliteControl.beforeOpen = () => {
+        sqliteControl.beforeOpen = undefined;
+        if (replacement === "file") {
+          unlinkSync(databasePath);
+          symlinkSync(externalPath, databasePath);
+        } else {
+          renameSync(join(root, "warehouse"), join(root, "warehouse-held"));
+          symlinkSync(outside, join(root, "warehouse"));
+        }
+      };
+
+      expect(connector.snapshot(query()).rows.map((row) => row.id)).toEqual([3, 1, 2, 4]);
+    },
+  );
 
   it("rejects write-shaped and arbitrary SQL forms without changing source data", () => {
     const before = new DatabaseSync(databasePath, { readOnly: true });

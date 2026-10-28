@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { lstatSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { extname, relative, resolve, sep } from "node:path";
 import type { Clock } from "../application/ports.js";
@@ -138,7 +146,7 @@ export class SqliteConnector {
 
   discover(databaseId: string): SqliteDiscovery {
     assertDatabaseId(databaseId);
-    const path = this.databasePath(databaseId);
+    const path = this.databaseHandle(databaseId);
     return this.withDatabase(path, (database) => ({
       databaseId,
       tables: this.tables(database).map((table) => ({
@@ -150,7 +158,7 @@ export class SqliteConnector {
 
   snapshot(query: StructuredTableQuery): ConnectorSnapshot {
     validateStructuredTableQuery(query);
-    const path = this.databasePath(query.databaseId);
+    const path = this.databaseHandle(query.databaseId);
     return this.withDatabase(path, (database) => {
       const table = this.tables(database, query.table)[0];
       if (!table) invalid("Query table is not present in the authorized database schema");
@@ -177,12 +185,16 @@ export class SqliteConnector {
       const order = query.order.map((entry) =>
         `${quoteIdentifier(entry.column)} ${entry.direction.toUpperCase()}`
       );
-      if (table.withoutRowid) {
+      const hiddenRowid = table.withoutRowid
+        ? undefined
+        : ["rowid", "_rowid_", "oid"].find((alias) => !columns.has(alias));
+      if (hiddenRowid) {
+        order.push(`${quoteIdentifier(hiddenRowid)} ASC`);
+      } else {
+        if (table.primaryKey.length === 0) invalid("Query table has no reliable stable ordering key");
         for (const column of table.primaryKey) {
           if (!query.order.some((entry) => entry.column === column)) order.push(`${quoteIdentifier(column)} ASC`);
         }
-      } else {
-        order.push("rowid ASC");
       }
       const sql = [
         `SELECT ${selected} FROM ${quoteIdentifier(query.table)}`,
@@ -226,7 +238,7 @@ export class SqliteConnector {
     });
   }
 
-  private databasePath(databaseId: string): string {
+  private databaseHandle(databaseId: string): number {
     if (!this.root) {
       throw new DomainError(
         "CAPABILITY_UNAVAILABLE",
@@ -248,7 +260,27 @@ export class SqliteConnector {
       const canonical = realpathSync(candidate);
       if (!insideRoot(this.root, canonical)) invalid("SQLite database resolves outside MARKETING_DATABASE_ROOT");
       if (!statSync(canonical).isFile()) invalid("SQLite database must be a regular file");
-      return canonical;
+      const descriptor = openSync(
+        canonical,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      try {
+        const metadata = fstatSync(descriptor);
+        const openedPath = realpathSync(canonical);
+        const openedMetadata = statSync(canonical);
+        if (
+          openedPath !== canonical ||
+          metadata.dev !== openedMetadata.dev ||
+          metadata.ino !== openedMetadata.ino
+        ) {
+          invalid("SQLite database changed while opening");
+        }
+        if (!metadata.isFile()) invalid("SQLite database must be a regular file");
+        return descriptor;
+      } catch (error) {
+        closeSync(descriptor);
+        throw error;
+      }
     } catch (error) {
       if (error instanceof DomainError) throw error;
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -258,9 +290,10 @@ export class SqliteConnector {
     }
   }
 
-  private withDatabase<T>(path: string, read: (database: DatabaseSync) => T): T {
-    const database = new DatabaseSync(path, { readOnly: true });
+  private withDatabase<T>(descriptor: number, read: (database: DatabaseSync) => T): T {
+    let database: DatabaseSync | undefined;
     try {
+      database = new DatabaseSync(`/dev/fd/${descriptor}`, { readOnly: true });
       database.exec("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF; BEGIN;");
       try {
         const result = read(database);
@@ -271,7 +304,11 @@ export class SqliteConnector {
         throw error;
       }
     } finally {
-      database.close();
+      try {
+        database?.close();
+      } finally {
+        closeSync(descriptor);
+      }
     }
   }
 
