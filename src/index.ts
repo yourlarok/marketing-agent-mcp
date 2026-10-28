@@ -5,6 +5,7 @@ import { DataResearchService } from "./application/data-research-service.js";
 import { MarketingService } from "./application/marketing-service.js";
 import { loadConfig } from "./config.js";
 import { ArtifactStore } from "./infrastructure/artifact-store.js";
+import { McpAnalyticsProvider } from "./infrastructure/analytics-provider.js";
 import { SqliteConnector } from "./infrastructure/sqlite-connector.js";
 import { openStore } from "./infrastructure/sqlite-store.js";
 import {
@@ -30,7 +31,16 @@ async function run(): Promise<void> {
       undefined,
       new SqliteConnector(config.databaseRoot, clock),
     );
-    const analysis = new AnalysisService(store, clock, ids, artifacts);
+    const analysis = new AnalysisService(
+      store,
+      clock,
+      ids,
+      artifacts,
+      new McpAnalyticsProvider({
+        ...(config.analyticsMcp ? { command: config.analyticsMcp.command } : {}),
+        ...(config.analyticsMcp ? { args: config.analyticsMcp.args } : {}),
+      }),
+    );
     const server = createMcpServer(service, dataResearch, analysis);
     const transport = new StdioServerTransport();
     let shutdown: Promise<void> | undefined;

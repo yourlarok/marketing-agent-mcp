@@ -32,6 +32,7 @@ describe("analysis graph", () => {
       "research",
       "dataset",
       "metric",
+      "analytics",
       "scenario",
       "monitor",
       "decision",

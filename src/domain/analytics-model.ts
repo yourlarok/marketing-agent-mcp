@@ -448,6 +448,20 @@ function median(values: readonly number[]): number {
   return lower + (upper - lower) / 2;
 }
 
+export function computeAnalyticsReference(
+  operation: AnalyticsOperation,
+  rows: readonly AnalyticsRow[],
+): AnalyticsResult {
+  if (operation.operation === "trend_v1") return computeTrendReference(operation, rows);
+  if (operation.operation === "funnel_v1") return computeFunnelReference(operation, rows);
+  validateAnalyticsOperation(operation);
+  const values = rows.map((row) => {
+    assertRecord(row, "Anomaly row");
+    return strictFiniteNumber(row[operation.parameters.valueField], false);
+  });
+  return computeAnomalyReference(operation, values);
+}
+
 export function computeAnomalyReference(
   operation: AnomalyAnalyticsOperation,
   values: readonly number[],

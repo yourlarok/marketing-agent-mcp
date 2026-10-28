@@ -7,6 +7,7 @@ export const ANALYSIS_NODE_KINDS = [
   "research",
   "dataset",
   "metric",
+  "analytics",
   "scenario",
   "monitor",
   "decision",

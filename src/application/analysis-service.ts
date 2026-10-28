@@ -9,6 +9,14 @@ import {
   type AnalysisPayload,
   type AnalysisRecommendedAction,
 } from "../domain/analysis-model.js";
+import {
+  ANOMALY_V1_FORMULA,
+  FUNNEL_V1_FORMULA,
+  TREND_V1_FORMULA,
+  validateAnalyticsOperation,
+  type AnalyticsResult,
+} from "../domain/analytics-model.js";
+import { assertRecord } from "../domain/contract-validation.js";
 import type { IngestionBatch } from "../domain/data-research-model.js";
 import { DomainError } from "../domain/errors.js";
 import {
@@ -21,6 +29,10 @@ import {
 } from "../domain/metric-catalog.js";
 import type { Dataset, Evidence, EvidenceAsset, Source } from "../domain/model.js";
 import { canonicalAcquisitionUrl } from "../infrastructure/acquisition-policy.js";
+import type {
+  AnalyticsProvider,
+  AnalyticsProviderResponse,
+} from "../infrastructure/analytics-provider.js";
 import type { ArtifactStore } from "../infrastructure/artifact-store.js";
 import { MAX_DATASET_JSONL_BYTES } from "../infrastructure/file-ingestor.js";
 import { credentialEnvironmentVariable } from "../infrastructure/safe-http.js";
@@ -40,6 +52,7 @@ import {
   type ExpandAnalysisGraph,
   type ForkAnalysisGraph,
   type GetAnalysisGraph,
+  type RunProfessionalAnalytics,
   type StartAnalysis,
 } from "./analysis-commands.js";
 import type {
@@ -103,13 +116,24 @@ interface PreparedMetric {
   qualityLimitations: string[];
 }
 
+interface PreparedAnalytics {
+  descriptors: MetricDescriptors;
+  response: AnalyticsProviderResponse;
+  rowCount: number;
+}
+
+type EvidenceArtifactSelector = Pick<
+  ComputeMetric,
+  "id" | "workspaceId" | "expectedVersion" | "batchId" | "datasetId" | "evidenceId" | "assetId"
+> & Partial<Pick<ComputeMetric, "metricId">>;
+
 function conflict(message: string): never {
   throw new DomainError("CONFLICT", message);
 }
 
 async function loadMetricDescriptors(
   repos: Repositories,
-  input: ComputeMetric,
+  input: EvidenceArtifactSelector,
 ): Promise<MetricDescriptors> {
   await requireWorkspace(repos, input.workspaceId);
   const graph = await requireGraph(repos, input.id, input.workspaceId);
@@ -276,6 +300,22 @@ async function readMetric(
   };
 }
 
+async function readProfessionalAnalytics(
+  store: Store,
+  artifacts: ArtifactStore,
+  analytics: AnalyticsProvider,
+  input: RunProfessionalAnalytics,
+): Promise<PreparedAnalytics> {
+  const descriptors = await store.transaction((repos) => loadMetricDescriptors(repos, input));
+  const normalized = await artifacts.read(descriptors.asset.contentHash, MAX_DATASET_JSONL_BYTES);
+  if (normalized.length !== descriptors.asset.byteLength) {
+    conflict("Evidence artifact byte length does not match its descriptor");
+  }
+  const rows = parseNormalizedRows(normalized);
+  const response = await analytics.analyze({ operation: input.operation, rows });
+  return { descriptors, response, rowCount: rows.length };
+}
+
 function metricNodeId(input: ComputeMetric): string {
   const identity = JSON.stringify([
     input.id,
@@ -414,7 +454,40 @@ function metricReferenceFromNode(node: AnalysisGraphNode): ReferenceAssessment {
   return reference as unknown as ReferenceAssessment;
 }
 
-function derivedNodeId(kind: "scenario" | "monitor", identity: unknown): string {
+function analyticsPayload(
+  prepared: PreparedAnalytics,
+  input: RunProfessionalAnalytics,
+): AnalysisPayload {
+  const { descriptors, response } = prepared;
+  const result: AnalyticsResult = response.result;
+  const formula = result.operation === "trend_v1"
+    ? TREND_V1_FORMULA
+    : result.operation === "funnel_v1" ? FUNNEL_V1_FORMULA : ANOMALY_V1_FORMULA;
+  return {
+    ...result,
+    definitionVersion: 1,
+    formula,
+    provenance: {
+      provider: "mcp",
+      tool: "analyze",
+      toolVersion: response.toolVersion,
+      inputHash: response.inputHash,
+      rowCount: prepared.rowCount,
+      batchId: input.batchId,
+      datasetId: input.datasetId,
+      evidenceId: input.evidenceId,
+      assetId: input.assetId,
+      sourceId: descriptors.source.id,
+      evidenceHash: descriptors.evidence.contentHash,
+      assetKind: descriptors.asset.kind,
+      assetContentHash: descriptors.asset.contentHash,
+      assetByteLength: descriptors.asset.byteLength,
+    },
+    limitations: ["Statistical output only; no business cause or future outcome is inferred."],
+  } as unknown as AnalysisPayload;
+}
+
+function derivedNodeId(kind: "analytics" | "scenario" | "monitor", identity: unknown): string {
   return `${kind}-${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}`;
 }
 
@@ -801,6 +874,7 @@ export class AnalysisService {
     private readonly clock: Clock,
     ids: IdGenerator,
     private readonly artifacts?: ArtifactStore,
+    private readonly analytics?: AnalyticsProvider,
   ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
@@ -1127,14 +1201,96 @@ export class AnalysisService {
     });
   }
 
+  async analyze(command: Command<RunProfessionalAnalytics>): Promise<AnalysisGraph> {
+    const input = command.input;
+    assertRecord(input, "Professional analytics command", [
+      "id",
+      "workspaceId",
+      "expectedVersion",
+      "batchId",
+      "datasetId",
+      "evidenceId",
+      "assetId",
+      "operation",
+    ]);
+    assertExpectedVersion(input.expectedVersion);
+    for (const field of ["batchId", "datasetId", "evidenceId", "assetId"] as const) {
+      assertNonEmptyString(input[field], field);
+    }
+    validateAnalyticsOperation(input.operation);
+    if (input.operation.datasetId !== input.datasetId) {
+      invalid("Professional analytics operation and evidence must reference the same Dataset");
+    }
+    if (!this.analytics) {
+      throw new DomainError(
+        "CAPABILITY_UNAVAILABLE",
+        "Professional analytics MCP is not configured",
+        false,
+        {
+          capability: "professional_analytics",
+          reason: "mcp_not_configured",
+          configurationAction: "Configure MARKETING_ANALYTICS_MCP_COMMAND and MARKETING_ANALYTICS_MCP_ARGS in the trusted deployment environment",
+        },
+      );
+    }
+    if (!this.artifacts) throw new Error("ArtifactStore is required for professional analytics");
+    let prepared: PreparedAnalytics | undefined;
+    return this.commands.executeBatch({
+      workspaceId: input.workspaceId,
+      action: "analysis_graph.professional_analyze",
+      entityType: "analysis_graph",
+      input,
+      context: command.context,
+      write: async (repos, current, timestamp) => {
+        if (!prepared) conflict("Professional analytics preparation did not complete");
+        const descriptors = await loadMetricDescriptors(repos, current);
+        assertCurrentMetricDescriptors(descriptors, prepared.descriptors);
+        const datasetNode = descriptors.graph.nodes.find((node) =>
+          node.kind === "dataset" && node.payload.datasetId === current.datasetId);
+        if (!datasetNode) invalid("The analysis graph must contain the analytics dataset node");
+        const nodeId = derivedNodeId("analytics", [
+          current.id,
+          current.batchId,
+          current.datasetId,
+          current.evidenceId,
+          current.assetId,
+          current.operation,
+          prepared.response.inputHash,
+        ]);
+        const expanded = expandAnalysisGraph(descriptors.graph, {
+          expectedVersion: current.expectedVersion,
+          updatedAt: timestamp,
+          nodes: [{
+            id: nodeId,
+            kind: "analytics",
+            payload: analyticsPayload(prepared, current),
+          }],
+          edges: [{
+            id: `analytics-edge-${nodeId.slice("analytics-".length)}`,
+            fromNodeId: datasetNode.id,
+            toNodeId: nodeId,
+          }],
+          recommendedActions: rebindGraphActions(
+            descriptors.graph.recommendedActions,
+            current.id,
+            current.expectedVersion + 1,
+          ),
+        });
+        return repos.analysisGraphs.update(expanded, current.expectedVersion);
+      },
+    }, async () => {
+      prepared = await readProfessionalAnalytics(this.store, this.artifacts!, this.analytics!, input);
+    });
+  }
+
   async expand(command: Command<ExpandAnalysisGraph>): Promise<AnalysisGraph> {
     const input = command.input;
     assertExpectedVersion(input.expectedVersion);
     if (!Array.isArray(input.nodes) || !Array.isArray(input.edges)) {
       invalid("nodes and edges must be arrays");
     }
-    if (input.nodes.some((node) => ["metric", "scenario", "monitor"].includes(node.kind))) {
-      invalid("Metric, Scenario, and Monitor nodes can only be created by their compute commands");
+    if (input.nodes.some((node) => ["metric", "analytics", "scenario", "monitor"].includes(node.kind))) {
+      invalid("Metric, Analytics, Scenario, and Monitor nodes can only be created by their compute commands");
     }
     if (input.recommendedActions !== undefined && !Array.isArray(input.recommendedActions)) {
       invalid("recommendedActions must be an array");
@@ -1234,7 +1390,7 @@ export class AnalysisCapabilityService {
         availability: { state: "available", detail: "Uses optimistic graph versions and validates node references." },
         limitations: [
           "Graphs must remain acyclic with unique IDs and no orphan edges.",
-          "Metric, Scenario, and Monitor nodes are created only by their compute commands.",
+          "Metric, Analytics, Scenario, and Monitor nodes are created only by their compute commands.",
           "No branch merge is provided.",
         ],
       }),

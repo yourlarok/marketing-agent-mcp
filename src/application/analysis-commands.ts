@@ -4,6 +4,7 @@ import type {
   AnalysisRecommendedAction,
   ScenarioLabel,
 } from "../domain/analysis-model.js";
+import type { AnalyticsOperation } from "../domain/analytics-model.js";
 import type { MetricId, ReferenceComparability } from "../domain/metric-catalog.js";
 import type { IngestContentLinks, IngestTemporaryApi } from "./data-research-commands.js";
 
@@ -56,6 +57,17 @@ export interface ComputeMetric {
   assetId: string;
   metricId: MetricId;
   comparability?: ReferenceComparability;
+}
+
+export interface RunProfessionalAnalytics {
+  id: string;
+  workspaceId: string;
+  expectedVersion: number;
+  batchId: string;
+  datasetId: string;
+  evidenceId: string;
+  assetId: string;
+  operation: AnalyticsOperation;
 }
 
 export interface CreateMetricScenario {

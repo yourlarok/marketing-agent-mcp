@@ -11,10 +11,14 @@ export interface AppConfig {
     command: string;
     args: string[];
   };
+  analyticsMcp?: {
+    command: string;
+    args: string[];
+  };
   logLevel: "error" | "warn" | "info";
 }
 
-export function parseContentMcpArguments(value: string | undefined): string[] {
+function parseMcpArguments(value: string | undefined, variable: string): string[] {
   if (!value) {
     return [];
   }
@@ -22,12 +26,20 @@ export function parseContentMcpArguments(value: string | undefined): string[] {
   try {
     parsed = JSON.parse(value);
   } catch (error) {
-    throw new Error("MARKETING_CONTENT_MCP_ARGS must be a JSON string array", { cause: error });
+    throw new Error(`${variable} must be a JSON string array`, { cause: error });
   }
   if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== "string")) {
-    throw new Error("MARKETING_CONTENT_MCP_ARGS must be a JSON string array");
+    throw new Error(`${variable} must be a JSON string array`);
   }
   return parsed;
+}
+
+export function parseContentMcpArguments(value: string | undefined): string[] {
+  return parseMcpArguments(value, "MARKETING_CONTENT_MCP_ARGS");
+}
+
+export function parseAnalyticsMcpArguments(value: string | undefined): string[] {
+  return parseMcpArguments(value, "MARKETING_ANALYTICS_MCP_ARGS");
 }
 
 export function parseCommaSeparatedList(value: string | undefined): string[] {
@@ -90,6 +102,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (!contentMcpCommand && env.MARKETING_CONTENT_MCP_ARGS) {
     throw new Error("MARKETING_CONTENT_MCP_COMMAND is required when MCP arguments are configured");
   }
+  const analyticsMcpCommand = env.MARKETING_ANALYTICS_MCP_COMMAND;
+  if (!analyticsMcpCommand && env.MARKETING_ANALYTICS_MCP_ARGS) {
+    throw new Error("MARKETING_ANALYTICS_MCP_COMMAND is required when MCP arguments are configured");
+  }
   return {
     dataDir,
     ...(env.MARKETING_ARTIFACT_DIR ? { artifactDir: env.MARKETING_ARTIFACT_DIR } : {}),
@@ -101,6 +117,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
       contentMcp: {
         command: contentMcpCommand,
         args: parseContentMcpArguments(env.MARKETING_CONTENT_MCP_ARGS),
+      },
+    } : {}),
+    ...(analyticsMcpCommand ? {
+      analyticsMcp: {
+        command: analyticsMcpCommand,
+        args: parseAnalyticsMcpArguments(env.MARKETING_ANALYTICS_MCP_ARGS),
       },
     } : {}),
     logLevel: "info",
