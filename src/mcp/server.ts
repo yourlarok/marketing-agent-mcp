@@ -6,6 +6,7 @@ import {
 } from "../application/analysis-service.js";
 import type { DataResearchService } from "../application/data-research-service.js";
 import type { MarketingService } from "../application/marketing-service.js";
+import { DomainError } from "../domain/errors.js";
 import { registerAnalysisTools } from "./register-analysis-tools.js";
 import { registerDataResearchTools } from "./register-data-research-tools.js";
 import { registerTools } from "./register-tools.js";
@@ -28,6 +29,18 @@ export function createMcpServer(
   analysis?: AnalysisService,
   options: McpServerOptions = {},
 ): McpServer {
+  const installed: Required<AnalysisCapabilityConfiguration> = {
+    sqliteConfigured: dataResearch?.hasConfiguredSqliteConnector() ?? false,
+    professionalAnalyticsConfigured: analysis?.hasProfessionalAnalyticsProvider() ?? false,
+  };
+  for (const key of Object.keys(installed) as (keyof typeof installed)[]) {
+    if (options[key] !== undefined && options[key] !== installed[key]) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        `MCP capability declaration contradicts installed service: ${key}`,
+      );
+    }
+  }
   const server = new McpServer(
     {
       name: "marketing-agent-mcp",
@@ -53,7 +66,7 @@ export function createMcpServer(
     registerDataResearchTools(server, service, dataResearch);
   }
   if (analysis) {
-    registerAnalysisTools(server, analysis, new AnalysisCapabilityService(options));
+    registerAnalysisTools(server, analysis, new AnalysisCapabilityService(installed));
   }
   return server;
 }

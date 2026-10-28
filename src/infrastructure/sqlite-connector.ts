@@ -146,6 +146,10 @@ export class SqliteConnector {
     }
   }
 
+  isConfigured(): boolean {
+    return this.root !== undefined;
+  }
+
   discover(databaseId: string): SqliteDiscovery {
     assertDatabaseId(databaseId);
     const path = this.databaseHandle(databaseId);

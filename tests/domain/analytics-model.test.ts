@@ -45,6 +45,18 @@ describe("controlled analytics operations and results", () => {
     }
   });
 
+  it("accepts server-generated UUID dataset IDs that start with a digit", () => {
+    const operation = {
+      ...trendOperation,
+      datasetId: "01234567-89ab-4cde-8fab-0123456789ab",
+    };
+    expect(() => validateAnalyticsOperation(operation)).not.toThrow();
+    const result = computeTrendReference(operation, [
+      { observedAt: "2026-01-01T00:00:00.000Z", revenue: 1 },
+    ]);
+    expect(() => validateAnalyticsResult(result)).not.toThrow();
+  });
+
   it("validates field identifiers, stage ordering, and prototype keys", () => {
     for (const field of ["bad.field", "bad;field", "__proto__", "constructor", "prototype", ""]) {
       expectInvalid(() => validateAnalyticsOperation({

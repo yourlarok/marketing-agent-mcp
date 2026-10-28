@@ -39,6 +39,7 @@ import { MAX_DATASET_JSONL_BYTES } from "../infrastructure/file-ingestor.js";
 import { credentialEnvironmentVariable } from "../infrastructure/safe-http.js";
 import { assertUtcInstant } from "../infrastructure/sqlite.js";
 import {
+  assertBoundedCommandResponse,
   AuditableCommandPipeline,
   type Command,
   type CommandContext,
@@ -887,6 +888,10 @@ export class AnalysisService {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
 
+  hasProfessionalAnalyticsProvider(): boolean {
+    return this.analytics !== undefined;
+  }
+
   start(command: Command<StartAnalysis>): Promise<AnalysisGraph> {
     const input = command.input;
     assertNonEmptyString(input.objective, "objective");
@@ -1286,6 +1291,7 @@ export class AnalysisService {
         });
         return repos.analysisGraphs.update(expanded, current.expectedVersion);
       },
+      validateResponse: (response) => assertBoundedCommandResponse(response),
     }, async () => {
       prepared = await readProfessionalAnalytics(this.store, this.artifacts!, this.analytics!, input);
     });

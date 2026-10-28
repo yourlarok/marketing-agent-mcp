@@ -127,6 +127,16 @@ export interface RecordCapabilityHealth {
   reason?: string;
 }
 
+export const MAX_COMMAND_RESPONSE_BYTES = 64 * 1024;
+
+export function assertBoundedCommandResponse(value: unknown): void {
+  if (Buffer.byteLength(canonicalJson(value), "utf8") > MAX_COMMAND_RESPONSE_BYTES) {
+    throw new DomainError("CONFLICT", "Command response exceeds 64 KiB", false, {
+      limitBytes: MAX_COMMAND_RESPONSE_BYTES,
+    });
+  }
+}
+
 interface WriteOperation<T, R extends EntityRecord> {
   workspaceId: string;
   action: string;
@@ -134,6 +144,7 @@ interface WriteOperation<T, R extends EntityRecord> {
   input: T;
   context: CommandContext;
   write(repos: Repositories, input: T, timestamp: string): Promise<R>;
+  validateResponse?(response: R): void;
 }
 
 export interface CommandPipeline {
@@ -364,6 +375,7 @@ export class AuditableCommandPipeline implements CommandPipeline {
       const input = redact(operation.input) as T;
       const timestamp = this.clock.now();
       const entity = await operation.write(repos, input, timestamp);
+      operation.validateResponse?.(entity);
       await repos.audit.append({
         id: this.ids.next(),
         workspaceId: entity.workspaceId,

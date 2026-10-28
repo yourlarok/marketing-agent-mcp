@@ -50,6 +50,7 @@ import {
 import { SafeHttpClient } from "../infrastructure/safe-http.js";
 import { SqliteConnector } from "../infrastructure/sqlite-connector.js";
 import {
+  assertBoundedCommandResponse,
   AuditableCommandPipeline,
   type Command,
   type CommandPipeline,
@@ -344,10 +345,14 @@ export class DataResearchService {
     private readonly artifacts: ArtifactStore = new ArtifactStore(),
     private readonly http: Pick<SafeHttpClient, "get"> = new SafeHttpClient(),
     private readonly acquisition: AcquisitionProvider = AcquisitionRouter.fromEnvironment(),
-    private readonly sqlite: Pick<SqliteConnector, "discover" | "snapshot"> =
+    private readonly sqlite: Pick<SqliteConnector, "discover" | "snapshot" | "isConfigured"> =
       new SqliteConnector(process.env.MARKETING_DATABASE_ROOT, clock),
   ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
+  }
+
+  hasConfiguredSqliteConnector(): boolean {
+    return this.sqlite.isConfigured();
   }
 
   createResearchSession(command: Command<CreateResearchSession>): Promise<ResearchSession> {
@@ -1031,6 +1036,7 @@ export class DataResearchService {
       context: command.context,
       write: (repos, _input, timestamp) =>
         this.writeIngestionBatch(repos, input, files, [], timestamp),
+      validateResponse: (response) => assertBoundedCommandResponse(response),
     }, prepare);
   }
 

@@ -92,7 +92,7 @@ describe("public SQLite and professional analytics MCP tools", () => {
     artifacts = new ArtifactStore(join(tempDir, "artifacts"));
     sequence = 0;
     const clock = { now: () => now };
-    const ids = { next: () => `generated-${++sequence}` };
+    const ids = { next: () => `${++sequence}-generated` };
     marketing = new MarketingService(store, clock, ids);
     dataResearch = new DataResearchService(
       store,
@@ -299,6 +299,166 @@ describe("public SQLite and professional analytics MCP tools", () => {
       id: graph.id,
       workspaceId,
     })).toEqual(analyzed);
+  });
+
+  it("rolls back an oversized SQLite write response, audit, and idempotency on every attempt", async () => {
+    const clock = { now: () => now };
+    const oversizedData = new DataResearchService(
+      store,
+      clock,
+      { next: () => `${"x".repeat(30_000)}-${++sequence}` },
+      artifacts,
+      undefined,
+      undefined,
+      new SqliteConnector(databaseRoot, clock),
+    );
+    const oversizedServer = createMcpServer(marketing, oversizedData, analysis, {
+      sqliteConfigured: true,
+      professionalAnalyticsConfigured: true,
+    });
+    const oversizedClient = new Client({ name: "oversized-sqlite-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const arguments_ = {
+      id: "oversized-sqlite-batch",
+      workspaceId,
+      query: sqliteQuery(),
+      ownership: "authorized",
+      ...context("oversized-sqlite"),
+    };
+    try {
+      await Promise.all([
+        oversizedClient.connect(clientTransport),
+        oversizedServer.connect(serverTransport),
+      ]);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const result = await oversizedClient.callTool({ name: "ingest_sqlite", arguments: arguments_ });
+        expect(result).toMatchObject({ isError: true });
+        expect(JSON.stringify(result)).toContain("Resource conflict");
+      }
+      expect(await store.transaction((repos) =>
+        repos.ingestionBatches.get(arguments_.id, workspaceId))).toBeUndefined();
+      expect(await store.transaction((repos) =>
+        repos.audit.listForEntity(workspaceId, "ingestion_batch", arguments_.id))).toEqual([]);
+      expect(await store.transaction((repos) =>
+        repos.idempotency.get(workspaceId, arguments_.idempotencyKey))).toBeUndefined();
+    } finally {
+      await Promise.all([oversizedClient.close(), oversizedServer.close()]);
+    }
+  });
+
+  it("rolls back an oversized analytics response without advancing the graph or recording success", async () => {
+    const batch = await call<IngestionBatch>("ingest_sqlite", {
+      id: "oversized-analytics-batch",
+      workspaceId,
+      query: sqliteQuery(),
+      ownership: "authorized",
+      ...context("oversized-analytics-ingest"),
+    });
+    const evidence = (await store.transaction((repos) =>
+      repos.evidence.get(batch.evidenceIds[0]!, workspaceId))) as Evidence;
+    const graph = await call<AnalysisGraph>("marketing_analysis_start", {
+      id: "oversized-analytics-graph",
+      workspaceId,
+      objective: "x".repeat(63_000),
+      inputMode: "dataset",
+      referenceId: batch.datasetIds[0]!,
+      ...context("oversized-analytics-start"),
+    });
+    const arguments_ = {
+      id: graph.id,
+      workspaceId,
+      expectedVersion: graph.version,
+      batchId: batch.id,
+      datasetId: batch.datasetIds[0]!,
+      evidenceId: batch.evidenceIds[0]!,
+      assetId: evidence.assets!.find((asset) => asset.kind === "normalized_jsonl")!.id,
+      operation: {
+        operation: "trend_v1",
+        datasetId: batch.datasetIds[0]!,
+        parameters: { timeField: "observedAt", valueField: "revenue", grain: "day" },
+      },
+      ...context("oversized-analytics"),
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = await client.callTool({
+        name: "professional_analytics_compute",
+        arguments: arguments_,
+      });
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toContain("Resource conflict");
+    }
+    expect(await store.transaction((repos) =>
+      repos.analysisGraphs.get(graph.id, workspaceId))).toEqual(graph);
+    expect(await store.transaction((repos) =>
+      repos.audit.listForEntity(workspaceId, "analysis_graph", graph.id)))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ action: "analysis_graph.start" })]));
+    expect(await store.transaction((repos) =>
+      repos.audit.listForEntity(workspaceId, "analysis_graph", graph.id)))
+      .not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ action: "analysis_graph.professional_analyze" }),
+      ]));
+    expect(await store.transaction((repos) =>
+      repos.idempotency.get(workspaceId, arguments_.idempotencyKey))).toBeUndefined();
+  });
+
+  it("derives capability visibility from installed services and rejects contradictory declarations", async () => {
+    expect(() => createMcpServer(marketing, dataResearch, analysis, { sqliteConfigured: false }))
+      .toThrow(/contradicts/i);
+    expect(() => createMcpServer(marketing, dataResearch, analysis, {
+      professionalAnalyticsConfigured: false,
+    })).toThrow(/contradicts/i);
+
+    const clock = { now: () => now };
+    const unconfiguredData = new DataResearchService(
+      store,
+      clock,
+      { next: () => `unavailable-${++sequence}` },
+      artifacts,
+      undefined,
+      undefined,
+      new SqliteConnector(undefined, clock),
+    );
+    const unconfiguredAnalysis = new AnalysisService(
+      store,
+      clock,
+      { next: () => `unavailable-analysis-${++sequence}` },
+      artifacts,
+    );
+    expect(() => createMcpServer(marketing, unconfiguredData, unconfiguredAnalysis, {
+      sqliteConfigured: true,
+    })).toThrow(/contradicts/i);
+    expect(() => createMcpServer(marketing, unconfiguredData, unconfiguredAnalysis, {
+      professionalAnalyticsConfigured: true,
+    })).toThrow(/contradicts/i);
+    expect(() => createMcpServer(marketing, unconfiguredData, unconfiguredAnalysis, {
+      sqliteConfigured: false,
+      professionalAnalyticsConfigured: false,
+    })).not.toThrow();
+
+    const legacyServer = createMcpServer(marketing, dataResearch, analysis);
+    const legacyClient = new Client({ name: "configured-legacy-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([
+        legacyClient.connect(clientTransport),
+        legacyServer.connect(serverTransport),
+      ]);
+      const capabilities = JSON.parse((await legacyClient.callTool({
+        name: "marketing_capability_list",
+        arguments: {},
+      })).content[0]!.text) as { id: string; availability: { state: string } }[];
+      for (const id of ["connector.sqlite.discover", "ingest.sqlite", "analytics.professional"]) {
+        expect(capabilities.find((capability) => capability.id === id)?.availability.state)
+          .toBe("available");
+      }
+      const discovery = await legacyClient.callTool({
+        name: "connector_sqlite_discover",
+        arguments: { databaseId: "marketing" },
+      });
+      expect(discovery).not.toMatchObject({ isError: true });
+    } finally {
+      await Promise.all([legacyClient.close(), legacyServer.close()]);
+    }
   });
 
   it("rejects unknown, secret, path, SQL, shell, and code inputs before persistence", async () => {

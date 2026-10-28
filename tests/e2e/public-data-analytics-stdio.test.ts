@@ -34,7 +34,7 @@ function context(suffix: string): JsonRecord {
 }
 
 function payload(result: CallToolResult): JsonRecord {
-  expect(result.isError).not.toBe(true);
+  expect(result.isError, JSON.stringify(result)).not.toBe(true);
   return JSON.parse((result.content[0] as { text: string }).text) as JsonRecord;
 }
 

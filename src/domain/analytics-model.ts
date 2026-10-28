@@ -1,7 +1,6 @@
 import {
   assertIdentifier,
   assertRecord,
-  assertStableId,
   assertUtcInstant,
   invalid,
 } from "./contract-validation.js";
@@ -123,12 +122,20 @@ function assertWindow(value: unknown, label = "Analytics window"): asserts value
   }
 }
 
+function assertDatasetId(value: unknown, label: string): void {
+  if (typeof value !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(value) ||
+      ["__proto__", "prototype", "constructor"].includes(value)) {
+    invalid(`${label} must be a non-empty entity ID`);
+  }
+}
+
 function assertCommonOperation(value: unknown): asserts value is Record<string, unknown> {
   assertRecord(value, "Analytics operation", ["operation", "datasetId", "parameters"]);
   if (!(ANALYTICS_OPERATIONS as readonly string[]).includes(value.operation as string)) {
     invalid("Unsupported analytics operation");
   }
-  assertStableId(value.datasetId, "Analytics datasetId");
+  assertDatasetId(value.datasetId, "Analytics datasetId");
 }
 
 export function validateAnalyticsOperation(value: unknown): asserts value is AnalyticsOperation {
@@ -161,7 +168,7 @@ function assertCommonResult(value: unknown): asserts value is Record<string, unk
   if (!(ANALYTICS_OPERATIONS as readonly string[]).includes(value.operation as string)) {
     invalid("Unsupported analytics result operation");
   }
-  assertStableId(value.datasetId, "Analytics result datasetId");
+  assertDatasetId(value.datasetId, "Analytics result datasetId");
 }
 
 function validateTrendResult(value: Record<string, unknown>): void {

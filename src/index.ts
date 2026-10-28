@@ -41,10 +41,7 @@ async function run(): Promise<void> {
         args: config.analyticsMcp.args,
       }) : undefined,
     );
-    const server = createMcpServer(service, dataResearch, analysis, {
-      sqliteConfigured: config.databaseRoot !== undefined,
-      professionalAnalyticsConfigured: config.analyticsMcp !== undefined,
-    });
+    const server = createMcpServer(service, dataResearch, analysis);
     const transport = new StdioServerTransport();
     let shutdown: Promise<void> | undefined;
 
