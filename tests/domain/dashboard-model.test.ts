@@ -160,6 +160,18 @@ describe("dashboard entity contract", () => {
     expect(dashboard().artifacts.map((artifact) => artifact.kind)).toEqual(["html", "manifest"]);
   });
 
+  it("accepts persisted UUID entity references that begin with a digit", () => {
+    const sourceId = "0b6f53e4-92cf-4f0f-8f4f-7b1ec8a0f90f";
+    expect(dashboard({
+      views: [view(viewInputs[0]!, { sources: [{ sourceId, updatedAt: later }] })],
+      sourceIds: [sourceId],
+      sourceVersions: [
+        { entityType: "source", id: sourceId, version: 1 },
+        { entityType: "analysis_graph", id: "graph-1", version: 2 },
+      ],
+    }).sourceIds).toEqual([sourceId]);
+  });
+
   it.each([
     ["duplicate html", [dashboard().artifacts[0], { ...dashboard().artifacts[0]!, id: "other-html" }]],
     ["missing manifest", [dashboard().artifacts[0]]],

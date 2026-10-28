@@ -246,6 +246,50 @@ server 对 canonical operation + rows 计算 SHA-256 `inputHash`，要求 provid
 
 `metric_monitor_compare` 比较值、绝对/相对变化、参考度和样本变化。基线或新值 unknown 时对比为 unknown、delta 为 null；基线为 0 时相对变化为 null。它只执行一次调用，返回 guardrail 与复盘条件，`scheduling=not_provided`，不会创建定时任务、 recurring monitor 或自动调度。
 
+## 受控看板与策略任务
+
+完整公开流程是：**数据/竞对/分析 → 五类看板 → 下钻 → 建议 → 修改/拒绝/重排/补充任务 → 重启**。每一步只使用前一步持久化的公开 ID 与描述符，不需要带外 SQL。
+
+### 11 个看板与策略工具
+
+- `dashboard_render` 从 persisted Snapshot 渲染或按 `expectedVersion` 替换看板；`dashboard_get` 恢复元数据；`dashboard_artifact_get` 分块读取 artifact；`dashboard_drilldown_get` 读取单个 datum 的真实引用。
+- `strategy_recommendation_generate` 从证据支持的 Finding 和可选 AnalysisGraph 节点生成建议。
+- `strategy_task_supplement`、`strategy_task_update`、`strategy_task_reject`、`strategy_task_reorder` 分别补充、修改、拒绝和重排用户控制的 Task；`strategy_task_get` 读取完整状态，`strategy_task_list` 按确定顺序分页。
+
+### 五类 view 与来源要求
+
+| view kind | 必需来源 |
+| --- | --- |
+| `trend` | 同图真实外部分析 `trend_v1` Analytics 节点 |
+| `structure` | 同图 Metric 节点；多个节点必须具有相同 metric ID 与定义版本 |
+| `funnel` | 同图恰好一个真实外部分析 `funnel_v1` Analytics 节点 |
+| `competitor_comparison` | 两个已确认竞对形成的 persisted CompetitorDiff |
+| `task_effect` | 同图 Monitor 与 Task/Recommendation 的指标链接；空 `taskIds` 返回 `TASK_NOT_LINKED` 和可见的 `不可验证`，不制造效果值 |
+
+每个 view 显示来源、来源更新时间 `sourceUpdatedAt`、证据观察时间 `dataAsOf`、指标公式/定义版本、证据与图引用以及 unknown 原因。renderer 固定为 `type: controlled_renderer`、`id: controlled_html_svg_v1`、`professionalTool: false`。它是项目内受控 HTML/SVG renderer，**不是 Power BI 或专业 BI 工具**，不执行 artifact 中的脚本，也不调用外部看板服务。
+
+### 双 artifact、下钻与重启恢复
+
+每次 render 生成 HTML 与 JSON manifest 两个真实 artifact，描述符包含准确字节长度和 64 位十六进制 SHA-256 `contentHash`。`dashboard_artifact_get` 的 `offset` / `length` 按原始字节读取，单块最大 **32 KiB**，内容为 base64；调用方按 offset 拼回后必须校验 SHA-256。单 artifact 最大 1 MiB。内容寻址用于完整性校验与恢复，**内容寻址不等于加密**。
+
+HTML 中每个 datum anchor 都对应 `viewId` / `datumId`。将二者传给 `dashboard_drilldown_get` 可取得 Dataset、Evidence 与 AnalysisGraph refs；再用 `analysis_graph_get` 和 `evidence_asset_get` 验证节点及证据正文确实存在。trend、funnel、competitor 与已链接 task observation 都遵循这一证据路径。
+
+同一 data/artifact 目录重启后，`dashboard_get` 恢复最新版本和替换后的 artifact 描述符，分块读取、下钻、Recommendation 血缘及完整 Task 状态仍可恢复。备份仍需一致保存 SQLite 与 artifact root。
+
+### 建议字段、数学与非因果边界
+
+先用 `finding_record` 记录带 `evidenceIds` 的 Finding，再调用 `strategy_recommendation_generate`。`affectedStage` 指定阶段，`targetChannels` 指定渠道，`expectedMetrics` 选择 `establish_baseline` 或链接真实 Metric/Scenario 的 `reach_scenario_target`；返回的 `evidenceIds` 与 `analysisNodeRefs` 保留 lineage。
+
+例如 CTR baseline `0.1`、Scenario target `0.15`、预测分母 40,000 时，expected space 的 `absoluteDelta=0.05`、`relativeDelta=0.5`、预测分子为 6,000、分子增量为 2,000。算术直接来自 persisted Metric/Scenario，`causality=not_established`，不是提升承诺。
+
+Task 完成后可将 Task 与对应 Monitor 链入新版 task-effect view。baseline/current 为 `0.1/0.2` 时，观察值 `absoluteDelta=0.1`、`relativeDelta=1`，解释固定为 `observed_change_not_causal`。这种前后观察是**非因果**描述，不能证明变化由 Task 导致。
+
+### 用户控制、版本与幂等
+
+补充 Task 时提供 `recommendationIds`、标题、`assignee`、优先级、数值 `rank`、依赖、素材要求和验收标准。修改可调整负责人、素材与验收等可变字段；拒绝必须给出原因。每次非重放命令只递增一次版本，更新/拒绝/重排及 Dashboard 替换要求当前 `expectedVersion`，stale version 会冲突。相同幂等键与相同输入的精确重放返回相同响应，不同输入复用该键会被拒绝。
+
+`strategy_task_list` 按 **`(rank,id)`** 排序并提供有界 cursor；符合条件的 Task 仍通过既有 `task_transition` 显式执行 `draft → ready → in_progress → completed`。这些工具只管理用户控制的草稿与状态，**不自动生产内容、审核、排期或发布**，也不会创建相应工具调用或记录。
+
 ## 上限、部分失败与隐私
 
 ### 内置上限
@@ -297,6 +341,7 @@ server 对 canonical operation + rows 计算 SHA-256 `inputHash`，要求 provid
 | 公开研究 | `research_session_create`、`research_permission_set`、`research_session_run` |
 | 竞品与证据 | `competitor_confirm`、`competitor_diff_create`、`data_research_get`、`evidence_asset_get` |
 | 分析网络 | `marketing_analysis_start`、`marketing_capability_list`、`analysis_graph_get`、`analysis_graph_expand`、`analysis_graph_fork`、`metric_compute`、`professional_analytics_compute`、`metric_scenario_create`、`metric_monitor_compare` |
+| 受控看板与策略 | `dashboard_render`、`dashboard_get`、`dashboard_artifact_get`、`dashboard_drilldown_get`、`strategy_recommendation_generate`、`strategy_task_supplement`、`strategy_task_update`、`strategy_task_reject`、`strategy_task_reorder`、`strategy_task_get`、`strategy_task_list` |
 
 `capability_health_record` 只有在关联证据包含完全匹配的 `toolHealth` 时才能把能力置为 `verified`。健康检查必须由调用方实际完成；能力注册不等于安装、授权、执行或健康验证。`marketing_capability_list` 同样只是声明与路由目录，不会把未安装的 connector 变成可用能力。
 
@@ -312,22 +357,23 @@ npm run smoke
 `npm run smoke` 等价于：
 
 ```bash
-vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/data-analytics-documentation.test.ts
+vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/dashboard-strategy-stdio.test.ts tests/e2e/data-analytics-documentation.test.ts
 ```
 
-运行 smoke 前必须构建最新代码。四套 stdio 验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client，另有 README/smoke 文档契约：
+运行 smoke 前必须构建最新代码。五套 stdio 验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client，另有 README/smoke 文档契约，共 13 个 smoke cases：
 
 - 原套件覆盖营销链、幂等、血缘、能力健康、输入边界、原始 malformed JSON、协议专用 stdout、启动失败和优雅关闭。
 - 数据研究套件启动本地 HTTP fixture 与真 Chromium，完成计划、CSV/XLSX 与质量资产、env-ref 认证临时 API、内容链接、研究权限与限域抓取、竞品确认/Diff、证据读取，并重启验证 plan/session/diff/artifact。loopback 仅在测试进程内显式 allowlist，测试凭据仅通过 env reference 使用。
 - 分析网络套件覆盖初始化 instructions、无数据公开研究分支、能力边界、公开/自有文件指标、条件情景、监控、expand/fork、幂等与父图不变，并在重启后仅通过 `analysis_graph_get` 恢复全部节点和引用；验证零分母 unknown、complete-case、公开来源参考度与不可比语义，不使用带外 SQL。
 - SQLite/外部分析套件使用临时真实 SQLite 和独立分析 MCP fixture，核对 discover、结构化 snapshot/ingest、engagement/conversion 数值、Wilson 适用性与区间、trend/funnel/anomaly 实质结果、input hash/证据 provenance、fork、重启恢复以及未配置 capability gap；每例使用独立目录和子进程环境，并关闭 server/provider。
+- 看板策略套件使用真实 CSV、外部分析 MCP、loopback Chromium 竞对和本地 Playwright Chromium 读取五 SVG，验证双 artifact 分块/hash、下钻、建议数学、任务控制、版本/幂等与重启恢复；不 mock provider、browser 或 artifact。
 
 `npm test` 也包含这些 e2e 文件，因此同样要求最新 `dist` 和可用 Chromium。
 
 ## 当前不支持
 
 - 不做自动因果推断、保证性提升或商业结果承诺；条件情景、Wilson 区间和前后对比不能替代实验或因果分析。
-- 不提供仪表盘、内容生成、逆向制作、审批执行或发布。
+- 看板仅为上述受控 HTML/SVG，不是 Power BI 或专业 BI；不提供内容生成、逆向制作、审批执行或发布，策略任务不自动生产内容、审核、排期或发布。
 - 不提供 PostgreSQL、MySQL、GA4 connector，不安装或声明外部营销平台的 OAuth、账户同步、live connector，也不提供定时/自动调度监控；文件、临时授权 API、SQLite 和公开链接快照不等于持续平台集成。
 - 不声明内置任何特定专业内容或分析 MCP 供应商集成；外部分析必须显式配置真实依赖，未配置时没有本地分析 fallback。
 - SQLite connector 不支持视图、BLOB、WAL、任意 SQL、实时同步或没有兼容 POSIX `/dev/fd` 的平台。

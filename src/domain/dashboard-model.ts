@@ -306,11 +306,18 @@ function assertNonEmptyString(value: unknown, label: string): void {
   }
 }
 
+function assertReferenceId(value: unknown, label: string): void {
+  if (typeof value !== "string" || value.trim().length === 0 ||
+      value.trim() !== value || value.length > 128) {
+    invalid(`${label} must be a normalized entity reference ID`);
+  }
+}
+
 function assertIdArray(value: unknown, label: string, nonEmpty = false): asserts value is string[] {
   if (!Array.isArray(value) || value.length > 1000 || (nonEmpty && value.length === 0)) {
     invalid(`${label} must be a bounded ID array`);
   }
-  for (const id of value) assertStableId(id, label);
+  for (const id of value) assertReferenceId(id, label);
   if (new Set(value).size !== value.length) invalid(`${label} must not contain duplicates`);
 }
 
@@ -328,9 +335,9 @@ function validateView(view: DashboardView): void {
   assertRecord(view, "Dashboard view", [...VIEW_METADATA_KEYS, ...referenceKeys]);
 
   if (view.kind === "competitor_comparison") {
-    assertStableId(view.competitorDiffId, "Dashboard competitorDiffId");
+    assertReferenceId(view.competitorDiffId, "Dashboard competitorDiffId");
   } else {
-    assertStableId(view.graphId, "Dashboard graphId");
+    assertReferenceId(view.graphId, "Dashboard graphId");
     if (view.kind === "task_effect") {
       assertIdArray(view.taskIds, "Dashboard taskIds");
       assertIdArray(view.monitorNodeIds, "Dashboard monitorNodeIds", true);
@@ -369,7 +376,7 @@ function validateView(view: DashboardView): void {
       "type",
       "ownership",
     ]);
-    assertStableId(source.sourceId, "Dashboard source ID");
+    assertReferenceId(source.sourceId, "Dashboard source ID");
     assertUtcInstant(source.updatedAt, "Dashboard source updatedAt");
     if (source.name !== undefined) assertNonEmptyString(source.name, "Dashboard source name");
     if (source.type !== undefined && !["file", "link", "api", "manual", "database"].includes(source.type)) {
@@ -491,7 +498,7 @@ export function validateDashboard(dashboard: Dashboard): void {
     if (!(REFERENCE_FIELDS.map(([, entityType]) => entityType) as readonly string[]).includes(reference.entityType)) {
       invalid("Dashboard source version entityType must be supported");
     }
-    assertStableId(reference.id, "Dashboard source version ID");
+    assertReferenceId(reference.id, "Dashboard source version ID");
     if (!Number.isSafeInteger(reference.version) || reference.version < 1) {
       invalid("Dashboard source version must be a positive safe integer");
     }
