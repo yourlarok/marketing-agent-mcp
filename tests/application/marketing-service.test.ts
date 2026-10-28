@@ -1430,6 +1430,26 @@ describe("MarketingService recommendations and tasks", () => {
     ).toMatchObject({ action: "task.transition", entityId: "task-1" });
   });
 
+  it("does not allow the legacy transition command to reject a task without a rejection reason", async () => {
+    await createRecommendation();
+    await createTask("task-1");
+
+    await expect(
+      service.transitionTask({
+        input: { id: "task-1", workspaceId: "workspace-1", next: "rejected", expectedVersion: 1 },
+        context: nextContext(),
+      }),
+    ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    expect(
+      await store.transaction((repos) => repos.tasks.get("task-1", "workspace-1")),
+    ).toMatchObject({ state: "draft", version: 1 });
+
+    await expect(service.transitionTask({
+      input: { id: "task-1", workspaceId: "workspace-1", next: "ready", expectedVersion: 1 },
+      context: nextContext(),
+    })).resolves.toMatchObject({ state: "ready", version: 2 });
+  });
+
   it("rejects a task transition with a stale expected version", async () => {
     await createRecommendation();
     await createTask("task-1");

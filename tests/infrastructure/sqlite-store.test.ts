@@ -828,6 +828,29 @@ describe("transactional SQLite storage", () => {
       })))).rejects.toThrow();
     }
 
+    const unnormalized = dashboardRecord({
+      id: "unnormalized-task-effect",
+      taskIds: [],
+      sourceVersions: dashboardRecord().sourceVersions.filter((reference) => reference.entityType !== "task"),
+    });
+    const normalizedView = createDashboardView({
+      id: "empty-task-effect",
+      kind: "task_effect",
+      graphId: "graph-1",
+      taskIds: [],
+      monitorNodeIds: ["monitor-1"],
+      sourceUpdatedAt: later,
+      sources: [{ sourceId: "source-1", updatedAt: later }],
+      metrics: [{ metricId: "ctr_v1", formula: "sum(clicks) / sum(impressions)" }],
+    });
+    unnormalized.views = [{ ...normalizedView, status: "ok", reasons: [] }];
+    await expect(
+      store.transaction((repos) => repos.dashboards.insert(unnormalized)),
+    ).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    expect(
+      await store.transaction((repos) => repos.dashboards.get("unnormalized-task-effect", "ws-1")),
+    ).toBeUndefined();
+
     await store.transaction((repos) => repos.dashboards.update(dashboardRecord(), 1));
     await expect(
       store.transaction((repos) => repos.dashboards.update(dashboardRecord(), 1)),

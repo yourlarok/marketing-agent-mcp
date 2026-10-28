@@ -122,6 +122,22 @@ describe("dashboard views", () => {
     expect(taskView.reasons).toContainEqual(expect.objectContaining({ code: "TASK_NOT_LINKED" }));
   });
 
+  it("rejects an unnormalized empty task-effect view at the direct validation boundary", () => {
+    const normalized = view({
+      id: "task-view",
+      kind: "task_effect",
+      graphId: "graph-1",
+      taskIds: [],
+      monitorNodeIds: ["monitor-1"],
+    });
+    const candidate = {
+      ...dashboard(),
+      views: [{ ...normalized, status: "ok" as const, reasons: [] }],
+    };
+
+    expectInvalid(() => validateDashboard(candidate));
+  });
+
   it("bounds source and metric descriptors and rejects duplicate descriptor IDs", () => {
     expectInvalid(() => view(viewInputs[0]!, {
       sources: Array.from({ length: 101 }, (_, index) => ({ sourceId: `source-${index}`, updatedAt: now })),

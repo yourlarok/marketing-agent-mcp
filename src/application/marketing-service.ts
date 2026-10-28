@@ -886,6 +886,9 @@ export class MarketingService {
         if (!(TASK_STATES as readonly string[]).includes(input.next)) {
           throw new DomainError("INVALID_INPUT", "next must be a supported task state");
         }
+        if (input.next === "rejected") {
+          throw new DomainError("INVALID_INPUT", "Task rejection requires the dedicated rejection command");
+        }
         if (!Number.isInteger(input.expectedVersion) || input.expectedVersion < 1) {
           throw new DomainError("INVALID_INPUT", "expectedVersion must be a positive integer");
         }

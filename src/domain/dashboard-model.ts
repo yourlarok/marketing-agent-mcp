@@ -178,6 +178,10 @@ function validateView(view: DashboardView): void {
     assertNonEmptyString(reason.code, "Dashboard reason code");
     assertNonEmptyString(reason.message, "Dashboard reason message");
   }
+  if (view.kind === "task_effect" && view.taskIds.length === 0 &&
+      (view.status !== "unverifiable" || !view.reasons.some((reason) => reason.code === "TASK_NOT_LINKED"))) {
+    invalid("An empty task-effect view must be unverifiable with TASK_NOT_LINKED");
+  }
   if (view.dataAsOf !== null) assertUtcInstant(view.dataAsOf, "Dashboard dataAsOf");
   assertUtcInstant(view.sourceUpdatedAt, "Dashboard sourceUpdatedAt");
 
