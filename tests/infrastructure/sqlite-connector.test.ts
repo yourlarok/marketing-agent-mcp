@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { renameSync, symlinkSync, unlinkSync } from "node:fs";
+import { existsSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
 import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -249,6 +249,44 @@ describe("SqliteConnector", () => {
     }));
     expect(snapshot.schema).toEqual([{ name: "value", type: "unknown" }]);
     expect(snapshot.rows).toEqual([{ value: "text" }, { value: 12 }, { value: null }]);
+  });
+
+  it("fails closed with a controlled error for a real uncheckpointed WAL database", () => {
+    const walPath = join(root, "warehouse", "wal.sqlite");
+    const writer = new DatabaseSync(walPath);
+    try {
+      writer.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA wal_autocheckpoint = 0;
+        CREATE TABLE daily_metrics (
+          id INTEGER,
+          day TEXT,
+          channel TEXT,
+          active BOOLEAN,
+          clicks INTEGER,
+          note TEXT
+        );
+        INSERT INTO daily_metrics VALUES
+          (1, '2026-10-28', 'owned', 1, 100, 'wal-only');
+      `);
+      expect(writer.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+      expect(existsSync(`${walPath}-wal`)).toBe(true);
+
+      for (const read of [
+        () => connector.discover("warehouse/wal"),
+        () => connector.snapshot(query({ databaseId: "warehouse/wal" })),
+      ]) {
+        expect(read).toThrowError(expect.objectContaining<Partial<DomainError>>({
+          code: "CAPABILITY_UNAVAILABLE",
+          details: expect.objectContaining({
+            capability: "sqlite",
+            reason: "wal_not_supported",
+          }),
+        }));
+      }
+    } finally {
+      writer.close();
+    }
   });
 
   it.each([

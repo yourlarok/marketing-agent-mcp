@@ -77,6 +77,53 @@ export class ArtifactStore {
     }
   }
 
+  async readRange(
+    contentHash: string,
+    offset: number,
+    length: number,
+    expectedBytes?: number,
+  ): Promise<Buffer> {
+    if (!/^[0-9a-f]{64}$/.test(contentHash)) {
+      throw new DomainError("NOT_FOUND", "Evidence asset not found");
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0 ||
+        !Number.isSafeInteger(length) || length < 0) {
+      throw new DomainError("INVALID_INPUT", "Evidence asset range must use non-negative integers");
+    }
+    const root = await this.root();
+    const target = join(root, contentHash);
+    let handle;
+    try {
+      handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const metadata = await handle.stat();
+      if (!metadata.isFile()) {
+        throw new DomainError("NOT_FOUND", "Evidence asset not found");
+      }
+      if (expectedBytes !== undefined && metadata.size !== expectedBytes) {
+        throw new DomainError("CONFLICT", "Evidence artifact length does not match");
+      }
+      if (offset > metadata.size) {
+        throw new DomainError("INVALID_INPUT", "Evidence asset offset exceeds totalBytes");
+      }
+      const content = Buffer.alloc(Math.min(length, metadata.size - offset));
+      if (content.length > 0) {
+        const { bytesRead } = await handle.read(content, 0, content.length, offset);
+        if (bytesRead !== content.length) {
+          throw new DomainError("CONFLICT", "Evidence artifact changed while reading a range");
+        }
+      }
+      return content;
+    } catch (error) {
+      if (error instanceof DomainError) throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new DomainError("NOT_FOUND", "Evidence asset not found");
+      }
+      throw error;
+    } finally {
+      await handle?.close();
+    }
+  }
+
   private async verifyExisting(
     target: string,
     contentHash: string,

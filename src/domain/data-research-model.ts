@@ -5,6 +5,8 @@ export interface DataRequestPlan extends EntityRecord, Partial<DataRequestPlanDe
   objective?: string;
 }
 
+export const EVIDENCE_ASSET_CHUNK_MAX_BYTES = 32 * 1024;
+
 export const INGESTION_BATCH_STATES = ["completed", "partial", "blocked"] as const;
 export type IngestionBatchState = (typeof INGESTION_BATCH_STATES)[number];
 

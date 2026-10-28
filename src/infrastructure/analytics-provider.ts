@@ -73,9 +73,10 @@ class BoundedStdioClientTransport extends StdioClientTransport {
   }
 
   override async start(): Promise<void> {
-    await super.start();
+    const starting = super.start();
     this.childPid = this.pid ?? undefined;
     this.processObserved = this.childPid !== undefined;
+    await starting;
   }
 
   get needsCleanup(): boolean {

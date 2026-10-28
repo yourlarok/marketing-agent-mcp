@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { EVIDENCE_ASSET_CHUNK_MAX_BYTES } from "../domain/data-research-model.js";
 import { isSecretLikeKey } from "../domain/secrets.js";
 
 export { isSecretLikeKey } from "../domain/secrets.js";
@@ -481,6 +482,8 @@ export const evidenceAssetGetInputSchema = z.strictObject({
   workspaceId: idSchema,
   evidenceId: idSchema,
   assetId: idSchema,
+  offset: z.number().int().nonnegative().optional(),
+  length: z.number().int().positive().max(EVIDENCE_ASSET_CHUNK_MAX_BYTES).optional(),
 });
 
 const analysisComparabilitySchema = z.enum(["not_assessed", "comparable", "not_comparable"]);
@@ -1035,4 +1038,6 @@ export const evidenceAssetGetToolSchema = z.strictObject({
   workspaceId: rawStringSchema,
   evidenceId: rawStringSchema,
   assetId: rawStringSchema,
+  offset: rawNumberSchema.optional(),
+  length: rawNumberSchema.optional(),
 });

@@ -76,6 +76,7 @@ export const SQLITE_CONNECTOR_MANIFEST: ConnectorManifest = {
     "equality_filters_only",
     "stable_order",
     "no_arbitrary_sql",
+    "wal_fail_closed",
   ],
 };
 
@@ -106,6 +107,15 @@ interface AuthorizedTable {
 
 function invalid(message: string): never {
   throw new DomainError("INVALID_INPUT", message);
+}
+
+function walUnsupported(): never {
+  throw new DomainError(
+    "CAPABILITY_UNAVAILABLE",
+    "SQLite WAL databases are not supported by this connector",
+    false,
+    { capability: "sqlite", reason: "wal_not_supported" },
+  );
 }
 
 function quoteIdentifier(identifier: string): string {
@@ -266,6 +276,13 @@ export class SqliteConnector {
       const canonical = realpathSync(candidate);
       if (!insideRoot(this.root, canonical)) invalid("SQLite database resolves outside MARKETING_DATABASE_ROOT");
       if (!statSync(canonical).isFile()) invalid("SQLite database must be a regular file");
+      try {
+        lstatSync(`${canonical}-wal`);
+        walUnsupported();
+      } catch (error) {
+        if (error instanceof DomainError) throw error;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
       const descriptor = openSync(
         canonical,
         constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
@@ -300,7 +317,10 @@ export class SqliteConnector {
     let database: DatabaseSync | undefined;
     try {
       database = new DatabaseSync(`/dev/fd/${descriptor}`, { readOnly: true });
-      database.exec("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF; BEGIN;");
+      database.exec("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;");
+      const journal = database.prepare("PRAGMA journal_mode").get() as { journal_mode?: unknown };
+      if (String(journal.journal_mode).toLowerCase() === "wal") walUnsupported();
+      database.exec("BEGIN;");
       try {
         const result = read(database);
         database.exec("COMMIT");

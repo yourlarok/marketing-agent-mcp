@@ -14,6 +14,7 @@ import {
 import { compareCompetitorObservations } from "../domain/competitor-diff.js";
 import {
   COMPETITOR_STATUSES,
+  EVIDENCE_ASSET_CHUNK_MAX_BYTES,
   RESEARCH_LIMIT_CEILINGS,
   RESEARCH_LIMIT_MINIMA,
   type Competitor,
@@ -1537,11 +1538,25 @@ export class DataResearchService {
         assetId: query.assetId,
       });
     }
-    const content = await this.artifacts.read(asset.contentHash);
-    if (content.length !== asset.byteLength) {
+    const offset = query.offset ?? 0;
+    const length = query.length ?? EVIDENCE_ASSET_CHUNK_MAX_BYTES;
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      invalid("Evidence asset offset must be a non-negative integer");
+    }
+    if (!Number.isSafeInteger(length) || length < 1 || length > EVIDENCE_ASSET_CHUNK_MAX_BYTES) {
+      invalid(`Evidence asset length must be between 1 and ${EVIDENCE_ASSET_CHUNK_MAX_BYTES}`);
+    }
+    if (!Number.isSafeInteger(asset.byteLength) || asset.byteLength < 0) {
       throw new DomainError("CONFLICT", "Evidence artifact length does not match");
     }
-    return { ...asset, content };
+    if (offset > asset.byteLength) invalid("Evidence asset offset exceeds totalBytes");
+    const content = await this.artifacts.readRange(
+      asset.contentHash,
+      offset,
+      length,
+      asset.byteLength,
+    );
+    return { ...asset, content, offset, totalBytes: asset.byteLength };
   }
 
   planDataRequests(command: Command<CreateDataRequestPlan>): Promise<DataRequestPlan> {

@@ -714,6 +714,48 @@ describe("analysis MCP tools and initialization", () => {
     ]);
   });
 
+  it("rolls back an oversized legacy graph expansion and every success record on repeated attempts", async () => {
+    const graph = await call<AnalysisGraph>("marketing_analysis_start", {
+      id: "graph-oversized-expand",
+      workspaceId: "workspace-1",
+      objective: "Preserve legacy write response atomicity",
+      ...context("start-oversized-expand"),
+    });
+    const arguments_ = {
+      id: graph.id,
+      workspaceId: graph.workspaceId,
+      expectedVersion: graph.version,
+      nodes: [{
+        id: "oversized-decision",
+        kind: "decision",
+        payload: { statement: "x".repeat(64_000) },
+      }],
+      edges: [{
+        id: "oversized-decision-edge",
+        fromNodeId: graph.nodes[1]!.id,
+        toNodeId: "oversized-decision",
+      }],
+      ...context("oversized-expand"),
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = await client.callTool({
+        name: "analysis_graph_expand",
+        arguments: arguments_,
+      });
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toContain("Resource conflict");
+    }
+    expect(await store.transaction((repos) =>
+      repos.analysisGraphs.get(graph.id, graph.workspaceId))).toEqual(graph);
+    expect(await store.transaction((repos) =>
+      repos.audit.listForEntity(graph.workspaceId, "analysis_graph", graph.id)))
+      .not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ action: "analysis_graph.expand" }),
+      ]));
+    expect(await store.transaction((repos) =>
+      repos.idempotency.get(graph.workspaceId, arguments_.idempotencyKey))).toBeUndefined();
+  }, 15_000);
+
   it("rejects unknown fields, oversized input, and nested secrets before analysis writes", async () => {
     const valid = {
       id: "graph-strict",

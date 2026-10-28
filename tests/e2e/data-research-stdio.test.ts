@@ -1,4 +1,5 @@
-import { copyFile, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, readdir, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -356,4 +357,102 @@ describe("built data-research stdio acceptance", () => {
     expect(second.stderr()).not.toContain(credentialValue);
     await stopClient(second);
   }, 90_000);
+
+  it("reads large evidence assets in bounded chunks with hash verification and restart recovery", async () => {
+    const originalContent = Buffer.from(`name,amount\n${Array.from(
+      { length: 12_000 },
+      (_, index) => `product-${index},${index}\n`,
+    ).join("")}`);
+    expect(originalContent.length).toBeGreaterThan(64 * 1024);
+    await writeFile(join(importDir, "large.csv"), originalContent);
+    const first = await startClient();
+    const { client } = first;
+    const call = async (name: string, arguments_: JsonRecord): Promise<JsonRecord> =>
+      payload(await client.callTool({ name, arguments: arguments_ }));
+    await call("workspace_create", {
+      id: workspaceId,
+      name: "Chunked evidence assets",
+      ...context("chunk-workspace"),
+    });
+    const batch = await call("ingest_files", {
+      id: "batch-large-asset",
+      workspaceId,
+      paths: ["large.csv"],
+      ...context("chunk-ingest"),
+    });
+    const lineage = await call("data_research_get", {
+      entityType: "ingestion_batch",
+      id: batch.id as string,
+      workspaceId,
+    });
+    const evidence = ((lineage.descriptors as JsonRecord).evidence as JsonRecord[])[0]!;
+    const asset = (evidence.assets as JsonRecord[])
+      .find((candidate) => candidate.kind === "original")!;
+    const selector = {
+      workspaceId,
+      evidenceId: evidence.id as string,
+      assetId: asset.id as string,
+    };
+
+    const firstChunk = await call("evidence_asset_get", selector);
+    expect(firstChunk).toMatchObject({
+      offset: 0,
+      length: 32 * 1024,
+      totalBytes: originalContent.length,
+      contentHash: asset.contentHash,
+    });
+    const chunks = [Buffer.from(firstChunk.content as string, "base64")];
+    while (chunks.reduce((sum, chunk) => sum + chunk.length, 0) < originalContent.length) {
+      const offset = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const chunk = await call("evidence_asset_get", { ...selector, offset, length: 16_384 });
+      expect(chunk).toMatchObject({
+        offset,
+        totalBytes: originalContent.length,
+        contentHash: asset.contentHash,
+      });
+      const content = Buffer.from(chunk.content as string, "base64");
+      expect(content.length).toBe(chunk.length);
+      expect(content.length).toBeLessThanOrEqual(16_384);
+      chunks.push(content);
+    }
+    const restored = Buffer.concat(chunks);
+    expect(restored.equals(originalContent)).toBe(true);
+    expect(createHash("sha256").update(restored).digest("hex")).toBe(asset.contentHash);
+    expect(chunks.length).toBeGreaterThan(2);
+
+    for (const [page, message] of [
+      [{ offset: -1, length: 1 }, "Input validation error"],
+      [{ offset: 0, length: 0 }, "Input validation error"],
+      [{ offset: 0, length: 32 * 1024 + 1 }, "Input validation error"],
+      [{ offset: 1.5, length: 1 }, "Input validation error"],
+      [{ offset: originalContent.length + 1, length: 1 }, "Invalid input"],
+    ] as const) {
+      const result = await client.callTool({
+        name: "evidence_asset_get",
+        arguments: { ...selector, ...page },
+      });
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toContain(message);
+    }
+    const end = await call("evidence_asset_get", {
+      ...selector,
+      offset: originalContent.length,
+      length: 1,
+    });
+    expect(end).toMatchObject({ offset: originalContent.length, length: 0, content: "" });
+
+    await stopClient(first);
+    const second = await startClient();
+    const restoredChunk = payload(await second.client.callTool({
+      name: "evidence_asset_get",
+      arguments: { ...selector, offset: chunks[0]!.length, length: 16_384 },
+    }));
+    expect(Buffer.from(restoredChunk.content as string, "base64").equals(chunks[1]!)).toBe(true);
+    expect(restoredChunk).toMatchObject({
+      offset: chunks[0]!.length,
+      totalBytes: originalContent.length,
+      contentHash: asset.contentHash,
+    });
+    await stopClient(second);
+  }, 60_000);
 });

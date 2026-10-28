@@ -375,7 +375,7 @@ export class AuditableCommandPipeline implements CommandPipeline {
       const input = redact(operation.input) as T;
       const timestamp = this.clock.now();
       const entity = await operation.write(repos, input, timestamp);
-      operation.validateResponse?.(entity);
+      (operation.validateResponse ?? assertBoundedCommandResponse)(entity);
       await repos.audit.append({
         id: this.ids.next(),
         workspaceId: entity.workspaceId,

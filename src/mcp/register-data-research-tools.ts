@@ -314,7 +314,11 @@ export function registerDataResearchTools(
       try {
         const query = evidenceAssetGetInputSchema.parse(validateToolArguments(arguments_));
         const { content, ...asset } = await dataResearch.getEvidenceAsset(query);
-        return textResult({ ...asset, content: content.toString("base64") });
+        return textResult({
+          ...asset,
+          length: content.length,
+          content: content.toString("base64"),
+        });
       } catch (error) {
         throw toMcpError(error);
       }

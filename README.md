@@ -155,7 +155,7 @@ API 还必须具有 `owned` 或 `authorized` 所有权，并提供未来的 UTC 
 
 `data_research_get` 可读取 `data_request_plan`、`ingestion_batch`、`research_session`、`competitor`、`competitor_diff` 的工作区血缘与审计 request ID，并返回完整 `entity` 和继续流程所需的 `descriptors`：plan rounds/questions/batch refs、batch 的 Source/Dataset/Evidence、session/competitor 的 Evidence（含 assets）、Diff entries/competitors/findings。`ingest_content_links` 同时返回 `competitorIds`，业务衔接不需要直接 SQL。原 `lineage_get` 继续读取营销任务链。
 
-`evidence_asset_get` 只接受 `workspaceId`、`evidenceId`、`assetId`，返回资产元数据及 base64 `content`，不接受文件路径。Evidence 的 `assets` 元数据提供 asset ID 与 kind。
+`evidence_asset_get` 只接受 `workspaceId`、`evidenceId`、`assetId` 以及可选 `offset` / `length`，不接受文件路径。`offset` 默认 0，`length` 默认且最大 32 KiB 原始字节；响应只含当前块的 base64 `content`，并返回当前 `offset`、块 `length`、`totalBytes` 和完整资产的 `contentHash`。小资产的旧调用仍返回完整内容；大资产按 offset 逐块读取并在拼回后校验 SHA-256。Evidence 的 `assets` 元数据提供 asset ID 与 kind。
 
 SQLite、实体版本、审计和幂等结果在同一数据目录重启后保留；artifact 通过内容哈希重新读取。重启后可仅用 `data_research_get` 恢复 plan/session/diff payload 和资产描述，再用 `evidence_asset_get` 读取正文。
 
@@ -167,6 +167,7 @@ SQLite、实体版本、审计和幂等结果在同一数据目录重启后保�
 - 这不是任意 SQL 接口。只能选择已发现表中的列、等值/`IS NULL` filters、受控升降序和行数 limit；server 构造参数化查询并追加稳定排序。调用方不能传 SQL 字符串、join、子查询、写语句或 PRAGMA。
 - 每次 ingest 都是调用时生成的**显式快照**，保存 query hash、observedAt、来源描述和内容 hash；不是实时同步、订阅或持续连接。源库之后的变化不会自动进入 Dataset，必须再次显式 ingest 形成新快照。
 - 仅接受 `owned` 或 `authorized` 数据。视图、BLOB、非有限数值和超出安全整数范围的 SQLite integer 不受支持；不能把它当作任意 SQLite 数据库的通用导入器。
+- 当前不支持 WAL 数据库。授权校验后会检查 `-wal` 侧车与 `journal_mode`，WAL 在 discover 或 snapshot 读取任何 schema/业务行之前以受控 `CAPABILITY_UNAVAILABLE`（`reason=wal_not_supported`）失败，不会退回主文件旧数据。调用方应先由可信来源完成 checkpoint 并转换为非 WAL 快照。
 - 当前文件描述符传递实现依赖 POSIX 风格 `/dev/fd/<fd>`，供 `node:sqlite` 打开已经完成授权校验的描述符。没有兼容 `/dev/fd` 的平台（包括原生 Windows）不支持此 SQLite connector；这不是可移植的纯路径实现，也不影响不使用该 connector 的其他工具。
 
 ## 外部分析 MCP
@@ -329,6 +330,6 @@ vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e
 - 不提供仪表盘、内容生成、逆向制作、审批执行或发布。
 - 不提供 PostgreSQL、MySQL、GA4 connector，不安装或声明外部营销平台的 OAuth、账户同步、live connector，也不提供定时/自动调度监控；文件、临时授权 API、SQLite 和公开链接快照不等于持续平台集成。
 - 不声明内置任何特定专业内容或分析 MCP 供应商集成；外部分析必须显式配置真实依赖，未配置时没有本地分析 fallback。
-- SQLite connector 不支持视图、BLOB、任意 SQL、实时同步或没有兼容 POSIX `/dev/fd` 的平台。
+- SQLite connector 不支持视图、BLOB、WAL、任意 SQL、实时同步或没有兼容 POSIX `/dev/fd` 的平台。
 - 不支持自动登录、CAPTCHA 绕过、文件下载、任意脚本执行、任意 SQL/Python/公式 DSL、跨 Dataset join、语义化竞品结论或把 `unknown` 当作事实。
 - 不提供跨工作区访问、多用户认证、远程传输、访问控制、数据库加密或外部 MCP 的 OS 沙箱。

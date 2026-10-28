@@ -592,7 +592,7 @@ describe("MCP server", () => {
     }
   });
 
-  it("enforces the 64 KiB UTF-8 limit across complete real tool arguments", async () => {
+  it("enforces 64 KiB input and transactional output limits across real tool arguments", async () => {
     const tempDir = await createTempDir();
     const databasePath = join(tempDir, "store.db");
     const store = openStore(databasePath);
@@ -621,11 +621,12 @@ describe("MCP server", () => {
         "€".repeat(multibyteLength) + "x".repeat(remaining - multibyteLength * 3);
       expect(Buffer.byteLength(JSON.stringify(boundaryArguments), "utf8")).toBe(65_536);
 
-      const accepted = await client.callTool({
+      const boundaryResult = await client.callTool({
         name: "workspace_create",
         arguments: boundaryArguments,
       });
-      expect(accepted).not.toMatchObject({ isError: true });
+      expect(boundaryResult).toMatchObject({ isError: true });
+      expect(JSON.stringify(boundaryResult)).toContain("Resource conflict");
 
       const oversizedArguments = {
         ...boundaryArguments,
@@ -648,7 +649,7 @@ describe("MCP server", () => {
             (SELECT COUNT(*) FROM workspaces) AS workspaces,
             (SELECT COUNT(*) FROM audit_records) AS audits,
             (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
-        ).get()).toEqual({ workspaces: 1, audits: 1, idempotency: 1 });
+        ).get()).toEqual({ workspaces: 0, audits: 0, idempotency: 0 });
         expect(raw.prepare("SELECT id FROM workspaces WHERE id = ?").get("workspace-oversized")).toBeUndefined();
       } finally {
         raw.close();

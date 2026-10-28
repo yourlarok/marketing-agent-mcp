@@ -1514,7 +1514,7 @@ export class AnalysisCapabilityService {
           detail: "SQLite discovery requires MARKETING_DATABASE_ROOT in the trusted deployment configuration.",
         },
         fallback: ["ingest.files with an exported snapshot"],
-        limitations: ["Schema discovery is read-only.", "No PostgreSQL, MySQL, GA4, OAuth, or arbitrary path access is provided."],
+        limitations: ["Schema discovery is read-only.", "WAL databases fail closed as unsupported before schema or row reads.", "No PostgreSQL, MySQL, GA4, OAuth, or arbitrary path access is provided."],
       }),
       capability({
         id: "ingest.sqlite",
@@ -1530,7 +1530,7 @@ export class AnalysisCapabilityService {
           detail: "SQLite ingestion requires MARKETING_DATABASE_ROOT in the trusted deployment configuration.",
         },
         fallback: ["ingest.files with an exported snapshot"],
-        limitations: ["Only owned or authorized SQLite snapshots are supported.", "Arbitrary SQL, shell commands, dynamic paths, and code execution are rejected."],
+        limitations: ["Only owned or authorized non-WAL SQLite snapshots are supported; WAL fails closed before reads.", "Arbitrary SQL, shell commands, dynamic paths, and code execution are rejected."],
       }),
       capability({
         id: "analytics.professional",

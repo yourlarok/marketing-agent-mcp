@@ -438,10 +438,12 @@ describe("built stdio server acceptance", () => {
     boundaryArguments.metadata.note =
       "€".repeat(multibyteLength) + "x".repeat(remaining - multibyteLength * 3);
     expect(Buffer.byteLength(JSON.stringify(boundaryArguments), "utf8")).toBe(65_536);
-    expect(payload(await client.callTool({
+    const boundaryResult = await client.callTool({
       name: "workspace_create",
       arguments: boundaryArguments,
-    }))).toMatchObject({ id: "workspace-stdio-boundary" });
+    });
+    expect(boundaryResult).toMatchObject({ isError: true });
+    expect(JSON.stringify(boundaryResult)).toContain("Resource conflict");
 
     const oversizedArguments = {
       ...boundaryArguments,
@@ -465,7 +467,7 @@ describe("built stdio server acceptance", () => {
           (SELECT COUNT(*) FROM workspaces) AS workspaces,
           (SELECT COUNT(*) FROM audit_records) AS audits,
           (SELECT COUNT(*) FROM idempotency_records) AS idempotency`,
-      ).get()).toEqual({ workspaces: 1, audits: 1, idempotency: 1 });
+      ).get()).toEqual({ workspaces: 0, audits: 0, idempotency: 0 });
       expect(raw.prepare("SELECT id FROM workspaces WHERE id = ?").get("workspace-stdio-oversized")).toBeUndefined();
     } finally {
       raw.close();

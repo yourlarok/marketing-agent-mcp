@@ -124,8 +124,12 @@ export interface EvidenceAssetQuery {
   workspaceId: string;
   evidenceId: string;
   assetId: string;
+  offset?: number;
+  length?: number;
 }
 
 export interface EvidenceAssetContent extends EvidenceAsset {
   content: Buffer;
+  offset: number;
+  totalBytes: number;
 }
