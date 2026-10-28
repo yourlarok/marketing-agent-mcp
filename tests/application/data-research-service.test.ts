@@ -186,7 +186,7 @@ describe("versioned data-research storage", () => {
     }
   }
 
-  it("upgrades a real stage-1 database through 002 and 003 and preserves records on repeat open", async () => {
+  it("upgrades a real stage-1 database through 002, 003, and 004 and preserves records on repeat open", async () => {
     createStage1Database();
     const first = open();
     expect(
@@ -207,6 +207,7 @@ describe("versioned data-research storage", () => {
         { version: 1, applied_at: expect.any(String) },
         { version: 2, applied_at: expect.any(String) },
         { version: 3, applied_at: expect.any(String) },
+        { version: 4, applied_at: expect.any(String) },
       ]);
     } finally {
       migrationTimes.close();
@@ -235,7 +236,7 @@ describe("versioned data-research storage", () => {
     const database = new DatabaseSync(databasePath);
     try {
       database
-        .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)")
+        .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)")
         .run(now);
     } finally {
       database.close();
@@ -251,7 +252,7 @@ describe("versioned data-research storage", () => {
       ).toBeUndefined();
       expect(
         after.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
-      ).toEqual([{ version: 1 }, { version: 4 }]);
+      ).toEqual([{ version: 1 }, { version: 5 }]);
     } finally {
       after.close();
     }

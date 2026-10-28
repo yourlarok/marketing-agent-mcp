@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DomainError } from "../../src/domain/errors.js";
 import { canonicalJson } from "../../src/infrastructure/sqlite.js";
@@ -14,6 +16,11 @@ import {
   expandAnalysisGraph,
   type AnalysisGraph,
 } from "../../src/domain/analysis-model.js";
+import {
+  createDashboard,
+  createDashboardView,
+  type Dashboard,
+} from "../../src/domain/dashboard-model.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
 
 const now = "2026-10-26T12:30:00.000Z";
@@ -55,6 +62,65 @@ function analysisGraph(id = "graph-1", workspaceId = "ws-1"): AnalysisGraph {
       { id: "edge-2", fromNodeId: "dataset-node", toNodeId: "metric-node" },
     ],
     recommendedActions: [{ tool: "research", description: "Review evidence" }],
+  });
+}
+
+function dashboardRecord(overrides: Record<string, unknown> = {}): Dashboard {
+  return createDashboard({
+    id: "dashboard-1",
+    workspaceId: "ws-1",
+    createdAt: now,
+    generatedAt: later,
+    renderer: {
+      type: "controlled_renderer",
+      id: "controlled_html_svg_v1",
+      professionalTool: false,
+    },
+    views: [createDashboardView({
+      id: "task-effect",
+      kind: "task_effect",
+      graphId: "graph-1",
+      taskIds: ["task-1"],
+      monitorNodeIds: ["monitor-1"],
+      status: "ok",
+      reasons: [],
+      dataAsOf: now,
+      sourceUpdatedAt: later,
+      sources: [{ sourceId: "source-1", updatedAt: later }],
+      metrics: [{ metricId: "ctr_v1", formula: "sum(clicks) / sum(impressions)" }],
+    })],
+    artifacts: [
+      {
+        id: "dashboard-html",
+        kind: "html",
+        contentHash: "a".repeat(64),
+        byteLength: 100,
+        mediaType: "text/html; charset=utf-8",
+      },
+      {
+        id: "dashboard-manifest",
+        kind: "manifest",
+        contentHash: "b".repeat(64),
+        byteLength: 200,
+        mediaType: "application/json",
+      },
+    ],
+    sourceIds: ["source-1"],
+    datasetIds: ["dataset-1"],
+    evidenceIds: ["evidence-2", "evidence-1"],
+    graphIds: ["graph-1"],
+    competitorDiffIds: ["diff-1"],
+    taskIds: ["task-1"],
+    sourceVersions: [
+      { entityType: "source", id: "source-1", version: 1 },
+      { entityType: "dataset", id: "dataset-1", version: 1 },
+      { entityType: "evidence", id: "evidence-2", version: 1 },
+      { entityType: "evidence", id: "evidence-1", version: 1 },
+      { entityType: "analysis_graph", id: "graph-1", version: 1 },
+      { entityType: "competitor_diff", id: "diff-1", version: 1 },
+      { entityType: "task", id: "task-1", version: 1 },
+    ],
+    ...overrides,
   });
 }
 
@@ -658,6 +724,131 @@ describe("transactional SQLite storage", () => {
       };
       expect(Object.hasOwn(payload.metadata, "__proto__")).toBe(true);
       expect(payload.metadata["__proto__"]).toEqual({ preserved: true });
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("upgrades a populated v3 database without changing legacy Recommendation or Task records", async () => {
+    const legacyRecommendation = {
+      id: "legacy-recommendation",
+      workspaceId: "ws-1",
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+      findingIds: [],
+      hypothesis: "Legacy hypothesis",
+      affectedStage: "legacy-stage",
+      priority: "legacy-priority",
+      expectedMetric: "legacy-metric",
+    };
+    const legacyTask = {
+      id: "legacy-task",
+      workspaceId: "ws-1",
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+      recommendationIds: [],
+      assignee: "legacy-owner",
+      dependencyIds: [],
+      assetRequirements: [],
+      acceptanceCriteria: ["Legacy acceptance"],
+      state: "completed",
+    };
+    const raw = new DatabaseSync(databasePath);
+    try {
+      raw.exec("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE");
+      for (const migration of ["001_initial.sql", "002_data_research.sql", "003_analysis_graphs.sql"]) {
+        raw.exec(readFileSync(fileURLToPath(new URL(`../../migrations/${migration}`, import.meta.url)), "utf8"));
+      }
+      raw.prepare(
+        "INSERT INTO workspaces (id, workspace_id, version, created_at, updated_at, payload) VALUES (?, ?, 1, ?, ?, ?)",
+      ).run("ws-1", "ws-1", now, now, canonicalJson(entity("ws-1")));
+      raw.prepare(
+        "INSERT INTO recommendations (id, workspace_id, version, created_at, updated_at, payload) VALUES (?, ?, 1, ?, ?, ?)",
+      ).run(legacyRecommendation.id, "ws-1", now, now, canonicalJson(legacyRecommendation));
+      raw.prepare(
+        "INSERT INTO tasks (id, workspace_id, version, created_at, updated_at, payload) VALUES (?, ?, 1, ?, ?, ?)",
+      ).run(legacyTask.id, "ws-1", now, now, canonicalJson(legacyTask));
+      raw.exec("COMMIT");
+    } finally {
+      raw.close();
+    }
+
+    const store = open();
+    expect(await store.transaction((repos) => repos.recommendations.get("legacy-recommendation", "ws-1"))).toEqual(legacyRecommendation);
+    expect(await store.transaction((repos) => repos.tasks.get("legacy-task", "ws-1"))).toEqual(legacyTask);
+
+    const migrated = new DatabaseSync(databasePath);
+    try {
+      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 4 });
+      expect(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'dashboards'").get()).toEqual({ name: "dashboards" });
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it("persists Dashboard references in order, enforces workspace foreign keys, and rejects stale updates", async () => {
+    const store = open();
+    await store.transaction(async (repos) => {
+      await repos.workspaces.insert(entity("ws-1"));
+      await repos.workspaces.insert(entity("ws-2"));
+      await repos.sources.insert(entity("source-1", "ws-1"));
+      await repos.sources.insert(entity("source-other", "ws-2"));
+      await repos.datasets.insert({ ...entity("dataset-1", "ws-1"), sourceId: "source-1" });
+      await repos.datasets.insert({ ...entity("dataset-other", "ws-2"), sourceId: "source-other" });
+      await repos.evidence.insert({ ...entity("evidence-1", "ws-1"), sourceId: "source-1" });
+      await repos.evidence.insert({ ...entity("evidence-2", "ws-1"), sourceId: "source-1" });
+      await repos.evidence.insert({ ...entity("evidence-other", "ws-2"), sourceId: "source-other" });
+      await repos.analysisGraphs.insert(analysisGraph());
+      await repos.analysisGraphs.insert(createAnalysisGraph({ id: "graph-other", workspaceId: "ws-2", createdAt: now }));
+      await repos.competitorDiffs.insert(entity("diff-1", "ws-1"));
+      await repos.competitorDiffs.insert(entity("diff-other", "ws-2"));
+      await repos.tasks.insert(entity("task-1", "ws-1"));
+      await repos.tasks.insert(entity("task-other", "ws-2"));
+      await repos.dashboards.insert(dashboardRecord());
+    });
+
+    const crossWorkspaceReferences = [
+      ["sourceIds", "source", "source-other"],
+      ["datasetIds", "dataset", "dataset-other"],
+      ["evidenceIds", "evidence", "evidence-other"],
+      ["graphIds", "analysis_graph", "graph-other"],
+      ["competitorDiffIds", "competitor_diff", "diff-other"],
+      ["taskIds", "task", "task-other"],
+    ] as const;
+    for (const [field, entityType, otherId] of crossWorkspaceReferences) {
+      const candidate = dashboardRecord();
+      await expect(store.transaction((repos) => repos.dashboards.insert(dashboardRecord({
+        id: `cross-${field}`,
+        [field]: [otherId],
+        sourceVersions: candidate.sourceVersions.map((reference) =>
+          reference.entityType === entityType ? { ...reference, id: otherId } : reference
+        ),
+      })))).rejects.toThrow();
+    }
+
+    await store.transaction((repos) => repos.dashboards.update(dashboardRecord(), 1));
+    await expect(
+      store.transaction((repos) => repos.dashboards.update(dashboardRecord(), 1)),
+    ).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    store.close();
+
+    const reopened = open();
+    expect(await reopened.transaction((repos) => repos.dashboards.get("dashboard-1", "ws-1"))).toMatchObject({
+      ...dashboardRecord(),
+      version: 2,
+    });
+    expect(await reopened.transaction((repos) => repos.dashboards.get("dashboard-1", "ws-2"))).toBeUndefined();
+    const raw = new DatabaseSync(databasePath);
+    try {
+      expect(raw.prepare(
+        "SELECT evidence_id, position FROM dashboard_evidence WHERE dashboard_id = ? ORDER BY position",
+      ).all("dashboard-1")).toEqual([
+        { evidence_id: "evidence-2", position: 0 },
+        { evidence_id: "evidence-1", position: 1 },
+      ]);
+      expect(raw.prepare("SELECT COUNT(*) AS count FROM dashboards WHERE id LIKE 'cross-%'").get()).toEqual({ count: 0 });
     } finally {
       raw.close();
     }

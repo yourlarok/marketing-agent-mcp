@@ -75,6 +75,7 @@ const lineageEntityTypes: Record<LineageEntityType, keyof Repositories> = {
   competitor: "competitors",
   competitor_diff: "competitorDiffs",
   analysis_graph: "analysisGraphs",
+  dashboard: "dashboards",
 };
 
 function lineageReferences(record: EntityRecord, entityType: LineageEntityType): EntityRef[] {
@@ -124,6 +125,14 @@ function lineageReferences(record: EntityRecord, entityType: LineageEntityType):
     research_session: [["evidenceIds", "evidence"]],
     competitor: [["evidenceIds", "evidence"]],
     competitor_diff: [["findingIds", "finding"]],
+    dashboard: [
+      ["sourceIds", "source"],
+      ["datasetIds", "dataset"],
+      ["evidenceIds", "evidence"],
+      ["graphIds", "analysis_graph"],
+      ["competitorDiffIds", "competitor_diff"],
+      ["taskIds", "task"],
+    ],
   } as const;
   const references: EntityRef[] = [];
   for (const [key, referencedType] of reference[entityType]) {

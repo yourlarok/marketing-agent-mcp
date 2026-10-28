@@ -1,4 +1,10 @@
 import type { EntityRecord, JsonValue } from "../application/ports.js";
+import type {
+  AnalysisNodeRef,
+  RecommendationExpectedMetric,
+  RecommendationImpact,
+  StrategyPriority,
+} from "./strategy-model.js";
 
 export interface Workspace extends EntityRecord {
   name: string;
@@ -90,6 +96,11 @@ export interface Recommendation extends EntityRecord {
   affectedStage: string;
   priority: string;
   expectedMetric: string;
+  evidenceIds?: string[];
+  targetChannels?: string[];
+  analysisNodeRefs?: AnalysisNodeRef[];
+  expectedMetrics?: RecommendationExpectedMetric[];
+  impacts?: RecommendationImpact[];
 }
 
 export const TASK_STATES = [
@@ -98,6 +109,7 @@ export const TASK_STATES = [
   "in_progress",
   "blocked",
   "completed",
+  "rejected",
 ] as const;
 export type TaskState = (typeof TASK_STATES)[number];
 
@@ -108,6 +120,10 @@ export interface Task extends EntityRecord {
   assetRequirements: string[];
   acceptanceCriteria: string[];
   state: TaskState;
+  title?: string;
+  priority?: StrategyPriority;
+  rank?: number;
+  rejectionReason?: string;
 }
 
 export const CAPABILITY_ADAPTER_KINDS = [

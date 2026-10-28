@@ -16,6 +16,10 @@ const migrations = [
     version: 3,
     path: fileURLToPath(new URL("../../migrations/003_analysis_graphs.sql", import.meta.url)),
   },
+  {
+    version: 4,
+    path: fileURLToPath(new URL("../../migrations/004_dashboard_strategy.sql", import.meta.url)),
+  },
 ] as const;
 
 export interface AnalysisGraphReferenceIds {

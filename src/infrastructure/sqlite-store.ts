@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DomainError } from "../domain/errors.js";
 import { validateAnalysisGraph, type AnalysisGraph } from "../domain/analysis-model.js";
+import { validateDashboard, type Dashboard } from "../domain/dashboard-model.js";
 import type {
   AnalysisGraphRepository,
   AuditRecord,
@@ -184,6 +185,47 @@ const entityConfigs: Record<string, EntityConfig> = {
       },
     ],
   },
+  dashboards: {
+    table: "dashboards",
+    references: [
+      {
+        table: "dashboard_sources",
+        ownerColumn: "dashboard_id",
+        targetColumn: "source_id",
+        recordKey: "sourceIds",
+      },
+      {
+        table: "dashboard_datasets",
+        ownerColumn: "dashboard_id",
+        targetColumn: "dataset_id",
+        recordKey: "datasetIds",
+      },
+      {
+        table: "dashboard_evidence",
+        ownerColumn: "dashboard_id",
+        targetColumn: "evidence_id",
+        recordKey: "evidenceIds",
+      },
+      {
+        table: "dashboard_analysis_graphs",
+        ownerColumn: "dashboard_id",
+        targetColumn: "graph_id",
+        recordKey: "graphIds",
+      },
+      {
+        table: "dashboard_competitor_diffs",
+        ownerColumn: "dashboard_id",
+        targetColumn: "diff_id",
+        recordKey: "competitorDiffIds",
+      },
+      {
+        table: "dashboard_tasks",
+        ownerColumn: "dashboard_id",
+        targetColumn: "task_id",
+        recordKey: "taskIds",
+      },
+    ],
+  },
 };
 
 function assertId(value: string, name: string): void {
@@ -354,6 +396,18 @@ class SqliteAnalysisGraphRepository extends SqliteEntityRepository {
       return analysisGraphReferenceIds(record as unknown as AnalysisGraph)[recordKey];
     }
     return super.referenceIds(record, recordKey);
+  }
+}
+
+class SqliteDashboardRepository extends SqliteEntityRepository {
+  override async insert(record: EntityRecord): Promise<EntityRecord> {
+    validateDashboard(record as unknown as Dashboard);
+    return super.insert(record);
+  }
+
+  override async update(record: EntityRecord, expectedVersion: number): Promise<EntityRecord> {
+    validateDashboard(record as unknown as Dashboard);
+    return super.update(record, expectedVersion);
   }
 }
 
@@ -589,7 +643,9 @@ class SqliteStore implements Store {
         ? new SqliteTaskRepository(this.database, entityConfigs[name]!)
         : name === "analysisGraphs"
           ? new SqliteAnalysisGraphRepository(this.database, entityConfigs[name]!)
-          : new SqliteEntityRepository(this.database, entityConfigs[name]!)) as unknown as EntityRepository<T>;
+          : name === "dashboards"
+            ? new SqliteDashboardRepository(this.database, entityConfigs[name]!)
+            : new SqliteEntityRepository(this.database, entityConfigs[name]!)) as unknown as EntityRepository<T>;
     return {
       workspaces: repository("workspaces"),
       sources: repository("sources"),
@@ -604,6 +660,7 @@ class SqliteStore implements Store {
       competitors: repository("competitors"),
       competitorDiffs: repository("competitorDiffs"),
       analysisGraphs: repository("analysisGraphs") as unknown as AnalysisGraphRepository,
+      dashboards: repository("dashboards"),
       capabilities: new SqliteCapabilityRepository(
         this.database,
         entityConfigs.capabilities!,

@@ -6,6 +6,7 @@ import type {
   ResearchSession,
 } from "../domain/data-research-model.js";
 import type { AnalysisGraph } from "../domain/analysis-model.js";
+import type { Dashboard } from "../domain/dashboard-model.js";
 
 export type Id = string;
 export type Instant = string;
@@ -67,7 +68,8 @@ export type LineageEntityType =
   | "research_session"
   | "competitor"
   | "competitor_diff"
-  | "analysis_graph";
+  | "analysis_graph"
+  | "dashboard";
 
 export interface EntityRef {
   entityType: LineageEntityType;
@@ -127,6 +129,7 @@ export interface Repositories {
   competitors: EntityRepository<Competitor>;
   competitorDiffs: EntityRepository<CompetitorDiff>;
   analysisGraphs: AnalysisGraphRepository;
+  dashboards: EntityRepository<Dashboard>;
   capabilities: CapabilityRepository;
   audit: AuditRepository;
   idempotency: IdempotencyRepository;

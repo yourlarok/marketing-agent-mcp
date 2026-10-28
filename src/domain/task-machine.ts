@@ -2,11 +2,12 @@ import { DomainError } from "./errors.js";
 import { TASK_STATES, type TaskState } from "./model.js";
 
 const transitions: Readonly<Record<TaskState, readonly TaskState[]>> = {
-  draft: ["ready"],
-  ready: ["in_progress"],
-  in_progress: ["blocked", "completed"],
-  blocked: ["ready"],
+  draft: ["ready", "rejected"],
+  ready: ["in_progress", "rejected"],
+  in_progress: ["blocked", "completed", "rejected"],
+  blocked: ["ready", "rejected"],
   completed: [],
+  rejected: [],
 };
 
 export function assertTaskTransition(current: TaskState, next: TaskState): void {

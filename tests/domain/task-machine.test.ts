@@ -12,14 +12,19 @@ const states: TaskState[] = [
   "in_progress",
   "blocked",
   "completed",
+  "rejected",
 ];
 
 const legalTransitions = [
   ["draft", "ready"],
+  ["draft", "rejected"],
   ["ready", "in_progress"],
+  ["ready", "rejected"],
   ["in_progress", "blocked"],
   ["in_progress", "completed"],
+  ["in_progress", "rejected"],
   ["blocked", "ready"],
+  ["blocked", "rejected"],
 ] as const;
 
 describe("task state machine", () => {
