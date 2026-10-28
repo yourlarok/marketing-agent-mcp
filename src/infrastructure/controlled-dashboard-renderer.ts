@@ -489,7 +489,7 @@ function buildTask(snapshot: DashboardSnapshot, input: ViewInput< "task_effect">
         reasons.push(reason("TASK_STRATEGY_METADATA_MISSING"));
         continue;
       }
-      for (const expected of recommendation.expectedMetrics) {
+      for (const [expectedMetricIndex, expected] of recommendation.expectedMetrics.entries()) {
         const baselineNodeId = expectedBaseline(graphRecord, expected);
         if (!baselineNodeId || !graphRecord.nodes.some((candidate) => candidate.id === baselineNodeId && candidate.kind === "metric")) {
           reasons.push(reason("RECOMMENDATION_METRIC_NOT_LINKED"));
@@ -531,7 +531,7 @@ function buildTask(snapshot: DashboardSnapshot, input: ViewInput< "task_effect">
         const formula = text(payload.formula, "Monitor formula");
         metrics.push({ metricId: expected.metricId, definitionVersion, formula });
         data.push({
-          ...datumBase(snapshot, `${task.id}/${monitor.id}`, usable ? "ok" : "unknown", datumReasons, refs, [graphRef(graphRecord, monitor), graphRef(graphRecord, baselineNode)]),
+          ...datumBase(snapshot, `${task.id}/${recommendation.id}/${expectedMetricIndex}/${monitor.id}`, usable ? "ok" : "unknown", datumReasons, refs, [graphRef(graphRecord, monitor), graphRef(graphRecord, baselineNode)]),
           kind: "task_observation",
           taskId: task.id,
           monitorNodeId: monitor.id,

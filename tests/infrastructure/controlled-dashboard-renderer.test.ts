@@ -356,6 +356,40 @@ describe("ControlledDashboardRenderer", () => {
     });
   });
 
+  it("keeps shared-Monitor Recommendation observations uniquely addressable", () => {
+    const input = snapshot();
+    input.tasks[0]!.recommendationIds = ["recommendation-1", "recommendation-2"];
+    input.recommendations.push({ ...input.recommendations[0]!, id: "recommendation-2" });
+    input.views = [{
+      id: "task-view",
+      kind: "task_effect",
+      graphId: "graph-1",
+      taskIds: ["task-1"],
+      monitorNodeIds: ["monitor-1"],
+    }];
+
+    const first = render(input);
+    const second = render(input);
+    const data = first.manifestModel.views[0]!.data;
+    const datumIds = data.map((datum) => datum.datumId);
+    expect(datumIds).toEqual([
+      "task-1/recommendation-1/0/monitor-1",
+      "task-1/recommendation-2/0/monitor-1",
+    ]);
+    expect(new Set(datumIds).size).toBe(2);
+    expect(first.manifest).toEqual(second.manifest);
+    const html = new TextDecoder().decode(first.html);
+    for (const datum of data) {
+      const anchor = `drill-task-view-${datum.datumId}`;
+      expect(html.split(`id="${anchor}"`)).toHaveLength(2);
+      expect(html.split(`href="#${anchor}"`)).toHaveLength(2);
+      expect(datum.analysisGraphRefs).toEqual([
+        { graphId: "graph-1", graphVersion: 7, nodeId: "monitor-1", kind: "monitor" },
+        { graphId: "graph-1", graphVersion: 7, nodeId: "metric-ok", kind: "metric" },
+      ]);
+    }
+  });
+
   it("keeps unlinked and incomplete tasks explicitly unverifiable", () => {
     const input = snapshot();
     input.views = [{

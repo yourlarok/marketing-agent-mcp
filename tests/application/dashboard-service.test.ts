@@ -298,6 +298,51 @@ describe("DashboardService", () => {
       .rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 
+  it("drills each Recommendation observation independently when they share a Monitor", async () => {
+    await store.transaction(async (repos) => {
+      const recommendation = (await repos.recommendations.get("recommendation-1", "workspace-1"))!;
+      await repos.recommendations.insert({ ...recommendation, id: "recommendation-2" });
+      const task = (await repos.tasks.get("task-1", "workspace-1"))!;
+      await repos.tasks.update({
+        ...task,
+        recommendationIds: ["recommendation-1", "recommendation-2"],
+      }, 1);
+    });
+    const dashboard = await service.render({
+      input: input({ views: [input().views[4]!] }),
+      context: context("shared-monitor"),
+    });
+    const manifestDescriptor = dashboard.artifacts.find((artifact) => artifact.kind === "manifest")!;
+    const manifest = JSON.parse((await artifacts.read(manifestDescriptor.contentHash)).toString("utf8"));
+    const data = manifest.views[0].data as { datumId: string }[];
+    const datumIds = data.map((datum) => datum.datumId);
+    expect(datumIds).toEqual([
+      "task-1/recommendation-1/0/monitor-1",
+      "task-1/recommendation-2/0/monitor-1",
+    ]);
+    expect(new Set(datumIds).size).toBe(2);
+
+    const htmlDescriptor = dashboard.artifacts.find((artifact) => artifact.kind === "html")!;
+    const html = (await artifacts.read(htmlDescriptor.contentHash)).toString("utf8");
+    for (const datumId of datumIds) {
+      const anchor = `drill-task-view-${datumId}`;
+      expect(html.split(`id="${anchor}"`)).toHaveLength(2);
+      expect(html.split(`href="#${anchor}"`)).toHaveLength(2);
+      const drilldown = await service.getDrilldown({
+        id: dashboard.id,
+        workspaceId: dashboard.workspaceId,
+        viewId: "task-view",
+        datumId,
+      });
+      expect(drilldown.datumId).toBe(datumId);
+      expect(drilldown.analysisGraphRefs).toEqual([
+        { graphId: "graph-1", graphVersion: 1, nodeId: "monitor-1", kind: "monitor" },
+        { graphId: "graph-1", graphVersion: 1, nodeId: "metric-1", kind: "metric" },
+      ]);
+      expect(drilldown.evidence.map((item) => item.evidenceId)).toEqual(["evidence-1"]);
+    }
+  });
+
   it("detects a tampered manifest before returning drilldown data", async () => {
     const dashboard = await service.render({ input: input(), context: context("tamper") });
     const manifest = dashboard.artifacts.find((artifact) => artifact.kind === "manifest")!;
