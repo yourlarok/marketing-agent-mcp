@@ -262,6 +262,7 @@ export const lineageGetInputSchema = z.strictObject({
     "finding",
     "recommendation",
     "task",
+    "dashboard",
   ]),
   id: idSchema,
   workspaceId: idSchema,
@@ -620,6 +621,162 @@ export const metricMonitorCompareInputSchema = z.strictObject({
   ...commandContextInput,
 });
 
+const dashboardNodeViewSchema = (kind: "trend" | "structure" | "funnel") => z.strictObject({
+  id: idSchema,
+  kind: z.literal(kind),
+  graphId: idSchema,
+  nodeIds: uniqueIdsSchema.min(1),
+});
+const dashboardViewInputSchema = z.discriminatedUnion("kind", [
+  dashboardNodeViewSchema("trend"),
+  dashboardNodeViewSchema("structure"),
+  dashboardNodeViewSchema("funnel"),
+  z.strictObject({
+    id: idSchema,
+    kind: z.literal("competitor_comparison"),
+    competitorDiffId: idSchema,
+  }),
+  z.strictObject({
+    id: idSchema,
+    kind: z.literal("task_effect"),
+    graphId: idSchema,
+    taskIds: uniqueIdsSchema,
+    monitorNodeIds: uniqueIdsSchema.min(1),
+  }),
+]);
+export const dashboardRenderInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema.optional(),
+  views: z.array(dashboardViewInputSchema).min(1).max(5).refine((views) =>
+    new Set(views.map((view) => view.id)).size === views.length &&
+    new Set(views.map((view) => view.kind)).size === views.length, {
+    message: "Dashboard view IDs and kinds must not contain duplicates",
+  }),
+  ...commandContextInput,
+});
+export const dashboardGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+});
+export const dashboardDrilldownGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  viewId: idSchema,
+  datumId: idSchema,
+});
+export const dashboardArtifactGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  artifactId: idSchema,
+  offset: nonNegativeIntegerSchema.optional(),
+  length: positiveIntegerSchema.max(32 * 1024).optional(),
+});
+
+const strategyPrioritySchema = z.enum(["p0", "p1", "p2", "p3"]);
+const strategyMetricIdSchema = z.enum([
+  "ctr_v1",
+  "save_like_ratio_v1",
+  "engagement_rate_v1",
+  "conversion_rate_v1",
+]);
+const strategyExpectedMetricSchema = z.discriminatedUnion("acceptance", [
+  z.strictObject({
+    metricId: strategyMetricIdSchema,
+    acceptance: z.literal("reach_scenario_target"),
+    baselineMetricNodeId: idSchema,
+    scenarioNodeId: idSchema,
+  }),
+  z.strictObject({
+    metricId: strategyMetricIdSchema,
+    acceptance: z.literal("establish_baseline"),
+  }),
+]);
+const strategyExpectedMetricsSchema = z.array(strategyExpectedMetricSchema).min(1)
+  .max(MAX_COLLECTION_ENTRIES).refine((metrics) =>
+    new Set(metrics.map((metric) => metric.metricId)).size === metrics.length, {
+    message: "Expected metric IDs must not contain duplicates",
+  });
+const strategyChannelsSchema = textListSchema.min(1).refine((channels) =>
+  new Set(channels).size === channels.length, {
+  message: "Target channels must not contain duplicates",
+});
+export const strategyRecommendationGenerateInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  findingIds: uniqueIdsSchema.min(1),
+  hypothesis: z.string().trim().min(1).max(8_192),
+  affectedStage: z.enum(["impression", "click", "engagement", "lead", "trial", "purchase", "retention"]),
+  targetChannels: strategyChannelsSchema,
+  priority: strategyPrioritySchema,
+  expectedMetrics: strategyExpectedMetricsSchema,
+  analysisGraphId: idSchema.optional(),
+  analysisNodeIds: uniqueIdsSchema.optional(),
+  ...commandContextInput,
+});
+export const strategyTaskSupplementInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  recommendationIds: uniqueIdsSchema.min(1),
+  title: z.string().trim().min(1).max(8_192),
+  assignee: z.string().trim().min(1).max(1_024),
+  priority: strategyPrioritySchema,
+  rank: positiveIntegerSchema,
+  dependencyIds: uniqueIdsSchema,
+  assetRequirements: textListSchema,
+  acceptanceCriteria: textListSchema.min(1),
+  ...commandContextInput,
+});
+export const strategyTaskUpdateInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  recommendationIds: uniqueIdsSchema.min(1).optional(),
+  title: z.string().trim().min(1).max(8_192).optional(),
+  assignee: z.string().trim().min(1).max(1_024).optional(),
+  priority: strategyPrioritySchema.optional(),
+  dependencyIds: uniqueIdsSchema.optional(),
+  assetRequirements: textListSchema.optional(),
+  acceptanceCriteria: textListSchema.min(1).optional(),
+  ...commandContextInput,
+}).refine((input) => [
+  input.recommendationIds,
+  input.title,
+  input.assignee,
+  input.priority,
+  input.dependencyIds,
+  input.assetRequirements,
+  input.acceptanceCriteria,
+].some((value) => value !== undefined), {
+  message: "At least one mutable Task field is required",
+});
+export const strategyTaskRejectInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  reason: z.string().trim().min(1).max(8_192),
+  ...commandContextInput,
+});
+export const strategyTaskReorderInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  rank: positiveIntegerSchema,
+  ...commandContextInput,
+});
+export const strategyTaskGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+});
+export const strategyTaskListInputSchema = z.strictObject({
+  workspaceId: idSchema,
+  limit: positiveIntegerSchema.max(20).optional(),
+  cursor: z.strictObject({
+    rank: positiveIntegerSchema.nullable(),
+    id: idSchema,
+  }).optional(),
+});
+
 const rawStringSchema = z.string();
 const rawNumberSchema = z.number();
 const rawCommandContextInput = {
@@ -752,6 +909,132 @@ export const metricMonitorCompareToolSchema = z.strictObject({
   comparability: rawStringSchema.optional(),
   ...rawCommandContextInput,
 });
+
+const rawDashboardNodeViewSchema = (kind: "trend" | "structure" | "funnel") => z.strictObject({
+  id: rawStringSchema,
+  kind: z.literal(kind),
+  graphId: rawStringSchema,
+  nodeIds: z.array(rawStringSchema),
+});
+const rawDashboardViewSchema = z.discriminatedUnion("kind", [
+  rawDashboardNodeViewSchema("trend"),
+  rawDashboardNodeViewSchema("structure"),
+  rawDashboardNodeViewSchema("funnel"),
+  z.strictObject({
+    id: rawStringSchema,
+    kind: z.literal("competitor_comparison"),
+    competitorDiffId: rawStringSchema,
+  }),
+  z.strictObject({
+    id: rawStringSchema,
+    kind: z.literal("task_effect"),
+    graphId: rawStringSchema,
+    taskIds: z.array(rawStringSchema),
+    monitorNodeIds: z.array(rawStringSchema),
+  }),
+]);
+export const dashboardRenderToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema.optional(),
+  views: z.array(rawDashboardViewSchema),
+  ...rawCommandContextInput,
+});
+export const dashboardGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+});
+export const dashboardDrilldownGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  viewId: rawStringSchema,
+  datumId: rawStringSchema,
+});
+export const dashboardArtifactGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  artifactId: rawStringSchema,
+  offset: rawNumberSchema.optional(),
+  length: rawNumberSchema.optional(),
+});
+const rawStrategyExpectedMetricSchema = z.discriminatedUnion("acceptance", [
+  z.strictObject({
+    metricId: rawStringSchema,
+    acceptance: z.literal("reach_scenario_target"),
+    baselineMetricNodeId: rawStringSchema,
+    scenarioNodeId: rawStringSchema,
+  }),
+  z.strictObject({
+    metricId: rawStringSchema,
+    acceptance: z.literal("establish_baseline"),
+  }),
+]);
+export const strategyRecommendationGenerateToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  findingIds: z.array(rawStringSchema),
+  hypothesis: rawStringSchema,
+  affectedStage: rawStringSchema,
+  targetChannels: z.array(rawStringSchema),
+  priority: rawStringSchema,
+  expectedMetrics: z.array(rawStrategyExpectedMetricSchema),
+  analysisGraphId: rawStringSchema.optional(),
+  analysisNodeIds: z.array(rawStringSchema).optional(),
+  ...rawCommandContextInput,
+});
+export const strategyTaskSupplementToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  recommendationIds: z.array(rawStringSchema),
+  title: rawStringSchema,
+  assignee: rawStringSchema,
+  priority: rawStringSchema,
+  rank: rawNumberSchema,
+  dependencyIds: z.array(rawStringSchema),
+  assetRequirements: z.array(rawStringSchema),
+  acceptanceCriteria: z.array(rawStringSchema),
+  ...rawCommandContextInput,
+});
+export const strategyTaskUpdateToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  recommendationIds: z.array(rawStringSchema).optional(),
+  title: rawStringSchema.optional(),
+  assignee: rawStringSchema.optional(),
+  priority: rawStringSchema.optional(),
+  dependencyIds: z.array(rawStringSchema).optional(),
+  assetRequirements: z.array(rawStringSchema).optional(),
+  acceptanceCriteria: z.array(rawStringSchema).optional(),
+  ...rawCommandContextInput,
+});
+export const strategyTaskRejectToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  reason: rawStringSchema,
+  ...rawCommandContextInput,
+});
+export const strategyTaskReorderToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  rank: rawNumberSchema,
+  ...rawCommandContextInput,
+});
+export const strategyTaskGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+});
+export const strategyTaskListToolSchema = z.strictObject({
+  workspaceId: rawStringSchema,
+  limit: rawNumberSchema.optional(),
+  cursor: z.strictObject({
+    rank: rawNumberSchema.nullable(),
+    id: rawStringSchema,
+  }).optional(),
+});
+
 const rawFreshnessSchema = z.strictObject({
   observedAt: rawStringSchema.optional(),
   evaluatedAt: rawStringSchema.optional(),

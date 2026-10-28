@@ -1379,6 +1379,8 @@ function capability(
 export interface AnalysisCapabilityConfiguration {
   sqliteConfigured?: boolean;
   professionalAnalyticsConfigured?: boolean;
+  dashboardRendererConfigured?: boolean;
+  strategyConfigured?: boolean;
 }
 
 export class AnalysisCapabilityService {
@@ -1547,6 +1549,55 @@ export class AnalysisCapabilityService {
         },
         fallback: ["metric_compute for supported controlled metrics"],
         limitations: ["Statistical output does not establish causality or future outcomes.", "No dynamic provider command, environment, code, or arbitrary rows are accepted through this tool."],
+      }),
+      capability({
+        id: "dashboard.controlled_renderer",
+        operation: "dashboard_render / dashboard_get / dashboard_drilldown_get / dashboard_artifact_get",
+        description: "Render and read controlled HTML/SVG dashboards from persisted evidence and source versions.",
+        requiredInputs: ["id", "workspaceId", "views", "actor", "requestId", "idempotencyKey"],
+        configuration: [
+          "controlled_html_svg_v1; no professional BI installation is required",
+          "One to five unique views and at most 500 data descriptors per view",
+          "1 MiB maximum per HTML or manifest artifact",
+          "32 KiB maximum base64-decoded artifact read chunk; 64 KiB maximum serialized MCP output",
+        ],
+        availability: this.configuration.dashboardRendererConfigured ? {
+          state: "available",
+          detail: "The controlled renderer and ArtifactStore are installed independently of professional analytics or Power BI.",
+        } : {
+          state: "unavailable",
+          detail: "DashboardService with its controlled renderer and ArtifactStore is not installed.",
+        },
+        fallback: ["analysis_graph_get for persisted graph results without rendering"],
+        limitations: [
+          "Controlled HTML/SVG is not Power BI and is not a professional BI verification.",
+          "At most 500 data descriptors are returned per view; artifact reads are chunked rather than returned whole.",
+          "Rendering persists evidence references but does not acquire new evidence or establish causality.",
+        ],
+      }),
+      capability({
+        id: "strategy.tasks",
+        operation: "strategy_recommendation_generate / strategy_task_supplement / strategy_task_update / strategy_task_reject / strategy_task_reorder / strategy_task_get / strategy_task_list",
+        description: "Generate evidence-bound recommendations and manage user-controlled draft tasks with audited commands.",
+        requiredInputs: ["workspaceId", "actor", "requestId", "idempotencyKey"],
+        configuration: [
+          "Positive expectedVersion for mutations and positive integer ranks",
+          "Task list limit defaults to 20 and is capped at 20 with deterministic cursor pagination",
+          "64 KiB maximum serialized MCP input and output",
+        ],
+        availability: this.configuration.strategyConfigured ? {
+          state: "available",
+          detail: "StrategyService is installed with the shared auditable Store, Clock, and IdGenerator.",
+        } : {
+          state: "unavailable",
+          detail: "StrategyService is not installed; no recommendation or task commands are registered.",
+        },
+        fallback: ["recommendation_create and task_create only for their narrower legacy contracts"],
+        limitations: [
+          "Tasks are user-controlled drafts; the service never automatically produces, approves, schedules, or publishes material.",
+          "Recommendations do not guarantee outcomes or establish causality.",
+          "Reads are workspace scoped and do not require write context; every mutation is auditable and idempotent.",
+        ],
       }),
       capability({
         id: "connectors.live",

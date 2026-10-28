@@ -6,8 +6,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AnalysisService } from "../../src/application/analysis-service.js";
 import type { CommandContext } from "../../src/application/commands.js";
+import { DashboardService } from "../../src/application/dashboard-service.js";
 import { DataResearchService } from "../../src/application/data-research-service.js";
 import { MarketingService } from "../../src/application/marketing-service.js";
+import { StrategyService } from "../../src/application/strategy-service.js";
 import type { Store } from "../../src/application/ports.js";
 import type { AnalysisGraph } from "../../src/domain/analysis-model.js";
 import type { IngestionBatch } from "../../src/domain/data-research-model.js";
@@ -55,6 +57,10 @@ const analysisToolNames = [
   "analysis_graph_fork",
   "analysis_graph_get",
   "connector_sqlite_discover",
+  "dashboard_artifact_get",
+  "dashboard_drilldown_get",
+  "dashboard_get",
+  "dashboard_render",
   "ingest_sqlite",
   "marketing_analysis_start",
   "marketing_capability_list",
@@ -62,16 +68,29 @@ const analysisToolNames = [
   "metric_monitor_compare",
   "metric_scenario_create",
   "professional_analytics_compute",
+  "strategy_recommendation_generate",
+  "strategy_task_get",
+  "strategy_task_list",
+  "strategy_task_reject",
+  "strategy_task_reorder",
+  "strategy_task_supplement",
+  "strategy_task_update",
 ];
 const writeToolNames = [
   "analysis_graph_expand",
   "analysis_graph_fork",
+  "dashboard_render",
   "ingest_sqlite",
   "marketing_analysis_start",
   "metric_compute",
   "metric_monitor_compare",
   "metric_scenario_create",
   "professional_analytics_compute",
+  "strategy_recommendation_generate",
+  "strategy_task_reject",
+  "strategy_task_reorder",
+  "strategy_task_supplement",
+  "strategy_task_update",
 ];
 
 function context(suffix: string): CommandContext {
@@ -126,11 +145,13 @@ describe("analysis MCP tools and initialization", () => {
       },
     );
     const analysis = new AnalysisService(store, clock, ids, artifacts);
+    const dashboard = new DashboardService(store, clock, ids, artifacts);
+    const strategy = new StrategyService(store, clock, ids);
     await marketing.createWorkspace({
       input: { id: "workspace-1", name: "Analysis" },
       context: context("setup-workspace"),
     });
-    server = createMcpServer(marketing, dataResearch, analysis);
+    server = createMcpServer(marketing, dataResearch, analysis, {}, dashboard, strategy);
     client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
@@ -179,7 +200,7 @@ describe("analysis MCP tools and initialization", () => {
     expect(tools.map((tool) => tool.name).sort()).toEqual(
       [...priorToolNames, ...analysisToolNames].sort(),
     );
-    expect(tools).toHaveLength(35);
+    expect(tools).toHaveLength(46);
     for (const tool of tools) {
       expect(tool.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
     }

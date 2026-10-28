@@ -77,6 +77,10 @@ describe("built stdio server acceptance", () => {
       "competitor_confirm",
       "competitor_diff_create",
       "connector_sqlite_discover",
+      "dashboard_artifact_get",
+      "dashboard_drilldown_get",
+      "dashboard_get",
+      "dashboard_render",
       "data_request_decline",
       "data_request_plan",
       "data_research_get",
@@ -100,6 +104,13 @@ describe("built stdio server acceptance", () => {
       "research_session_create",
       "research_session_run",
       "source_register",
+      "strategy_recommendation_generate",
+      "strategy_task_get",
+      "strategy_task_list",
+      "strategy_task_reject",
+      "strategy_task_reorder",
+      "strategy_task_supplement",
+      "strategy_task_update",
       "task_create",
       "task_transition",
       "workspace_create",
@@ -374,7 +385,7 @@ describe("built stdio server acceptance", () => {
     expect(malformed).toMatchObject({ isError: true });
     expect(JSON.stringify(malformed)).toContain("Input validation error");
     expect(JSON.stringify(malformed)).not.toContain("stack");
-    expect((await client.listTools()).tools).toHaveLength(35);
+    expect((await client.listTools()).tools).toHaveLength(46);
 
     await firstProcess.client.close();
     clients.splice(clients.indexOf(firstProcess.client), 1);

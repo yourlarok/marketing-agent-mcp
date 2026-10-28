@@ -1,8 +1,10 @@
 import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { AnalysisService } from "./application/analysis-service.js";
+import { DashboardService } from "./application/dashboard-service.js";
 import { DataResearchService } from "./application/data-research-service.js";
 import { MarketingService } from "./application/marketing-service.js";
+import { StrategyService } from "./application/strategy-service.js";
 import { loadConfig } from "./config.js";
 import { ArtifactStore } from "./infrastructure/artifact-store.js";
 import { McpAnalyticsProvider } from "./infrastructure/analytics-provider.js";
@@ -41,7 +43,16 @@ async function run(): Promise<void> {
         args: config.analyticsMcp.args,
       }) : undefined,
     );
-    const server = createMcpServer(service, dataResearch, analysis);
+    const dashboard = new DashboardService(store, clock, ids, artifacts);
+    const strategy = new StrategyService(store, clock, ids);
+    const server = createMcpServer(
+      service,
+      dataResearch,
+      analysis,
+      {},
+      dashboard,
+      strategy,
+    );
     const transport = new StdioServerTransport();
     let shutdown: Promise<void> | undefined;
 
