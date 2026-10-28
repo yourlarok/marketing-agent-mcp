@@ -36,9 +36,11 @@ export interface RecommendationExpectedMetric {
 export interface RecommendationImpact {
   formula: string;
   baselineValue: number | null;
-  targetValue: number;
+  targetValue: number | null;
+  projectedDenominator: number | null;
   absoluteDelta: number | null;
   relativeDelta: number | null;
+  projectedNumerator: number | null;
   projectedNumeratorDelta: number | null;
   assumptions: string[];
   status: "ok" | "unknown";
@@ -69,15 +71,15 @@ function validateExpectedMetric(metric: RecommendationExpectedMetric): void {
   ]);
   getMetricDefinition(metric.metricId);
   if (metric.acceptance === "reach_scenario_target") {
-    if (metric.scenarioNodeId === undefined || metric.baselineMetricNodeId !== undefined) {
-      invalid("reach_scenario_target requires only scenarioNodeId");
+    if (metric.scenarioNodeId === undefined || metric.baselineMetricNodeId === undefined) {
+      invalid("reach_scenario_target requires baselineMetricNodeId and scenarioNodeId");
     }
     assertStableId(metric.scenarioNodeId, "Recommendation scenarioNodeId");
-  } else if (metric.acceptance === "establish_baseline") {
-    if (metric.baselineMetricNodeId === undefined || metric.scenarioNodeId !== undefined) {
-      invalid("establish_baseline requires only baselineMetricNodeId");
-    }
     assertStableId(metric.baselineMetricNodeId, "Recommendation baselineMetricNodeId");
+  } else if (metric.acceptance === "establish_baseline") {
+    if (metric.baselineMetricNodeId !== undefined || metric.scenarioNodeId !== undefined) {
+      invalid("establish_baseline forbids baselineMetricNodeId and scenarioNodeId");
+    }
   } else {
     invalid("Recommendation expected-metric acceptance must be supported");
   }
@@ -94,8 +96,10 @@ function validateImpact(impact: RecommendationImpact): void {
     "formula",
     "baselineValue",
     "targetValue",
+    "projectedDenominator",
     "absoluteDelta",
     "relativeDelta",
+    "projectedNumerator",
     "projectedNumeratorDelta",
     "assumptions",
     "status",
@@ -108,21 +112,34 @@ function validateImpact(impact: RecommendationImpact): void {
   for (const field of [
     "baselineValue",
     "targetValue",
+    "projectedDenominator",
     "absoluteDelta",
     "relativeDelta",
+    "projectedNumerator",
     "projectedNumeratorDelta",
   ] as const) {
     assertNullableFinite(impact[field], `Recommendation impact ${field}`);
   }
-  if (typeof impact.targetValue !== "number") invalid("Recommendation impact targetValue must be finite");
-  assertStringArray(impact.assumptions, "Recommendation impact assumptions");
+  if (!Array.isArray(impact.assumptions) || impact.assumptions.length > 1000) {
+    invalid("Recommendation impact assumptions must be a bounded array");
+  }
+  for (const assumption of impact.assumptions) {
+    assertNonEmptyString(assumption, "Recommendation impact assumptions");
+  }
   if (impact.status !== "ok" && impact.status !== "unknown") invalid("Recommendation impact status must be supported");
   if (impact.status === "unknown") {
     assertNonEmptyString(impact.unknownReason, "Recommendation impact unknownReason");
   } else {
     if (impact.unknownReason !== null) invalid("Known recommendation impacts must have a null unknownReason");
-    if (impact.baselineValue === null || impact.absoluteDelta === null || impact.projectedNumeratorDelta === null) {
-      invalid("Known recommendation impacts require finite baseline and delta values");
+    if ([
+      impact.baselineValue,
+      impact.targetValue,
+      impact.projectedDenominator,
+      impact.absoluteDelta,
+      impact.projectedNumerator,
+      impact.projectedNumeratorDelta,
+    ].some((value) => value === null)) {
+      invalid("Known recommendation impacts require finite baseline, target, and projection values");
     }
   }
   if (impact.causality !== "not_established") invalid("Recommendation impact causality must be not_established");
@@ -152,6 +169,9 @@ export function validateRecommendationStrategy(recommendation: Recommendation): 
       invalid("Recommendation expectedMetrics must be a non-empty bounded array");
     }
     for (const metric of recommendation.expectedMetrics) validateExpectedMetric(metric);
+    if (new Set(recommendation.expectedMetrics.map((metric) => metric.metricId)).size !== recommendation.expectedMetrics.length) {
+      invalid("Recommendation expected metric IDs must not contain duplicates");
+    }
   }
   if (recommendation.impacts !== undefined) {
     if (!Array.isArray(recommendation.impacts) || recommendation.impacts.length === 0 ||

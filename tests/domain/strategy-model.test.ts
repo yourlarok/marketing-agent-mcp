@@ -50,8 +50,10 @@ function impact(overrides: Record<string, unknown> = {}): RecommendationImpact {
     formula: "sum(clicks) / sum(impressions)",
     baselineValue: 0.1,
     targetValue: 0.2,
+    projectedDenominator: 1000,
     absoluteDelta: 0.1,
     relativeDelta: 1,
+    projectedNumerator: 200,
     projectedNumeratorDelta: 100,
     assumptions: ["other_conditions_unchanged"],
     status: "ok",
@@ -87,25 +89,26 @@ describe("strategy recommendation contract", () => {
       evidenceIds: ["evidence-1"],
       targetChannels: ["xiaohongshu"],
       analysisNodeRefs: [{ graphId: "graph-1", nodeId: "scenario-1" }],
-      expectedMetrics: [{ metricId: "ctr_v1", acceptance: "reach_scenario_target", scenarioNodeId: "scenario-1" }],
+      expectedMetrics: [{ metricId: "ctr_v1", acceptance: "reach_scenario_target", baselineMetricNodeId: "baseline-1", scenarioNodeId: "scenario-1" }],
       impacts: [impact()],
     }))).not.toThrow();
   });
 
   it.each([
     [{ metricId: "ctr_v1", acceptance: "reach_scenario_target" }],
-    [{ metricId: "ctr_v1", acceptance: "reach_scenario_target", scenarioNodeId: "scenario-1", baselineMetricNodeId: "baseline-1" }],
-    [{ metricId: "ctr_v1", acceptance: "establish_baseline" }],
-    [{ metricId: "ctr_v1", acceptance: "establish_baseline", baselineMetricNodeId: "baseline-1", scenarioNodeId: "scenario-1" }],
-    [{ metricId: "unknown_metric", acceptance: "establish_baseline", baselineMetricNodeId: "baseline-1" }],
+    [{ metricId: "ctr_v1", acceptance: "reach_scenario_target", scenarioNodeId: "scenario-1" }],
+    [{ metricId: "ctr_v1", acceptance: "reach_scenario_target", baselineMetricNodeId: "baseline-1" }],
+    [{ metricId: "ctr_v1", acceptance: "establish_baseline", baselineMetricNodeId: "baseline-1" }],
+    [{ metricId: "ctr_v1", acceptance: "establish_baseline", scenarioNodeId: "scenario-1" }],
+    [{ metricId: "unknown_metric", acceptance: "establish_baseline" }],
   ] as RecommendationExpectedMetric[])("rejects invalid expected-metric combination %j", (expectedMetric) => {
     expectInvalid(() => validateRecommendationStrategy(recommendation({ expectedMetrics: [expectedMetric] })));
   });
 
   it("accepts both valid expected-metric acceptance shapes", () => {
     for (const expectedMetric of [
-      { metricId: "ctr_v1", acceptance: "reach_scenario_target", scenarioNodeId: "scenario-1" },
-      { metricId: "ctr_v1", acceptance: "establish_baseline", baselineMetricNodeId: "baseline-1" },
+      { metricId: "ctr_v1", acceptance: "reach_scenario_target", baselineMetricNodeId: "baseline-1", scenarioNodeId: "scenario-1" },
+      { metricId: "ctr_v1", acceptance: "establish_baseline" },
     ] as RecommendationExpectedMetric[]) {
       expect(() => validateRecommendationStrategy(recommendation({ expectedMetrics: [expectedMetric] }))).not.toThrow();
     }
@@ -114,8 +117,10 @@ describe("strategy recommendation contract", () => {
   it.each([
     "baselineValue",
     "targetValue",
+    "projectedDenominator",
     "absoluteDelta",
     "relativeDelta",
+    "projectedNumerator",
     "projectedNumeratorDelta",
   ])("rejects non-finite %s", (field) => {
     for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {

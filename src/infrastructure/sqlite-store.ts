@@ -14,6 +14,7 @@ import type {
   IdempotencyRepository,
   Repositories,
   Store,
+  TaskRepository,
 } from "../application/ports.js";
 import {
   analysisGraphReferenceIds,
@@ -425,7 +426,14 @@ class SqliteCapabilityRepository
   }
 }
 
-class SqliteTaskRepository extends SqliteEntityRepository {
+class SqliteTaskRepository extends SqliteEntityRepository implements TaskRepository {
+  async list(workspaceId: string): Promise<EntityRecord[]> {
+    const rows = this.database
+      .prepare("SELECT payload FROM tasks WHERE workspace_id = ? ORDER BY created_at, id")
+      .all(workspaceId) as unknown as { payload: string }[];
+    return rows.map((row) => JSON.parse(row.payload) as EntityRecord);
+  }
+
   override async insert(record: EntityRecord): Promise<EntityRecord> {
     const inserted = await super.insert(record);
     this.database.prepare("DELETE FROM task_dependencies WHERE task_id = ?").run(record.id);
@@ -653,7 +661,7 @@ class SqliteStore implements Store {
       evidence: repository("evidence"),
       findings: repository("findings"),
       recommendations: repository("recommendations"),
-      tasks: repository("tasks"),
+      tasks: repository("tasks") as TaskRepository,
       dataRequestPlans: repository("dataRequestPlans"),
       ingestionBatches: repository("ingestionBatches"),
       researchSessions: repository("researchSessions"),

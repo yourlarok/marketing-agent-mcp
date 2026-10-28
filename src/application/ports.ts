@@ -40,6 +40,10 @@ export interface AnalysisGraphRepository {
   update(record: AnalysisGraph, expectedVersion: number): Promise<AnalysisGraph>;
 }
 
+export interface TaskRepository extends EntityRepository {
+  list(workspaceId: Id): Promise<EntityRecord[]>;
+}
+
 export interface CapabilityRepository extends EntityRepository {
   list(workspaceId: Id): Promise<EntityRecord[]>;
 }
@@ -122,7 +126,7 @@ export interface Repositories {
   evidence: EntityRepository;
   findings: EntityRepository;
   recommendations: EntityRepository;
-  tasks: EntityRepository;
+  tasks: TaskRepository;
   dataRequestPlans: EntityRepository<DataRequestPlan>;
   ingestionBatches: EntityRepository<IngestionBatch>;
   researchSessions: EntityRepository<ResearchSession>;
