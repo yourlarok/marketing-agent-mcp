@@ -215,6 +215,32 @@ describe("SqliteConnector", () => {
     }))).toThrowError(expect.objectContaining<Partial<DomainError>>({ code: "INVALID_INPUT" }));
   });
 
+  it("rejects nullable primary keys with duplicate NULL when hidden rowid aliases are shadowed", () => {
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec(`
+        CREATE TABLE nullable_primary_key (
+          rowid INTEGER,
+          _rowid_ INTEGER,
+          oid INTEGER,
+          value TEXT,
+          PRIMARY KEY(value)
+        );
+        INSERT INTO nullable_primary_key VALUES
+          (1, 2, 3, NULL),
+          (1, 2, 3, NULL);
+      `);
+    } finally {
+      database.close();
+    }
+
+    expect(() => connector.snapshot(query({
+      table: "nullable_primary_key",
+      columns: ["rowid", "value"],
+      order: [{ column: "rowid", direction: "asc" }],
+    }))).toThrowError(expect.objectContaining<Partial<DomainError>>({ code: "INVALID_INPUT" }));
+  });
+
   it("represents mixed SQLite value types as unknown instead of forging a scalar type", () => {
     const snapshot = connector.snapshot(query({
       table: "campaign_types",

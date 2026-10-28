@@ -92,6 +92,7 @@ export interface SqliteDiscovery {
 interface TableInfo {
   name: string;
   type: string;
+  notnull: number;
   pk: number;
 }
 
@@ -99,6 +100,7 @@ interface AuthorizedTable {
   name: string;
   columns: ConnectorColumnSchema[];
   primaryKey: string[];
+  reliablePrimaryKey: boolean;
   withoutRowid: boolean;
 }
 
@@ -191,7 +193,7 @@ export class SqliteConnector {
       if (hiddenRowid) {
         order.push(`${quoteIdentifier(hiddenRowid)} ASC`);
       } else {
-        if (table.primaryKey.length === 0) invalid("Query table has no reliable stable ordering key");
+        if (!table.reliablePrimaryKey) invalid("Query table has no reliable stable ordering key");
         for (const column of table.primaryKey) {
           if (!query.order.some((entry) => entry.column === column)) order.push(`${quoteIdentifier(column)} ASC`);
         }
@@ -330,13 +332,16 @@ export class SqliteConnector {
         names.add(column.name);
         return { name: column.name, type: declaredType(column.type) };
       });
+      const primaryKey = info.filter((column) => column.pk > 0)
+        .sort((left, right) => left.pk - right.pk);
+      const withoutRowid = /\bWITHOUT\s+ROWID\b/i.test(record.sql ?? "");
       return {
         name: record.name,
         columns,
-        primaryKey: info.filter((column) => column.pk > 0)
-          .sort((left, right) => left.pk - right.pk)
-          .map((column) => column.name),
-        withoutRowid: /\bWITHOUT\s+ROWID\b/i.test(record.sql ?? ""),
+        primaryKey: primaryKey.map((column) => column.name),
+        reliablePrimaryKey: primaryKey.length > 0 &&
+          (withoutRowid || primaryKey.every((column) => column.notnull === 1)),
+        withoutRowid,
       };
     });
   }
