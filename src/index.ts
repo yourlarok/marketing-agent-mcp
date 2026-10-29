@@ -6,6 +6,8 @@ import { ContentProductionService } from "./application/content-production-servi
 import { DashboardService } from "./application/dashboard-service.js";
 import { DataResearchService } from "./application/data-research-service.js";
 import { MarketingService } from "./application/marketing-service.js";
+import { PublicationScheduler } from "./application/publication-scheduler.js";
+import { PublishingService } from "./application/publishing-service.js";
 import { StrategyService } from "./application/strategy-service.js";
 import { loadConfig } from "./config.js";
 import { ArtifactStore } from "./infrastructure/artifact-store.js";
@@ -13,6 +15,7 @@ import { McpAnalyticsProvider } from "./infrastructure/analytics-provider.js";
 import { McpBenchmarkReverseProvider } from "./infrastructure/benchmark-reverse-provider.js";
 import { McpMediaProvider } from "./infrastructure/media-provider.js";
 import { MediaValidator } from "./infrastructure/media-validation.js";
+import { McpPublishingProvider } from "./infrastructure/publishing-provider.js";
 import { SqliteConnector } from "./infrastructure/sqlite-connector.js";
 import { openStore } from "./infrastructure/sqlite-store.js";
 import {
@@ -24,6 +27,7 @@ import { createMcpServer } from "./mcp/server.js";
 async function run(): Promise<void> {
   const config = loadConfig(process.env);
   const store = openStore(join(config.dataDir, "marketing.db"));
+  let scheduler: PublicationScheduler | undefined;
   try {
     const clock = new SystemClock();
     const ids = new SystemIdGenerator();
@@ -74,6 +78,26 @@ async function run(): Promise<void> {
         ...(config.ffprobeCommand ? { ffprobeCommand: config.ffprobeCommand } : {}),
       }),
     );
+    const publishingProvider = new McpPublishingProvider({
+      ...(config.publishingMcp ? {
+        command: config.publishingMcp.command,
+        args: config.publishingMcp.args,
+        envAllowlist: config.publishingMcp.envAllowlist,
+      } : {}),
+    });
+    const publishing = new PublishingService(
+      store,
+      clock,
+      ids,
+      artifacts,
+      publishingProvider,
+      publishingProvider,
+    );
+    scheduler = new PublicationScheduler(store, publishing, clock, {
+      onError: (error) => console.error(
+        `Publication scheduler failed: ${error instanceof Error ? error.message : "unknown error"}`,
+      ),
+    });
     const server = createMcpServer(
       service,
       dataResearch,
@@ -84,15 +108,20 @@ async function run(): Promise<void> {
       benchmark,
       contentProduction,
     );
+    await scheduler.start();
     const transport = new StdioServerTransport();
     let shutdown: Promise<void> | undefined;
 
     const close = (): Promise<void> => {
       shutdown ??= (async () => {
         try {
-          await server.close();
+          await scheduler?.stop();
         } finally {
-          store.close();
+          try {
+            await server.close();
+          } finally {
+            store.close();
+          }
         }
       })();
       return shutdown;
@@ -104,11 +133,7 @@ async function run(): Promise<void> {
       process.exitCode = 1;
     };
     transport.onclose = () => {
-      try {
-        store.close();
-      } catch (error) {
-        reportCloseFailure(error);
-      }
+      void close().catch(reportCloseFailure);
     };
     process.once("SIGINT", () => {
       void close().catch(reportCloseFailure);
@@ -119,7 +144,11 @@ async function run(): Promise<void> {
 
     await server.connect(transport);
   } catch (error) {
-    store.close();
+    try {
+      await scheduler?.stop();
+    } finally {
+      store.close();
+    }
     throw error;
   }
 }

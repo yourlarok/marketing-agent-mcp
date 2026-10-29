@@ -62,10 +62,12 @@ export type ApprovalRepository = ImmutableEntityRepository<Approval>;
 
 export interface ScheduleRepository extends EntityRepository<Schedule> {
   listDue(workspaceId: Id, dueBy: Instant, limit?: number): Promise<Schedule[]>;
+  listAllDue(dueBy: Instant, limit?: number): Promise<Schedule[]>;
 }
 
 export interface PublicationRepository extends EntityRepository<Publication> {
   listRecoveryCandidates(workspaceId: Id, limit?: number): Promise<Publication[]>;
+  listAllRecoveryCandidates(limit?: number): Promise<Publication[]>;
   getByScheduleId(scheduleId: Id, workspaceId: Id): Promise<Publication | undefined>;
 }
 

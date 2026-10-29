@@ -665,6 +665,16 @@ class SqliteScheduleRepository extends SqliteEntityRepository implements Schedul
     ).all(workspaceId, dueBy, queryLimit(limit)) as unknown as { payload: string }[];
     return rows.map((row) => JSON.parse(row.payload) as Schedule);
   }
+
+  async listAllDue(dueBy: string, limit?: number): Promise<Schedule[]> {
+    assertUtcInstant(dueBy);
+    const rows = this.database.prepare(
+      `SELECT payload FROM schedules
+       WHERE status = 'scheduled' AND scheduled_for <= ?
+       ORDER BY scheduled_for, workspace_id, id LIMIT ?`,
+    ).all(dueBy, queryLimit(limit)) as unknown as { payload: string }[];
+    return rows.map((row) => JSON.parse(row.payload) as Schedule);
+  }
 }
 
 const PUBLICATION_IDENTITY_FIELDS = [
@@ -711,6 +721,15 @@ class SqlitePublicationRepository extends SqliteEntityRepository implements Publ
        WHERE workspace_id = ? AND status IN ('submitting', 'submitted', 'unknown')
        ORDER BY updated_at, id LIMIT ?`,
     ).all(workspaceId, queryLimit(limit)) as unknown as { payload: string }[];
+    return rows.map((row) => JSON.parse(row.payload) as Publication);
+  }
+
+  async listAllRecoveryCandidates(limit?: number): Promise<Publication[]> {
+    const rows = this.database.prepare(
+      `SELECT payload FROM publications
+       WHERE status IN ('submitting', 'submitted', 'unknown')
+       ORDER BY updated_at, workspace_id, id LIMIT ?`,
+    ).all(queryLimit(limit)) as unknown as { payload: string }[];
     return rows.map((row) => JSON.parse(row.payload) as Publication);
   }
 

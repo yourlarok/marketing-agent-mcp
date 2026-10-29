@@ -58,3 +58,29 @@ export interface GetPublication {
   id: string;
   workspaceId: string;
 }
+
+export interface ManualComplete {
+  id: string;
+  workspaceId: string;
+  publicationId: string;
+  expectedPublicationVersion: number;
+  evidenceIds: string[];
+  externalPublicationId: string;
+  publishedAt: string;
+}
+
+export interface GetDeliveryPackage {
+  id: string;
+  workspaceId: string;
+  offset?: number;
+  length?: number;
+}
+
+export interface DeliveryPackageChunk {
+  content: Buffer;
+  offset: number;
+  length: number;
+  totalBytes: number;
+  contentHash: string;
+  mediaType: "application/json";
+}

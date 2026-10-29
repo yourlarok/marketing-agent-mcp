@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { assertRecord, assertUtcInstant } from "../domain/contract-validation.js";
-import type { AssetVersion, ContentChannel } from "../domain/content-production-model.js";
+import { assertEntityReferenceId, assertRecord, assertUtcInstant } from "../domain/contract-validation.js";
+import type { AssetVersion, ContentBrief, ContentChannel } from "../domain/content-production-model.js";
 import { DomainError } from "../domain/errors.js";
+import type { Evidence, Source } from "../domain/model.js";
 import {
   createApproval,
   createPublication,
@@ -35,9 +36,12 @@ import type { Clock, IdGenerator, JsonValue, Repositories, Store } from "./ports
 import type {
   CancelSchedule,
   CreateSchedule,
+  DeliveryPackageChunk,
   GetApproval,
+  GetDeliveryPackage,
   GetPublication,
   GetSchedule,
+  ManualComplete,
   PublicationOperation,
   RecordApproval,
   Reschedule,
@@ -45,6 +49,12 @@ import type {
 
 const VALIDATION_TIME = "1970-01-01T00:00:00.000Z";
 const SUBMISSION_LEASE_MS = 30_000;
+const DELIVERY_PACKAGE_CHUNK_MAX_BYTES = 32_768;
+const MANUAL_COMPLETE_KEYS = [
+  "id", "workspaceId", "publicationId", "expectedPublicationVersion", "evidenceIds",
+  "externalPublicationId", "publishedAt",
+] as const;
+const GET_DELIVERY_PACKAGE_KEYS = ["id", "workspaceId", "offset", "length"] as const;
 const RECORD_APPROVAL_KEYS = [
   "id", "workspaceId", "assetVersionId", "expectedAssetVersion", "decision", "comment",
 ] as const;
@@ -79,6 +89,7 @@ interface ScheduleSnapshot {
 interface PublicationSnapshot extends ScheduleSnapshot {
   schedule: Schedule;
   publication: Publication;
+  brief: ContentBrief;
 }
 
 interface PreparedPublication extends PublicationSnapshot {
@@ -113,6 +124,21 @@ function validatePublicationOperation(input: PublicationOperation, context: Comm
   positiveVersion(input.expectedVersion, "expectedVersion");
   for (const [field, value] of Object.entries(context)) {
     if (typeof value !== "string" || value.trim().length === 0) invalid(`${field} must not be empty`);
+  }
+}
+
+function validateManualComplete(input: ManualComplete): void {
+  assertRecord(input, "ManualComplete", MANUAL_COMPLETE_KEYS);
+  positiveVersion(input.expectedPublicationVersion, "expectedPublicationVersion");
+  assertEntityReferenceId(input.publicationId, "publicationId");
+  assertEntityReferenceId(input.externalPublicationId, "externalPublicationId");
+  assertUtcInstant(input.publishedAt, "publishedAt");
+  if (!Array.isArray(input.evidenceIds) || input.evidenceIds.length < 1 || input.evidenceIds.length > 100) {
+    invalid("evidenceIds must contain 1-100 persisted Evidence IDs");
+  }
+  for (const id of input.evidenceIds) assertEntityReferenceId(id, "evidenceIds");
+  if (new Set(input.evidenceIds).size !== input.evidenceIds.length) {
+    invalid("evidenceIds must not contain duplicates");
   }
 }
 
@@ -246,6 +272,7 @@ async function requireSchedule(repos: Repositories, input: { id: string; workspa
 async function requirePublicationSnapshot(
   repos: Repositories,
   input: { id: string; workspaceId: string },
+  requireAutomatic = true,
 ): Promise<PublicationSnapshot> {
   const publication = await repos.publications.get(input.id, input.workspaceId);
   if (!publication) notFound("Publication not found in workspace", { id: input.id, workspaceId: input.workspaceId });
@@ -261,7 +288,7 @@ async function requirePublicationSnapshot(
     publication.channel !== schedule.channel ||
     publication.accountId !== schedule.accountId ||
     publication.deliveryMode !== schedule.deliveryMode ||
-    schedule.deliveryMode !== "automatic" ||
+    (requireAutomatic && schedule.deliveryMode !== "automatic") ||
     schedule.assetVersionId !== asset.id ||
     schedule.assetVersion !== asset.version ||
     schedule.channel !== asset.channel ||
@@ -273,7 +300,11 @@ async function requirePublicationSnapshot(
   ) {
     conflict("Publication requires the exact approved AssetVersion, artifact, account, channel, and Schedule");
   }
-  return { publication, schedule, asset, approval };
+  const brief = await repos.contentBriefs.get(asset.briefId, input.workspaceId);
+  if (!brief || brief.version !== asset.briefVersion || brief.channel !== asset.channel) {
+    conflict("Publication locked ContentBrief is missing or does not match the AssetVersion");
+  }
+  return { publication, schedule, asset, approval, brief };
 }
 
 export function publicationOperationKey(identity: PublicationOperationIdentity): string {
@@ -541,6 +572,148 @@ export class PublishingService {
       const publication = await repos.publications.get(query.id, query.workspaceId);
       if (!publication) notFound("Publication not found in workspace", { id: query.id, workspaceId: query.workspaceId });
       return publication;
+    });
+  }
+
+  async manualHandoff(command: Command<PublicationOperation>): Promise<Publication> {
+    validatePublicationOperation(command.input, command.context);
+    let prepared: { snapshot: PublicationSnapshot; bytes: Buffer } | undefined;
+    const prepare = async (): Promise<void> => {
+      prepared = undefined;
+      const snapshot = await this.store.transaction((repos) =>
+        requirePublicationSnapshot(repos, command.input, false)
+      );
+      this.assertManualHandoff(snapshot, command.input.expectedVersion);
+      await this.readActualArtifact(snapshot.asset);
+      const bytes = this.buildDeliveryPackage(snapshot);
+      await this.artifacts.put(bytes);
+      prepared = { snapshot, bytes };
+    };
+    return this.commands.executeBatch({
+      workspaceId: command.input.workspaceId,
+      action: "publication.manual_handoff",
+      entityType: "publication",
+      input: command.input,
+      context: command.context,
+      write: async (repos, input, timestamp) => {
+        if (!prepared) throw new Error("Manual handoff preparation did not complete");
+        const current = await requirePublicationSnapshot(repos, input, false);
+        this.assertManualHandoff(current, input.expectedVersion);
+        if (canonicalJson(current) !== canonicalJson(prepared.snapshot)) {
+          conflict("Publication, ContentBrief, Approval, AssetVersion, or Schedule changed before manual handoff");
+        }
+        if (current.schedule.status === "scheduled") {
+          await repos.schedules.update({
+            ...current.schedule,
+            status: "triggered",
+            updatedAt: timestamp,
+          }, current.schedule.version);
+        }
+        return repos.publications.update({
+          ...current.publication,
+          status: "manual_handoff",
+          updatedAt: timestamp,
+        }, input.expectedVersion);
+      },
+    }, prepare);
+  }
+
+  async manualComplete(command: Command<ManualComplete>): Promise<Publication> {
+    validateManualComplete(command.input);
+    return this.commands.execute({
+      workspaceId: command.input.workspaceId,
+      action: "publication.manual_complete",
+      entityType: "publication",
+      input: command.input,
+      context: command.context,
+      write: async (repos, input, timestamp) => {
+        const snapshot = await requirePublicationSnapshot(repos, {
+          id: input.publicationId,
+          workspaceId: input.workspaceId,
+        }, false);
+        this.assertPublicationVersion(snapshot.publication, input.expectedPublicationVersion);
+        if (snapshot.publication.status !== "manual_handoff") {
+          conflict("Only a manual handoff can be completed with manual evidence");
+        }
+        for (const evidenceId of input.evidenceIds) {
+          const evidence = await repos.evidence.get(evidenceId, input.workspaceId) as Evidence | undefined;
+          if (!evidence) notFound("Manual completion Evidence not found in workspace", {
+            evidenceId,
+            workspaceId: input.workspaceId,
+          });
+          const source = await repos.sources.get(evidence.sourceId, input.workspaceId) as Source | undefined;
+          if (!source || !["owned", "authorized"].includes(source.ownership) ||
+              evidence.classification !== "owned_operating") {
+            conflict("Manual completion requires owned or authorized owned_operating Evidence");
+          }
+        }
+        if (snapshot.schedule.status !== "triggered") {
+          conflict("Manual completion requires a triggered Schedule");
+        }
+        await repos.schedules.update({
+          ...snapshot.schedule,
+          status: "completed",
+          updatedAt: timestamp,
+        }, snapshot.schedule.version);
+        return repos.publications.update({
+          ...snapshot.publication,
+          status: "verified",
+          failure: null,
+          delivery: {
+            method: "manual_evidence",
+            externalPublicationId: input.externalPublicationId,
+            publishedAt: input.publishedAt,
+            evidenceIds: [...input.evidenceIds],
+          },
+          verification: {
+            method: "manual_evidence",
+            verifiedAt: timestamp,
+            externalPublicationId: input.externalPublicationId,
+            evidenceIds: [...input.evidenceIds],
+          },
+          updatedAt: timestamp,
+        }, input.expectedPublicationVersion);
+      },
+    });
+  }
+
+  async getDeliveryPackage(query: GetDeliveryPackage): Promise<DeliveryPackageChunk> {
+    assertRecord(query, "GetDeliveryPackage", GET_DELIVERY_PACKAGE_KEYS);
+    const offset = query.offset ?? 0;
+    const length = query.length ?? DELIVERY_PACKAGE_CHUNK_MAX_BYTES;
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) ||
+        length < 1 || length > DELIVERY_PACKAGE_CHUNK_MAX_BYTES) {
+      invalid(`Delivery package offset must be non-negative and length must be 1-${DELIVERY_PACKAGE_CHUNK_MAX_BYTES}`);
+    }
+    const snapshot = await this.store.transaction((repos) =>
+      requirePublicationSnapshot(repos, query, false)
+    );
+    if (snapshot.publication.status !== "manual_handoff" &&
+        !(snapshot.publication.status === "verified" && snapshot.publication.verification?.method === "manual_evidence")) {
+      conflict("Delivery package requires a manual handoff");
+    }
+    const bytes = this.buildDeliveryPackage(snapshot);
+    if (offset > bytes.length) invalid("Delivery package offset exceeds totalBytes");
+    const contentHash = createHash("sha256").update(bytes).digest("hex");
+    const content = await this.artifacts.readRange(contentHash, offset, length, bytes.length);
+    return {
+      content,
+      offset,
+      length: content.length,
+      totalBytes: bytes.length,
+      contentHash,
+      mediaType: "application/json",
+    };
+  }
+
+  async reconcileSchedule(publication: Publication): Promise<void> {
+    await this.store.transaction(async (repos) => {
+      const schedule = await repos.schedules.get(publication.scheduleId, publication.workspaceId);
+      if (!schedule || !["scheduled", "triggered"].includes(schedule.status) || publication.status === "pending") return;
+      const status = publication.status === "verified" ? "completed" : "triggered";
+      if (schedule.status !== status) {
+        await repos.schedules.update({ ...schedule, status, updatedAt: this.clock.now() }, schedule.version);
+      }
     });
   }
 
@@ -830,6 +1003,14 @@ export class PublishingService {
         verification,
         updatedAt: timestamp,
       }, claim.claimed.version);
+      const schedule = await repos.schedules.get(updated.scheduleId, updated.workspaceId);
+      if (!schedule) conflict("Publication Schedule is missing before outcome commit");
+      if (["scheduled", "triggered"].includes(schedule.status)) {
+        const scheduleStatus = status === "verified" ? "completed" : "triggered";
+        if (schedule.status !== scheduleStatus) {
+          await repos.schedules.update({ ...schedule, status: scheduleStatus, updatedAt: timestamp }, schedule.version);
+        }
+      }
       assertBoundedCommandResponse(updated);
       await this.appendAudit(repos, command, action, updated, timestamp);
       if (!deferIdempotency) await this.putIdempotency(repos, command, action, updated, timestamp);
@@ -951,8 +1132,54 @@ export class PublishingService {
     if (publication.version !== expectedVersion) conflict("Publication version does not match expectedVersion");
   }
 
+  private assertManualHandoff(snapshot: PublicationSnapshot, expectedVersion: number): void {
+    this.assertPublicationVersion(snapshot.publication, expectedVersion);
+    if (!["pending", "failed"].includes(snapshot.publication.status)) {
+      conflict("Only a pending or definitely failed Publication can become manual handoff");
+    }
+    if (!["scheduled", "triggered"].includes(snapshot.schedule.status)) {
+      conflict("Manual handoff requires a scheduled or triggered Schedule");
+    }
+    if (Date.parse(snapshot.schedule.scheduledFor) > Date.parse(this.clock.now())) {
+      conflict("Publication is not due");
+    }
+  }
+
+  private buildDeliveryPackage(snapshot: PublicationSnapshot): Buffer {
+    const schedule = snapshot.schedule;
+    return Buffer.from(canonicalJson({
+      packageVersion: 1,
+      status: "not_published",
+      brief: snapshot.brief,
+      briefHash: createHash("sha256").update(canonicalJson(snapshot.brief)).digest("hex"),
+      asset: snapshot.asset,
+      assetHash: createHash("sha256").update(canonicalJson(snapshot.asset)).digest("hex"),
+      artifact: snapshot.asset.artifact,
+      artifactHash: snapshot.asset.artifact.contentHash,
+      accountId: snapshot.publication.accountId,
+      channel: snapshot.publication.channel,
+      schedule: {
+        id: schedule.id,
+        workspaceId: schedule.workspaceId,
+        createdAt: schedule.createdAt,
+        assetVersionId: schedule.assetVersionId,
+        assetVersion: schedule.assetVersion,
+        approvalId: schedule.approvalId,
+        channel: schedule.channel,
+        accountId: schedule.accountId,
+        scheduledFor: schedule.scheduledFor,
+        timeZone: schedule.timeZone,
+        deliveryMode: schedule.deliveryMode,
+      },
+      approval: snapshot.approval,
+      operationKey: snapshot.publication.operationKey,
+    }), "utf8");
+  }
+
   private assertDueAndConfigured(snapshot: PublicationSnapshot): void {
-    if (snapshot.schedule.status !== "scheduled") conflict("Only a scheduled Schedule can publish");
+    if (!["scheduled", "triggered"].includes(snapshot.schedule.status)) {
+      conflict("Only a scheduled or triggered Schedule can publish");
+    }
     if (Date.parse(snapshot.schedule.scheduledFor) > Date.parse(this.clock.now())) {
       conflict("Publication is not due");
     }
