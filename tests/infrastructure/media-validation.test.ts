@@ -22,6 +22,42 @@ function png(width: number, height: number): Uint8Array {
   ], { maxBuffer: 8 * 1024 * 1024 });
 }
 
+function jpeg(width: number, height: number): Uint8Array {
+  return execFileSync(ffmpeg, [
+    "-v", "error",
+    "-f", "lavfi",
+    "-i", `color=c=blue:s=${width}x${height}`,
+    "-frames:v", "1",
+    "-c:v", "mjpeg",
+    "-f", "image2pipe",
+    "pipe:1",
+  ], { maxBuffer: 8 * 1024 * 1024 });
+}
+
+function matroska(): Uint8Array {
+  const directory = mkdtempSync(join(tmpdir(), "marketing-real-matroska-fixture-"));
+  const path = join(directory, "fixture.mkv");
+  try {
+    execFileSync(ffmpeg, [
+      "-v", "error", "-y",
+      "-f", "lavfi",
+      "-i", "color=c=red:s=1080x1920:r=1",
+      "-f", "lavfi",
+      "-i", "sine=frequency=1000:sample_rate=44100",
+      "-t", "2",
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-f", "matroska",
+      path,
+    ], { maxBuffer: 24 * 1024 * 1024, timeout: 30_000 });
+    return readFileSync(path);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 function mp4(options: { duration?: string; width?: number; audio?: boolean; videoCodec?: string } = {}): Uint8Array {
   const width = options.width ?? 1080;
   const audio = options.audio ?? true;
@@ -79,13 +115,21 @@ describe("real Playwright and ffprobe media validators", () => {
     await expectGap(new MediaValidator().validateXhsPng(png(1440, 1080)), "professional_media", "media_dimensions_mismatch");
   }, 20_000);
 
+  it("rejects a real 1080x1440 JPEG despite matching decoded dimensions", async () => {
+    await expectGap(new MediaValidator().validateXhsPng(jpeg(1080, 1440)), "professional_media", "media_format_mismatch");
+  }, 20_000);
+
   it("reports missing Chromium and actual image decode failures explicitly", async () => {
     await expectGap(
       new MediaValidator({ chromiumExecutablePath: "/definitely/missing/chromium" }).validateXhsPng(png(1080, 1440)),
       "professional_media",
       "chromium_unavailable",
     );
-    await expectGap(new MediaValidator().validateXhsPng(Uint8Array.from([0, 1, 2, 3])), "professional_media", "image_decode_failed");
+    await expectGap(
+      new MediaValidator().validateXhsPng(Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2, 3])),
+      "professional_media",
+      "image_decode_failed",
+    );
   }, 20_000);
 
   it("accepts a real 2000ms 1080x1920 H264/AAC MP4 and records bounded ffprobe provenance", async () => {
@@ -103,6 +147,14 @@ describe("real Playwright and ffprobe media validators", () => {
     });
     expect(result.probeVersion.length).toBeGreaterThan(0);
     expect(result.probeVersion.length).toBeLessThanOrEqual(256);
+  }, 30_000);
+
+  it("rejects real Matroska despite H264/AAC streams and matching dimensions", async () => {
+    await expectGap(
+      new MediaValidator({ ffprobeCommand: ffprobe }).validateChannelsMp4(matroska()),
+      "video_probe",
+      "media_format_mismatch",
+    );
   }, 30_000);
 
   it("rejects real wrong-width video", async () => {
@@ -166,7 +218,7 @@ describe("real Playwright and ffprobe media validators", () => {
     const tempDir = await createTempDir();
     const probe = join(tempDir, "ffprobe-fractional-duration");
     try {
-      writeFileSync(probe, `#!/bin/sh\nif [ "$1" = "-version" ]; then echo ffprobe-test-version; else echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1080,"height":1920},{"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"60.0004"}}'; fi\n`, { mode: 0o700 });
+      writeFileSync(probe, `#!/bin/sh\nif [ "$1" = "-version" ]; then echo ffprobe-test-version; else echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1080,"height":1920},{"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"60.0004","format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}'; fi\n`, { mode: 0o700 });
       await expectGap(
         new MediaValidator({ ffprobeCommand: probe }).validateChannelsMp4(mp4()),
         "video_probe",

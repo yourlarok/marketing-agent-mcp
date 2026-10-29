@@ -13,6 +13,7 @@ import { DomainError } from "../domain/errors.js";
 
 const FFPROBE_TIMEOUT_MS = 10_000;
 const FFPROBE_MAX_OUTPUT_BYTES = 64 * 1024;
+const PNG_SIGNATURE = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const MEDIA_CONFIGURATION_ACTION =
   "Configure MARKETING_MEDIA_MCP_COMMAND and MARKETING_MEDIA_MCP_ARGS in the trusted deployment environment";
 const PROBE_CONFIGURATION_ACTION =
@@ -31,7 +32,7 @@ const probeSchema = z.object({
     width: z.number().int().optional(),
     height: z.number().int().optional(),
   })),
-  format: z.object({ duration: z.string() }),
+  format: z.object({ duration: z.string(), format_name: z.string() }),
 });
 
 function gap(capability: "professional_media" | "video_probe", reason: string, message: string, retryable = false): DomainError {
@@ -128,6 +129,9 @@ export class MediaValidator {
     if (bytes.byteLength < 1 || bytes.byteLength > CHANNEL_PROFILES.xhs.maxBytes) {
       throw new DomainError("INVALID_INPUT", "PNG bytes exceed the internal profile byte limit");
     }
+    if (!PNG_SIGNATURE.every((value, index) => bytes[index] === value)) {
+      throw gap("professional_media", "media_format_mismatch", "XHS image bytes are not a PNG container");
+    }
     let browser: Browser | undefined;
     try {
       try {
@@ -199,7 +203,7 @@ export class MediaValidator {
       const provenance = probeVersion(versionOutput.stdout);
       const inspection = await runFfprobe(this.options.ffprobeCommand, [
         "-v", "error",
-        "-show_entries", "stream=codec_type,codec_name,width,height:format=duration",
+        "-show_entries", "stream=codec_type,codec_name,width,height:format=duration,format_name",
         "-show_streams",
         "-show_format",
         "-of", "json",
@@ -213,6 +217,9 @@ export class MediaValidator {
       }
       const parsed = probeSchema.safeParse(decoded);
       if (!parsed.success) throw probeGap("ffprobe_invalid_response", "ffprobe returned an invalid inspection schema");
+      if (!parsed.data.format.format_name.split(",").includes("mp4")) {
+        throw probeGap("media_format_mismatch", "Channels video bytes are not an MP4 container");
+      }
       const videos = parsed.data.streams.filter((stream) => stream.codec_type === "video");
       const audio = parsed.data.streams.filter((stream) => stream.codec_type === "audio");
       if (videos.length !== 1 || audio.length !== 1 || videos[0]!.codec_name !== "h264" || audio[0]!.codec_name !== "aac") {

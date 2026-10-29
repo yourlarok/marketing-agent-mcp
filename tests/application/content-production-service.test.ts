@@ -816,7 +816,7 @@ describe("ContentProductionService real Task 3 media fixtures", () => {
     }
     service = new ContentProductionService(
       store, { now: () => now }, { next: () => `audit-${++sequence}` }, artifacts,
-      new StubProvider(() => Uint8Array.from([0, 1, 2, 3])), new MediaValidator(),
+      new StubProvider(() => Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2, 3])), new MediaValidator(),
     );
     const invalidPng = { ...generationInput(png.id), id: "real-png-decode", contentId: "content-real-png-decode" };
     await expect(service.generate({ input: invalidPng, context: context("real-png-decode") }))

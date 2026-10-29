@@ -68,6 +68,7 @@ const MEDIA_GAP_REASONS = new Set([
   "chromium_cleanup_failed",
   "image_decode_failed",
   "media_dimensions_mismatch",
+  "media_format_mismatch",
 ]);
 const PROBE_GAP_REASONS = new Set([
   "ffprobe_not_configured",
@@ -79,6 +80,7 @@ const PROBE_GAP_REASONS = new Set([
   "ffprobe_cleanup_failed",
   "media_codec_mismatch",
   "media_dimensions_mismatch",
+  "media_format_mismatch",
   "media_duration_mismatch",
 ]);
 
