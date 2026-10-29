@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 
 export interface AppConfig {
   dataDir: string;
@@ -19,6 +20,12 @@ export interface AppConfig {
     command: string;
     args: string[];
   };
+  mediaMcp?: {
+    command: string;
+    args: string[];
+    envAllowlist: string[];
+  };
+  ffprobeCommand?: string;
   logLevel: "error" | "warn" | "info";
 }
 
@@ -48,6 +55,10 @@ export function parseAnalyticsMcpArguments(value: string | undefined): string[] 
 
 export function parseBenchmarkMcpArguments(value: string | undefined): string[] {
   return parseMcpArguments(value, "MARKETING_BENCHMARK_MCP_ARGS");
+}
+
+export function parseMediaMcpArguments(value: string | undefined): string[] {
+  return parseMcpArguments(value, "MARKETING_MEDIA_MCP_ARGS");
 }
 
 export function parseCommaSeparatedList(value: string | undefined): string[] {
@@ -121,6 +132,21 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (benchmarkMcpCommand !== undefined && benchmarkMcpCommand.trim().length === 0) {
     throw new Error("MARKETING_BENCHMARK_MCP_COMMAND must not be empty");
   }
+  const mediaMcpCommand = env.MARKETING_MEDIA_MCP_COMMAND;
+  if (!mediaMcpCommand && (env.MARKETING_MEDIA_MCP_ARGS || env.MARKETING_MEDIA_MCP_ENV_ALLOWLIST)) {
+    throw new Error("MARKETING_MEDIA_MCP_COMMAND is required when media MCP settings are configured");
+  }
+  if (mediaMcpCommand !== undefined && mediaMcpCommand.trim().length === 0) {
+    throw new Error("MARKETING_MEDIA_MCP_COMMAND must not be empty");
+  }
+  const mediaEnvAllowlist = parseCommaSeparatedList(env.MARKETING_MEDIA_MCP_ENV_ALLOWLIST);
+  if (mediaEnvAllowlist.some((name) => !/^[A-Z_][A-Z0-9_]*$/i.test(name))) {
+    throw new Error("MARKETING_MEDIA_MCP_ENV_ALLOWLIST must contain environment variable names only");
+  }
+  const ffprobeCommand = env.MARKETING_FFPROBE_COMMAND;
+  if (ffprobeCommand !== undefined && !isAbsolute(ffprobeCommand)) {
+    throw new Error("MARKETING_FFPROBE_COMMAND must be an absolute executable path");
+  }
   return {
     dataDir,
     ...(env.MARKETING_ARTIFACT_DIR ? { artifactDir: env.MARKETING_ARTIFACT_DIR } : {}),
@@ -146,6 +172,14 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
         args: parseBenchmarkMcpArguments(env.MARKETING_BENCHMARK_MCP_ARGS),
       },
     } : {}),
+    ...(mediaMcpCommand ? {
+      mediaMcp: {
+        command: mediaMcpCommand,
+        args: parseMediaMcpArguments(env.MARKETING_MEDIA_MCP_ARGS),
+        envAllowlist: mediaEnvAllowlist,
+      },
+    } : {}),
+    ...(ffprobeCommand ? { ffprobeCommand } : {}),
     logLevel: "info",
   };
 }

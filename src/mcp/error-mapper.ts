@@ -26,6 +26,10 @@ const ANALYTICS_CONFIGURATION_ACTION =
   "Configure MARKETING_ANALYTICS_MCP_COMMAND and MARKETING_ANALYTICS_MCP_ARGS in the trusted deployment environment";
 const BENCHMARK_CONFIGURATION_ACTION =
   "Configure MARKETING_BENCHMARK_MCP_COMMAND and MARKETING_BENCHMARK_MCP_ARGS in the trusted deployment environment";
+const MEDIA_CONFIGURATION_ACTION =
+  "Configure MARKETING_MEDIA_MCP_COMMAND and MARKETING_MEDIA_MCP_ARGS in the trusted deployment environment";
+const PROBE_CONFIGURATION_ACTION =
+  "Configure MARKETING_FFPROBE_COMMAND as an absolute deployment-controlled executable path";
 const SQLITE_CONFIGURATION_ACTION =
   "Configure MARKETING_DATABASE_ROOT in the trusted deployment environment";
 const ANALYTICS_GAP_REASONS = new Set([
@@ -50,6 +54,32 @@ const BENCHMARK_GAP_REASONS = new Set([
   "video_frames_missing",
   "asr_transcript_missing",
   "video_understanding_missing",
+]);
+const MEDIA_GAP_REASONS = new Set([
+  "mcp_not_configured",
+  "mcp_cleanup_failed",
+  "mcp_timeout",
+  "mcp_unavailable",
+  "mcp_invalid_response",
+  "mcp_input_hash_mismatch",
+  "mcp_response_too_large",
+  "mcp_result_mismatch",
+  "chromium_unavailable",
+  "chromium_cleanup_failed",
+  "image_decode_failed",
+  "media_dimensions_mismatch",
+]);
+const PROBE_GAP_REASONS = new Set([
+  "ffprobe_not_configured",
+  "ffprobe_unavailable",
+  "ffprobe_timeout",
+  "ffprobe_output_too_large",
+  "ffprobe_failed",
+  "ffprobe_invalid_response",
+  "ffprobe_cleanup_failed",
+  "media_codec_mismatch",
+  "media_dimensions_mismatch",
+  "media_duration_mismatch",
 ]);
 
 function safeDetails(
@@ -87,6 +117,18 @@ function safeCapabilityDetails(
     safe.capability = "benchmark_reverse";
     safe.configurationAction = BENCHMARK_CONFIGURATION_ACTION;
     if (typeof details.reason === "string" && BENCHMARK_GAP_REASONS.has(details.reason)) {
+      safe.reason = details.reason;
+    }
+  } else if (details?.capability === "professional_media") {
+    safe.capability = "professional_media";
+    safe.configurationAction = MEDIA_CONFIGURATION_ACTION;
+    if (typeof details.reason === "string" && MEDIA_GAP_REASONS.has(details.reason)) {
+      safe.reason = details.reason;
+    }
+  } else if (details?.capability === "video_probe") {
+    safe.capability = "video_probe";
+    safe.configurationAction = PROBE_CONFIGURATION_ACTION;
+    if (typeof details.reason === "string" && PROBE_GAP_REASONS.has(details.reason)) {
       safe.reason = details.reason;
     }
   } else if (details?.capability === "sqlite") {
