@@ -41,6 +41,7 @@ class FixtureProvider implements PublishingProvider {
   submitGate: Promise<void> | undefined;
   submitStarted: (() => void) | undefined;
   submitOutcome: "accepted" | "failed" = "accepted";
+  verifyOutcome: "verified" | "pending" = "verified";
   unconfiguredAccounts = new Set<string>();
 
   isConfigured(_channel: "xhs" | "channels", accountId: string): boolean {
@@ -82,14 +83,14 @@ class FixtureProvider implements PublishingProvider {
   async verify(request: PublishingVerifyRequest): Promise<PublishingProviderResult> {
     this.verifyCalls += 1;
     return {
-      status: "verified",
+      status: this.verifyOutcome,
       inputHash: request.inputHash,
       operationKey: request.operationKey,
       channel: request.channel,
       accountId: request.accountId,
       receipt: null,
-      externalPublicationId: "external-1",
-      publishedAt: due,
+      externalPublicationId: this.verifyOutcome === "verified" ? "external-1" : null,
+      publishedAt: this.verifyOutcome === "verified" ? due : null,
       failure: null,
       toolVersion: "fixture-1",
     };
@@ -354,6 +355,29 @@ describe("PublicationScheduler and manual-assisted delivery", () => {
     expect(await publication()).toMatchObject({ status: "verified" });
     expect(provider.submitCalls).toBe(0);
     expect(provider.verifyCalls).toBe(1);
+  });
+
+  it("verifies a moved nonterminal candidate once per frozen-clock run and recovers it again next run", async () => {
+    await schedule();
+    now = due;
+    await store.transaction(async (repos) => {
+      const current = (await repos.publications.get("publication-1", workspaceId))!;
+      await repos.publications.update({
+        ...current,
+        status: "submitted",
+        updatedAt: initialNow,
+      }, current.version);
+    });
+    provider.verifyOutcome = "pending";
+    scheduler = new PublicationScheduler(store, service, { now: () => now }, { batchSize: 1 });
+
+    await scheduler.recover();
+    expect(provider.verifyCalls).toBe(1);
+    expect(await publication()).toMatchObject({ status: "submitted", updatedAt: due });
+
+    await scheduler.recover();
+    expect(provider.verifyCalls).toBe(2);
+    expect(provider.submitCalls).toBe(0);
   });
 
   it("hands manual due work off without any provider call and reads a canonical package in bounded chunks", async () => {

@@ -93,6 +93,7 @@ export class PublicationScheduler {
 
   private async executeRecovery(): Promise<void> {
     const updatedThrough = this.clock.now();
+    const processed = new Set<string>();
     let after: PublicationRecoveryCursor | undefined;
     while (true) {
       const candidates = await this.store.transaction((repos) =>
@@ -100,6 +101,9 @@ export class PublicationScheduler {
       );
       if (candidates.length === 0) return;
       for (const candidate of candidates) {
+        const identity = JSON.stringify([candidate.workspaceId, candidate.id]);
+        if (processed.has(identity)) continue;
+        processed.add(identity);
         try {
           if (candidate.deliveryMode !== "automatic") continue;
           const verified = await this.publishing.verify(this.command(candidate, "recover"));
