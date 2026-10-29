@@ -469,6 +469,10 @@ export class PublishingService {
       write: async (repos, input, timestamp) => {
         const current = await requireSchedule(repos, input);
         this.assertScheduledVersion(current, input.expectedVersion);
+        const publication = await repos.publications.getByScheduleId(current.id, current.workspaceId);
+        if (!publication || publication.status !== "pending") {
+          conflict("Only a Schedule with a pending Publication can be rescheduled");
+        }
         assertFutureTime(input.scheduledFor, timestamp);
         return repos.schedules.update({
           ...current,
@@ -878,6 +882,13 @@ export class PublishingService {
           conflict("Submission is uncertain; retry must verify before any new submission");
         }
         this.assertAttemptCapacity(current.publication);
+        if (current.schedule.status === "scheduled") {
+          await repos.schedules.update({
+            ...current.schedule,
+            status: "triggered",
+            updatedAt: timestamp,
+          }, current.schedule.version);
+        }
         const attempt: PublicationAttempt = {
           attempt: current.publication.attempts.length + 1,
           startedAt: timestamp,

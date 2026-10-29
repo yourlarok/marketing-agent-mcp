@@ -1,5 +1,10 @@
 import type { Command, CommandContext } from "./commands.js";
-import type { Clock, Store } from "./ports.js";
+import type {
+  Clock,
+  PublicationRecoveryCursor,
+  ScheduleDueCursor,
+  Store,
+} from "./ports.js";
 import type { PublicationOperation } from "./publishing-commands.js";
 import type { Publication } from "../domain/publishing-model.js";
 import type { PublishingService } from "./publishing-service.js";
@@ -87,38 +92,54 @@ export class PublicationScheduler {
   }
 
   private async executeRecovery(): Promise<void> {
-    const candidates = await this.store.transaction((repos) =>
-      repos.publications.listAllRecoveryCandidates(this.batchSize)
-    );
-    for (const candidate of candidates) {
-      try {
-        if (candidate.deliveryMode !== "automatic") continue;
-        const verified = await this.publishing.verify(this.command(candidate, "recover"));
-        await this.publishing.reconcileSchedule(verified);
-      } catch (error) {
-        this.onError(error);
+    const updatedThrough = this.clock.now();
+    let after: PublicationRecoveryCursor | undefined;
+    while (true) {
+      const candidates = await this.store.transaction((repos) =>
+        repos.publications.listAllRecoveryCandidates(this.batchSize, after, updatedThrough)
+      );
+      if (candidates.length === 0) return;
+      for (const candidate of candidates) {
+        try {
+          if (candidate.deliveryMode !== "automatic") continue;
+          const verified = await this.publishing.verify(this.command(candidate, "recover"));
+          await this.publishing.reconcileSchedule(verified);
+        } catch (error) {
+          this.onError(error);
+        }
       }
+      const last = candidates[candidates.length - 1]!;
+      after = { updatedAt: last.updatedAt, workspaceId: last.workspaceId, id: last.id };
+      if (candidates.length < this.batchSize) return;
     }
   }
 
   private async executeDue(): Promise<void> {
-    const schedules = await this.store.transaction((repos) =>
-      repos.schedules.listAllDue(this.clock.now(), this.batchSize)
-    );
-    for (const schedule of schedules) {
-      try {
-        const publication = await this.store.transaction((repos) =>
-          repos.publications.getByScheduleId(schedule.id, schedule.workspaceId)
-        );
-        if (!publication) continue;
-        if (schedule.deliveryMode === "manual_assisted") {
-          await this.publishing.manualHandoff(this.command(publication, "manual-handoff"));
-          continue;
+    const dueBy = this.clock.now();
+    let after: ScheduleDueCursor | undefined;
+    while (true) {
+      const schedules = await this.store.transaction((repos) =>
+        repos.schedules.listAllDue(dueBy, this.batchSize, after)
+      );
+      if (schedules.length === 0) return;
+      for (const schedule of schedules) {
+        try {
+          const publication = await this.store.transaction((repos) =>
+            repos.publications.getByScheduleId(schedule.id, schedule.workspaceId)
+          );
+          if (!publication) continue;
+          if (schedule.deliveryMode === "manual_assisted") {
+            await this.publishing.manualHandoff(this.command(publication, "manual-handoff"));
+            continue;
+          }
+          await this.executeAutomatic(publication);
+        } catch (error) {
+          this.onError(error);
         }
-        await this.executeAutomatic(publication);
-      } catch (error) {
-        this.onError(error);
       }
+      const last = schedules[schedules.length - 1]!;
+      after = { scheduledFor: last.scheduledFor, workspaceId: last.workspaceId, id: last.id };
+      if (schedules.length < this.batchSize) return;
     }
   }
 

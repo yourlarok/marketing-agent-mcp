@@ -41,9 +41,10 @@ class FixtureProvider implements PublishingProvider {
   submitGate: Promise<void> | undefined;
   submitStarted: (() => void) | undefined;
   submitOutcome: "accepted" | "failed" = "accepted";
+  unconfiguredAccounts = new Set<string>();
 
-  isConfigured(): boolean {
-    return true;
+  isConfigured(_channel: "xhs" | "channels", accountId: string): boolean {
+    return !this.unconfiguredAccounts.has(accountId);
   }
 
   async submit(request: PublishingSubmitRequest): Promise<PublishingProviderResult> {
@@ -98,6 +99,7 @@ class FixtureProvider implements PublishingProvider {
 describe("PublicationScheduler and manual-assisted delivery", () => {
   let tempDir: string;
   let artifactRoot: string;
+  let storePath: string;
   let store: Store;
   let artifacts: ArtifactStore;
   let stored: StoredArtifact;
@@ -110,7 +112,8 @@ describe("PublicationScheduler and manual-assisted delivery", () => {
   beforeEach(async () => {
     tempDir = await createTempDir();
     artifactRoot = await createTempDir();
-    store = openStore(join(tempDir, "scheduler.db"));
+    storePath = join(tempDir, "scheduler.db");
+    store = openStore(storePath);
     artifacts = new ArtifactStore(artifactRoot);
     stored = await artifacts.put(Buffer.from("approved media bytes"));
     provider = new FixtureProvider();
@@ -142,6 +145,10 @@ describe("PublicationScheduler and manual-assisted delivery", () => {
       },
       context: context(`approve-${suffix}`),
     });
+    await createSchedule(overrides, suffix);
+  }
+
+  async function createSchedule(overrides: Partial<CreateSchedule> = {}, suffix = "create"): Promise<void> {
     await service.createSchedule({
       input: {
         id: "schedule-1", publicationId: "publication-1", workspaceId,
@@ -260,6 +267,93 @@ describe("PublicationScheduler and manual-assisted delivery", () => {
     expect(provider.submitCalls).toBe(1);
     expect(provider.verifyCalls).toBe(1);
     expect(await publication()).toMatchObject({ status: "verified" });
+  });
+
+  it("fences reschedule at the submit claim and verifies immediately after restart without another submit", async () => {
+    await schedule();
+    now = due;
+    let release!: () => void;
+    let started!: () => void;
+    provider.submitGate = new Promise<void>((resolve) => { release = resolve; });
+    const providerStarted = new Promise<void>((resolve) => { started = resolve; });
+    provider.submitStarted = () => started();
+    const submitting = service.submit({
+      input: { id: "publication-1", workspaceId, expectedVersion: 1 },
+      context: context("inflight-submit"),
+    });
+    await providerStarted;
+    const claimedSchedule = await store.transaction((repos) => repos.schedules.get("schedule-1", workspaceId));
+    const rescheduleResult = await service.reschedule({
+      input: {
+        id: "schedule-1", workspaceId, expectedVersion: claimedSchedule!.version,
+        scheduledFor: "2026-11-02T10:00:00.000Z", timeZone: "UTC",
+      },
+      context: context("inflight-reschedule"),
+    }).then(() => null, (error: unknown) => error);
+    release();
+    expect(await submitting).toMatchObject({ status: "submitted" });
+
+    store.close();
+    store = openStore(storePath);
+    service = new PublishingService(
+      store, { now: () => now }, { next: () => `audit-${++sequence}` }, artifacts, provider, provider,
+    );
+    scheduler = new PublicationScheduler(store, service, { now: () => now });
+    await scheduler.runOnce();
+
+    expect(rescheduleResult).toMatchObject({ code: "CONFLICT" });
+    expect(provider.submitCalls).toBe(1);
+    expect(provider.verifyCalls).toBe(1);
+    expect(await publication()).toMatchObject({ status: "verified" });
+    expect(await store.transaction((repos) => repos.schedules.get("schedule-1", workspaceId)))
+      .toMatchObject({ status: "completed", scheduledFor: due });
+  });
+
+  it("continues past a persistently failing first due row with batchSize 1", async () => {
+    await schedule({
+      id: "schedule-0", publicationId: "publication-0", accountId: "account-blocked",
+      scheduledFor: "2026-10-30T09:00:00.000Z",
+    }, "blocked-due");
+    await createSchedule({}, "valid-due");
+    provider.unconfiguredAccounts.add("account-blocked");
+    now = due;
+    scheduler = new PublicationScheduler(store, service, { now: () => now }, { batchSize: 1 });
+
+    await scheduler.runOnce();
+
+    expect(await store.transaction((repos) => repos.publications.get("publication-0", workspaceId)))
+      .toMatchObject({ status: "pending" });
+    expect(await publication()).toMatchObject({ status: "verified" });
+    expect(provider.submitCalls).toBe(1);
+    expect(provider.verifyCalls).toBe(1);
+  });
+
+  it("continues past a persistently failing first recovery row with batchSize 1", async () => {
+    await schedule({
+      id: "schedule-0", publicationId: "publication-0", accountId: "account-blocked",
+      scheduledFor: "2026-10-30T09:00:00.000Z",
+    }, "blocked-recovery");
+    await createSchedule({}, "valid-recovery");
+    await store.transaction(async (repos) => {
+      for (const [id, updatedAt] of [
+        ["publication-0", "2026-10-29T11:00:00.000Z"],
+        ["publication-1", "2026-10-29T11:01:00.000Z"],
+      ] as const) {
+        const current = (await repos.publications.get(id, workspaceId))!;
+        await repos.publications.update({ ...current, status: "unknown", updatedAt }, current.version);
+      }
+    });
+    provider.unconfiguredAccounts.add("account-blocked");
+    now = due;
+    scheduler = new PublicationScheduler(store, service, { now: () => now }, { batchSize: 1 });
+
+    await scheduler.recover();
+
+    expect(await store.transaction((repos) => repos.publications.get("publication-0", workspaceId)))
+      .toMatchObject({ status: "unknown" });
+    expect(await publication()).toMatchObject({ status: "verified" });
+    expect(provider.submitCalls).toBe(0);
+    expect(provider.verifyCalls).toBe(1);
   });
 
   it("hands manual due work off without any provider call and reads a canonical package in bounded chunks", async () => {

@@ -37,8 +37,10 @@ import type {
   EntityRepository,
   IdempotencyRecord,
   IdempotencyRepository,
+  PublicationRecoveryCursor,
   PublicationRepository,
   Repositories,
+  ScheduleDueCursor,
   ScheduleRepository,
   Store,
   TaskRepository,
@@ -666,13 +668,17 @@ class SqliteScheduleRepository extends SqliteEntityRepository implements Schedul
     return rows.map((row) => JSON.parse(row.payload) as Schedule);
   }
 
-  async listAllDue(dueBy: string, limit?: number): Promise<Schedule[]> {
+  async listAllDue(dueBy: string, limit?: number, after?: ScheduleDueCursor): Promise<Schedule[]> {
     assertUtcInstant(dueBy);
+    const parameters: (string | number)[] = [dueBy];
+    if (after) parameters.push(after.scheduledFor, after.workspaceId, after.id);
+    parameters.push(queryLimit(limit));
     const rows = this.database.prepare(
       `SELECT payload FROM schedules
        WHERE status = 'scheduled' AND scheduled_for <= ?
+       ${after ? "AND (scheduled_for, workspace_id, id) > (?, ?, ?)" : ""}
        ORDER BY scheduled_for, workspace_id, id LIMIT ?`,
-    ).all(dueBy, queryLimit(limit)) as unknown as { payload: string }[];
+    ).all(...parameters) as unknown as { payload: string }[];
     return rows.map((row) => JSON.parse(row.payload) as Schedule);
   }
 }
@@ -724,12 +730,23 @@ class SqlitePublicationRepository extends SqliteEntityRepository implements Publ
     return rows.map((row) => JSON.parse(row.payload) as Publication);
   }
 
-  async listAllRecoveryCandidates(limit?: number): Promise<Publication[]> {
+  async listAllRecoveryCandidates(
+    limit?: number,
+    after?: PublicationRecoveryCursor,
+    updatedThrough?: string,
+  ): Promise<Publication[]> {
+    if (updatedThrough) assertUtcInstant(updatedThrough);
+    const parameters: (string | number)[] = [];
+    if (updatedThrough) parameters.push(updatedThrough);
+    if (after) parameters.push(after.updatedAt, after.workspaceId, after.id);
+    parameters.push(queryLimit(limit));
     const rows = this.database.prepare(
       `SELECT payload FROM publications
        WHERE status IN ('submitting', 'submitted', 'unknown')
+       ${updatedThrough ? "AND updated_at <= ?" : ""}
+       ${after ? "AND (updated_at, workspace_id, id) > (?, ?, ?)" : ""}
        ORDER BY updated_at, workspace_id, id LIMIT ?`,
-    ).all(queryLimit(limit)) as unknown as { payload: string }[];
+    ).all(...parameters) as unknown as { payload: string }[];
     return rows.map((row) => JSON.parse(row.payload) as Publication);
   }
 

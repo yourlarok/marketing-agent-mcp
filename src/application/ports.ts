@@ -60,14 +60,30 @@ export interface ImmutableEntityRepository<T extends EntityRecord> {
 
 export type ApprovalRepository = ImmutableEntityRepository<Approval>;
 
+export interface ScheduleDueCursor {
+  scheduledFor: Instant;
+  workspaceId: Id;
+  id: Id;
+}
+
+export interface PublicationRecoveryCursor {
+  updatedAt: Instant;
+  workspaceId: Id;
+  id: Id;
+}
+
 export interface ScheduleRepository extends EntityRepository<Schedule> {
   listDue(workspaceId: Id, dueBy: Instant, limit?: number): Promise<Schedule[]>;
-  listAllDue(dueBy: Instant, limit?: number): Promise<Schedule[]>;
+  listAllDue(dueBy: Instant, limit?: number, after?: ScheduleDueCursor): Promise<Schedule[]>;
 }
 
 export interface PublicationRepository extends EntityRepository<Publication> {
   listRecoveryCandidates(workspaceId: Id, limit?: number): Promise<Publication[]>;
-  listAllRecoveryCandidates(limit?: number): Promise<Publication[]>;
+  listAllRecoveryCandidates(
+    limit?: number,
+    after?: PublicationRecoveryCursor,
+    updatedThrough?: Instant,
+  ): Promise<Publication[]>;
   getByScheduleId(scheduleId: Id, workspaceId: Id): Promise<Publication | undefined>;
 }
 
