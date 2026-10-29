@@ -1,6 +1,6 @@
 # Marketing Agent MCP
 
-通过 stdio 提供营销审计、数据准备、证据资产、受控公开研究、确定性竞品比较和版本化分析网络的 MCP server。所有实体按 `workspaceId` 隔离；写操作保留审计与幂等记录。
+通过 stdio 提供营销审计、数据准备、证据资产、受控公开研究、确定性竞品比较、版本化分析网络、证据绑定逆向和原创内容生成资产的 MCP server。所有实体按 `workspaceId` 隔离；写操作保留审计与幂等记录。
 
 ## 环境要求与安装
 
@@ -17,7 +17,7 @@ mkdir -p /absolute/path/to/marketing-imports
 mkdir -p /absolute/path/to/marketing-artifacts
 ```
 
-Linux 若缺少 Chromium 系统依赖，可按 Playwright 官方提示安装对应依赖。`npm run smoke` 会启动真 Chromium，不会用模拟浏览器替代；缺少浏览器时必须先执行上述安装命令。
+Linux 若缺少 Chromium 系统依赖，可按 Playwright 官方提示安装对应依赖。`npm run smoke` 会启动真 Chromium，不会用模拟浏览器替代；缺少浏览器时必须先执行上述安装命令。内容生产 smoke 还要求可信本地 ffmpeg/ffprobe：测试用 `MARKETING_TEST_FFMPEG` 和 `MARKETING_TEST_FFPROBE` 指定精确绝对路径（未设置时使用 `/opt/homebrew/bin/ffmpeg` 与 `/opt/homebrew/bin/ffprobe`）。ffmpeg 仅供独立测试 media fixture 生成真实 PNG/MP4；ffprobe 同时用于 server 验收和测试独立复核，不可跳过或用签名/描述符代替。
 
 启动、构建和测试均应在项目根目录执行。server 入口是构建后的 `dist/index.js`，不是源码或 `node_modules`。
 
@@ -28,7 +28,11 @@ Linux 若缺少 Chromium 系统依赖，可按 Playwright 官方提示安装对�
 | `MARKETING_DATA_DIR` | 必填，必须是已存在目录。SQLite 位于其中的 `marketing.db`。 |
 | `MARKETING_IMPORT_ROOT` | 文件导入必填，必须是已存在目录。`ingest_files.paths` 使用相对该目录的路径；绝对路径、`..` 和解析后越界的符号链接均不能绕过目录边界。 |
 | `MARKETING_DATABASE_ROOT` | SQLite discover/snapshot 必填，必须是已存在且明确授权的数据库目录。只允许读取 canonical path 仍位于该根内的普通 `.sqlite` / `.db` 文件。 |
-| `MARKETING_ARTIFACT_DIR` | 产生或读取证据资产时必填。首次使用时自动创建并设为私有目录权限；原始文件/API 响应、规范化 JSONL、质量报告、页面正文和 PNG 截图按 SHA-256 内容寻址保存。 |
+| `MARKETING_ARTIFACT_DIR` | 产生或读取证据资产时必填。首次使用时自动创建并设为私有目录权限；原始文件/API 响应、规范化 JSONL、质量报告、页面正文、PNG 截图、持久化视频帧/ASR（若另行取得）以及生成资产按 SHA-256 内容寻址保存。 |
+| `MARKETING_BENCHMARK_MCP_COMMAND` / `MARKETING_BENCHMARK_MCP_ARGS` | 可选但逆向必需；受信任 stdio reverse provider 的固定 executable 与 JSON 字符串数组参数。 |
+| `MARKETING_MEDIA_MCP_COMMAND` / `MARKETING_MEDIA_MCP_ARGS` | 可选但生成/派生必需；受信任 stdio media provider 的固定 executable 与 JSON 字符串数组参数。 |
+| `MARKETING_MEDIA_MCP_ENV_ALLOWLIST` | 可选；媒体 provider 可接收的部署环境变量名逗号列表，不能由工具调用覆盖。 |
+| `MARKETING_FFPROBE_COMMAND` | Channels 验收必需；独立可信 ffprobe 的绝对 executable path。 |
 
 仅使用血缘工具时不需要 import/artifact root。import root 中的输入文件和 artifact root 中的证据应分别授权；不要因为导入目录可读就把证据目录暴露给其他用户。
 
@@ -290,6 +294,55 @@ Task 完成后可将 Task 与对应 Monitor 链入新版 task-effect view。base
 
 `strategy_task_list` 按 **`(rank,id)`** 排序并提供有界 cursor；符合条件的 Task 仍通过既有 `task_transition` 显式执行 `draft → ready → in_progress → completed`。这些工具只管理用户控制的草稿与状态，**不自动生产内容、审核、排期或发布**，也不会创建相应工具调用或记录。
 
+## 证据绑定逆向与原创内容生产
+
+完整公开流程是：**合法公开页面与 CompetitorDiff → persisted BenchmarkAnalysis → 原创 ContentBrief → 分渠道生成/派生 AssetVersion → 分块读取与重启恢复**。每一步只使用公开工具返回的工作区 ID、版本和描述符；不接受 SQL、artifact 文件路径、调用方媒体字节或动态 provider 命令。
+
+### 8 个工具与 persisted Evidence
+
+- `benchmark_reverse_create` / `benchmark_reverse_get`：从选定 Evidence 创建、读取不可变的版本 1 BenchmarkAnalysis；可选关联当前版本的 CompetitorDiff。
+- `content_brief_create` / `content_brief_get`：从 ready 或 in_progress Task、Recommendation、BenchmarkAnalysis 和事实 Finding 创建、读取不可变的版本 1 ContentBrief。
+- `content_asset_generate` / `content_asset_derive` / `content_asset_get`：分别创建根资产、从最新父版本派生下一版本、读取任一持久化版本。
+- `content_artifact_get`：按 AssetVersion 与 artifact ID 读取实际 PNG/MP4 字节，不提供路径访问。
+
+`ingest_content_links` 和公开研究只持久化实际取得的 `page_text`、字段和 `screenshot` 等观察，**不制造 `video_frames` 或 `asr_transcript`**。图片逆向至少需要真实 page text 或 screenshot；视频逆向要求每个入选 Evidence 都已具有真实 persisted `video_frames` 和 `asr_transcript`。缺少任一资产时分别返回 `image_observation_missing`、`video_frames_missing` 或 `asr_transcript_missing` 的 `CAPABILITY_UNAVAILABLE`，不会用页面文字或图片冒充视频理解。
+
+逆向 provider 必须返回与输入规范一致的 SHA-256 `inputHash`。server 重算并核对 hash，只接受实际送入的 Evidence asset refs，保留其 `observedAt`、字节数和 `contentHash`，再次验证观察 basis。每个 method 具有 `hook`、`information_order`、`layout`、`shot_rhythm`、`cta` 或 `other` 维度及 `high|medium|low|unknown` confidence；`unknown` 必须原样保留。`analysisMethod` 和 `humanReview: "not_performed"` 描述实际 fixture/provider 方法与人工审查边界，不包含原文 excerpt、虚构指标、因果效果或“人工看过视频”的声明。
+
+### 宿主语言原创 brief 与事实引用
+
+`content_brief_create` 要求使用**宿主用户原始语言**创作新表达，而不是拼接公开 benchmark 文本。`creative` segment 是原创表达；`fact` segment 必须通过 `findingId` 引用 persisted fact Finding，且该 Finding 有 Evidence 并属于当前 Recommendation 的 Finding/Evidence 上下文。未关联、跨工作区、非 fact 或无 Evidence 的引用会被拒绝。brief 自动派生 `findingIds`、`evidenceIds` 和带版本的 `sourceVersions`，调用方不能直接注入这些血缘字段。
+
+公开来源文字与独立生产素材始终是两条通道：BenchmarkAnalysis 涉及的 Evidence 不能作为 production source，production source 必须另行具有 `owned` 或 `authorized` 权限。对公开文字中连续至少 40 个 Unicode code point 的规范化精确复用会拒绝 brief；这只是一项防直接复制检查，**不是版权、法律或原创性保证**。
+
+XHS 与 Channels 必须分别创建 brief、分别调用 generate/derive，使用不同 `contentId`；没有批量双渠道生成或调用方 channel/profile override。Channels brief 可有多个镜头，每帧 `durationMs` 为正整数，总时长不超过 60,000 ms；例如两个镜头各 1,000 ms，合计 2,000 ms。
+
+### 精确内部 profile、provider 与真实媒体验收
+
+server 根据 persisted brief 选择下列固定 profile。它们是内部输入与验收规格，不是平台官方认证、发布许可或分发效果保证。
+
+| channel / profileId | 实际输出与精确验收 | 上限 | guarantee |
+| --- | --- | --- | --- |
+| `xhs` / `xhs_png_1080x1440_v1` | PNG；真实 Playwright Chromium decode 后 natural size 必须为 **1080×1440** | 4 MiB | `internal_acceptance_only` |
+| `channels` / `channels_mp4_1080x1920_h264_aac_v1` | 独立真实 ffprobe；恰好一个 **1080×1920 H.264** 视频流和一个 **AAC** 音频流，时长为正且不超过 60 秒 | 16 MiB | `internal_acceptance_only` |
+
+逆向与媒体生成都需要部署方显式配置独立 stdio MCP。逆向固定调用 `reverse_engineer`，媒体固定调用 `render`；media provider 返回的 `inputHash`、media type、字节长度、SHA-256 `contentHash` 和实际存储字节必须一致。未配置时没有本地逆向或生成器 fallback，也不会把 fixture 或内置函数冒充商业 provider。
+
+- `MARKETING_BENCHMARK_MCP_COMMAND` 与 JSON 字符串数组 `MARKETING_BENCHMARK_MCP_ARGS`：受信任部署配置；单 asset 16 MiB、合计 24 MiB、文字 1 MiB、provider 响应 1 MiB、60 秒超时、最多 20 个 methods。
+- `MARKETING_MEDIA_MCP_COMMAND` 与 JSON 字符串数组 `MARKETING_MEDIA_MCP_ARGS`：受信任部署配置；provider 响应 24 MiB、120 秒超时；最多 8 个独立 source assets 加 1 个 parent，source/parent 合计 16 MiB。
+- `MARKETING_MEDIA_MCP_ENV_ALLOWLIST`：逗号分隔的媒体 provider 环境变量名 allowlist。只有列出的部署变量可转发，工具调用方不能传 env；其他业务环境变量和凭据默认不进入 provider。
+- `MARKETING_FFPROBE_COMMAND`：必须是部署控制的**绝对可执行路径**，独立于 media provider。每次 Channels generate/derive 对实际返回字节执行版本与媒体 probe；单次 10 秒、probe 输出 64 KiB。XHS 使用 Chromium decode，不借 ffprobe 代替。
+
+每次调用使用独立受控 provider/client，并在成功、协议错误、超时或验证失败后清理进程；临时 probe 文件也会删除。响应 schema、输入输出字节、source/parent 总量、超时和环境转发均有硬边界。上述校验与进程清理**不是 OS 沙箱**，部署方仍需以独立账户、容器和主机资源/网络策略限制受信任 provider。
+
+### 不可变派生、分块、重启与失败边界
+
+根 AssetVersion 为版本 1 且 parent 为 null。derive 必须传当前最新 `parentVersionId` 和 `expectedParentVersion`，创建同一 `contentId` 的下一不可变版本，父版本保持不变；stale parent 返回 conflict。派生记录 parent artifact hash、实际 `revisionInstructions`、修改 actor、requestId、UTC createdAt、provider provenance 和新的实际内容 hash，并重新执行完整媒体验收。相同命令与 idempotency key 精确重放返回相同实体，不再次调用 provider；复用 key 但改变输入会被拒绝。提交前会重查 brief、Task、Recommendation、Finding、Evidence、Source、source materials、版本和 parent，防止准备期间的血缘变化被静默写入。
+
+`content_artifact_get` 的 `offset` / `length` 以原始字节计，`length` 默认且最大 **32 KiB（32,768 bytes）**，响应为当前块的 base64、`totalBytes` 和完整资产 `contentHash`。调用方逐块拼回后必须独立计算 SHA-256；不得把单块 hash 当作整文件 hash。使用同一 data/artifact roots 重启后，只需 `benchmark_reverse_get`、`content_brief_get`、`content_asset_get`、`lineage_get` 和 `content_artifact_get` 即可恢复分析、brief、全部资产版本、Task/Recommendation/Finding/Evidence/parent 血缘与每个 artifact，无需 SQL 或路径。
+
+provider 未配置、真实媒体缺失、decode/probe 失败或 hash 不符时返回结构化 capability gap；失败命令**不留下成功的 BenchmarkAnalysis/AssetVersion 版本、成功审计或幂等结果**，后续 get 为 NOT_FOUND。已通过内部验收也不等于人工审核、法律放行、平台官方验证、排期、发布或效果复盘；当前没有内容审批、自动排期、发布或生成资产效果复盘工具。
+
 ## 上限、部分失败与隐私
 
 ### 内置上限
@@ -329,7 +382,7 @@ Task 完成后可将 Task 与对应 Monitor 链入新版 task-effect view。base
 
 ## 持久化与关闭
 
-每次内容采集结束会关闭 Chromium、目标固定代理和专业内容 MCP client；每次外部分析结束也会清理其独立 provider 进程。server 响应 `SIGINT` / `SIGTERM`，关闭 MCP transport 和 SQLite 后退出；关闭 MCP client 也会触发 transport 清理。不要在写入或关闭过程中直接删除数据库或证据目录。
+每次内容采集结束会关闭 Chromium、目标固定代理和专业内容 MCP client；每次外部分析、benchmark reverse 和 media render 结束也会清理各自独立 provider/client 进程。server 响应 `SIGINT` / `SIGTERM`，关闭 MCP transport 和 SQLite 后退出；关闭 MCP client 也会触发 transport 清理。不要在写入或关闭过程中直接删除数据库或证据目录。
 
 ## 工具总览
 
@@ -342,6 +395,7 @@ Task 完成后可将 Task 与对应 Monitor 链入新版 task-effect view。base
 | 竞品与证据 | `competitor_confirm`、`competitor_diff_create`、`data_research_get`、`evidence_asset_get` |
 | 分析网络 | `marketing_analysis_start`、`marketing_capability_list`、`analysis_graph_get`、`analysis_graph_expand`、`analysis_graph_fork`、`metric_compute`、`professional_analytics_compute`、`metric_scenario_create`、`metric_monitor_compare` |
 | 受控看板与策略 | `dashboard_render`、`dashboard_get`、`dashboard_artifact_get`、`dashboard_drilldown_get`、`strategy_recommendation_generate`、`strategy_task_supplement`、`strategy_task_update`、`strategy_task_reject`、`strategy_task_reorder`、`strategy_task_get`、`strategy_task_list` |
+| 逆向与内容生产 | `benchmark_reverse_create`、`benchmark_reverse_get`、`content_brief_create`、`content_brief_get`、`content_asset_generate`、`content_asset_derive`、`content_asset_get`、`content_artifact_get` |
 
 `capability_health_record` 只有在关联证据包含完全匹配的 `toolHealth` 时才能把能力置为 `verified`。健康检查必须由调用方实际完成；能力注册不等于安装、授权、执行或健康验证。`marketing_capability_list` 同样只是声明与路由目录，不会把未安装的 connector 变成可用能力。
 
@@ -357,25 +411,26 @@ npm run smoke
 `npm run smoke` 等价于：
 
 ```bash
-vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/dashboard-strategy-stdio.test.ts tests/e2e/data-analytics-documentation.test.ts
+vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/dashboard-strategy-stdio.test.ts tests/e2e/content-production-stdio.test.ts tests/e2e/data-analytics-documentation.test.ts
 ```
 
-运行 smoke 前必须构建最新代码。五套 stdio 验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client，另有 README/smoke 文档契约，共 13 个 smoke cases：
+运行 smoke 前必须构建最新代码。六套 stdio 验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client，另有 README/smoke 文档契约，共 **14 个 smoke cases**：
 
 - 原套件覆盖营销链、幂等、血缘、能力健康、输入边界、原始 malformed JSON、协议专用 stdout、启动失败和优雅关闭。
 - 数据研究套件启动本地 HTTP fixture 与真 Chromium，完成计划、CSV/XLSX 与质量资产、env-ref 认证临时 API、内容链接、研究权限与限域抓取、竞品确认/Diff、证据读取，并重启验证 plan/session/diff/artifact。loopback 仅在测试进程内显式 allowlist，测试凭据仅通过 env reference 使用。
 - 分析网络套件覆盖初始化 instructions、无数据公开研究分支、能力边界、公开/自有文件指标、条件情景、监控、expand/fork、幂等与父图不变，并在重启后仅通过 `analysis_graph_get` 恢复全部节点和引用；验证零分母 unknown、complete-case、公开来源参考度与不可比语义，不使用带外 SQL。
 - SQLite/外部分析套件使用临时真实 SQLite 和独立分析 MCP fixture，核对 discover、结构化 snapshot/ingest、engagement/conversion 数值、Wilson 适用性与区间、trend/funnel/anomaly 实质结果、input hash/证据 provenance、fork、重启恢复以及未配置 capability gap；每例使用独立目录和子进程环境，并关闭 server/provider。
 - 看板策略套件使用真实 CSV、外部分析 MCP、loopback Chromium 竞对和本地 Playwright Chromium 读取五 SVG，验证双 artifact 分块/hash、下钻、建议数学、任务控制、版本/幂等与重启恢复；不 mock provider、browser 或 artifact。
+- 内容生产套件使用显式 allowlist 的 loopback 合法公开页面、真 Chromium、独立 benchmark/media stdio fixture commands 和临时 roots，覆盖两种 brief、三个资产版本、父版本派生、stale conflict、精确幂等重放不增加 provider 调用、32 KiB 多块 SHA-256 读取、公开工具重启恢复以及移除 provider/ffprobe 后的结构化缺口与 NOT_FOUND。测试另用真实 Playwright 解码 1080×1440 PNG，用可信 ffprobe 复核 1080×1920 H.264/AAC MP4 和 2,000 ms 时长（格式解析允许 **50 ms** 容差）；每份 artifact 至少两块，不 mock provider/browser、不跳过 ffprobe、不访问商业服务，并检查 provider/server 进程退出、协议专用 stdout 和无 shutdown stderr。
 
-`npm test` 也包含这些 e2e 文件，因此同样要求最新 `dist` 和可用 Chromium。
+`npm test` 也包含这些 e2e 文件，因此同样要求最新 `dist`、可用 Chromium 以及上述测试 ffmpeg/ffprobe。
 
 ## 当前不支持
 
 - 不做自动因果推断、保证性提升或商业结果承诺；条件情景、Wilson 区间和前后对比不能替代实验或因果分析。
-- 看板仅为上述受控 HTML/SVG，不是 Power BI 或专业 BI；不提供内容生成、逆向制作、审批执行或发布，策略任务不自动生产内容、审核、排期或发布。
+- 看板仅为上述受控 HTML/SVG，不是 Power BI 或专业 BI。内容逆向和生成必须显式配置真实 provider；当前不提供内容审批执行、自动排期、发布或生成资产效果复盘，策略任务不自动执行这些操作。
 - 不提供 PostgreSQL、MySQL、GA4 connector，不安装或声明外部营销平台的 OAuth、账户同步、live connector，也不提供定时/自动调度监控；文件、临时授权 API、SQLite 和公开链接快照不等于持续平台集成。
-- 不声明内置任何特定专业内容或分析 MCP 供应商集成；外部分析必须显式配置真实依赖，未配置时没有本地分析 fallback。
+- 不声明内置任何特定专业内容、逆向、媒体或分析 MCP 供应商集成；这些能力必须显式配置真实依赖，未配置时没有本地 reverse/generate/analytics fallback。
 - SQLite connector 不支持视图、BLOB、WAL、任意 SQL、实时同步或没有兼容 POSIX `/dev/fd` 的平台。
 - 不支持自动登录、CAPTCHA 绕过、文件下载、任意脚本执行、任意 SQL/Python/公式 DSL、跨 Dataset join、语义化竞品结论或把 `unknown` 当作事实。
 - 不提供跨工作区访问、多用户认证、远程传输、访问控制、数据库加密或外部 MCP 的 OS 沙箱。

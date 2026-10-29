@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 
 describe("data analytics smoke and documentation contracts", () => {
-  it("retains every stdio suite and includes dashboard strategy in npm smoke", async () => {
+  it("retains every stdio suite and includes content production in npm smoke", async () => {
     const manifest = JSON.parse(await readFile(join(projectRoot, "package.json"), "utf8")) as {
       scripts: { smoke: string };
     };
@@ -16,6 +16,7 @@ describe("data analytics smoke and documentation contracts", () => {
       "tests/e2e/analysis-stdio.test.ts",
       "tests/e2e/public-data-analytics-stdio.test.ts",
       "tests/e2e/dashboard-strategy-stdio.test.ts",
+      "tests/e2e/content-production-stdio.test.ts",
       "tests/e2e/data-analytics-documentation.test.ts",
     ]) {
       expect(manifest.scripts.smoke).toContain(suite);
@@ -109,5 +110,43 @@ describe("data analytics smoke and documentation contracts", () => {
     ]) {
       expect(readme, `README must disclose ${required}`).toContain(required);
     }
+    for (const required of [
+      "benchmark_reverse_create",
+      "benchmark_reverse_get",
+      "content_brief_create",
+      "content_brief_get",
+      "content_asset_generate",
+      "content_asset_derive",
+      "content_asset_get",
+      "content_artifact_get",
+      "MARKETING_BENCHMARK_MCP_COMMAND",
+      "MARKETING_BENCHMARK_MCP_ARGS",
+      "MARKETING_MEDIA_MCP_COMMAND",
+      "MARKETING_MEDIA_MCP_ARGS",
+      "MARKETING_MEDIA_MCP_ENV_ALLOWLIST",
+      "MARKETING_FFPROBE_COMMAND",
+      "不制造 `video_frames` 或 `asr_transcript`",
+      "high|medium|low|unknown",
+      "宿主用户原始语言",
+      "findingId",
+      "xhs_png_1080x1440_v1",
+      "channels_mp4_1080x1920_h264_aac_v1",
+      "internal_acceptance_only",
+      "分别调用 generate/derive",
+      "inputHash",
+      "expectedParentVersion",
+      "32,768 bytes",
+      "sourceVersions",
+      "不留下成功的 BenchmarkAnalysis/AssetVersion",
+      "不是 OS 沙箱",
+      "MARKETING_TEST_FFMPEG",
+      "MARKETING_TEST_FFPROBE",
+      "2,000 ms",
+      "50 ms",
+      "效果复盘",
+    ]) {
+      expect(readme, `README must disclose content production contract ${required}`).toContain(required);
+    }
+    expect(readme).not.toContain("不提供内容生成、逆向制作");
   });
 });
