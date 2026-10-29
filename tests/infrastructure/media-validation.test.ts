@@ -58,6 +58,30 @@ function matroska(): Uint8Array {
   }
 }
 
+function mov(): Uint8Array {
+  const directory = mkdtempSync(join(tmpdir(), "marketing-real-mov-fixture-"));
+  const path = join(directory, "fixture.mov");
+  try {
+    execFileSync(ffmpeg, [
+      "-v", "error", "-y",
+      "-f", "lavfi",
+      "-i", "color=c=red:s=1080x1920:r=1",
+      "-f", "lavfi",
+      "-i", "sine=frequency=1000:sample_rate=44100",
+      "-t", "2",
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-f", "mov",
+      path,
+    ], { maxBuffer: 24 * 1024 * 1024, timeout: 30_000 });
+    return readFileSync(path);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 function mp4(options: { duration?: string; width?: number; audio?: boolean; videoCodec?: string } = {}): Uint8Array {
   const width = options.width ?? 1080;
   const audio = options.audio ?? true;
@@ -78,6 +102,24 @@ function mp4(options: { duration?: string; width?: number; audio?: boolean; vide
       path,
     ], { maxBuffer: 24 * 1024 * 1024, timeout: 30_000 });
     return readFileSync(path);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function majorBrand(bytes: Uint8Array): string {
+  const directory = mkdtempSync(join(tmpdir(), "marketing-major-brand-probe-"));
+  const path = join(directory, "fixture-media");
+  try {
+    writeFileSync(path, bytes, { flag: "wx", mode: 0o600 });
+    const output = execFileSync(ffprobe, [
+      "-v", "error",
+      "-show_entries", "format_tags=major_brand",
+      "-of", "json",
+      path,
+    ], { encoding: "utf8" });
+    const parsed = JSON.parse(output) as { format: { tags: { major_brand: string } } };
+    return parsed.format.tags.major_brand;
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -132,8 +174,10 @@ describe("real Playwright and ffprobe media validators", () => {
     );
   }, 20_000);
 
-  it("accepts a real 2000ms 1080x1920 H264/AAC MP4 and records bounded ffprobe provenance", async () => {
-    const result = await new MediaValidator({ ffprobeCommand: ffprobe }).validateChannelsMp4(mp4({ duration: "2" }));
+  it("accepts a real 2000ms 1080x1920 H264/AAC MP4 with a standard major brand and bounded provenance", async () => {
+    const content = mp4({ duration: "2" });
+    expect(majorBrand(content)).toBe("isom");
+    const result = await new MediaValidator({ ffprobeCommand: ffprobe }).validateChannelsMp4(content);
     expect(result).toMatchObject({
       status: "passed",
       profileId: "channels_mp4_1080x1920_h264_aac_v1",
@@ -152,6 +196,16 @@ describe("real Playwright and ffprobe media validators", () => {
   it("rejects real Matroska despite H264/AAC streams and matching dimensions", async () => {
     await expectGap(
       new MediaValidator({ ffprobeCommand: ffprobe }).validateChannelsMp4(matroska()),
+      "video_probe",
+      "media_format_mismatch",
+    );
+  }, 30_000);
+
+  it("rejects real QuickTime MOV with major_brand qt despite the shared MP4 demuxer", async () => {
+    const content = mov();
+    expect(majorBrand(content)).toBe("qt  ");
+    await expectGap(
+      new MediaValidator({ ffprobeCommand: ffprobe }).validateChannelsMp4(content),
       "video_probe",
       "media_format_mismatch",
     );
@@ -218,7 +272,7 @@ describe("real Playwright and ffprobe media validators", () => {
     const tempDir = await createTempDir();
     const probe = join(tempDir, "ffprobe-fractional-duration");
     try {
-      writeFileSync(probe, `#!/bin/sh\nif [ "$1" = "-version" ]; then echo ffprobe-test-version; else echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1080,"height":1920},{"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"60.0004","format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}'; fi\n`, { mode: 0o700 });
+      writeFileSync(probe, `#!/bin/sh\nif [ "$1" = "-version" ]; then echo ffprobe-test-version; else echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1080,"height":1920},{"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"60.0004","format_name":"mov,mp4,m4a,3gp,3g2,mj2","tags":{"major_brand":"isom"}}}'; fi\n`, { mode: 0o700 });
       await expectGap(
         new MediaValidator({ ffprobeCommand: probe }).validateChannelsMp4(mp4()),
         "video_probe",

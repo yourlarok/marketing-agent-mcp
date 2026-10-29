@@ -14,6 +14,7 @@ import { DomainError } from "../domain/errors.js";
 const FFPROBE_TIMEOUT_MS = 10_000;
 const FFPROBE_MAX_OUTPUT_BYTES = 64 * 1024;
 const PNG_SIGNATURE = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const MP4_MAJOR_BRANDS = new Set(["isom", "iso2", "avc1", "mp41", "mp42"]);
 const MEDIA_CONFIGURATION_ACTION =
   "Configure MARKETING_MEDIA_MCP_COMMAND and MARKETING_MEDIA_MCP_ARGS in the trusted deployment environment";
 const PROBE_CONFIGURATION_ACTION =
@@ -32,7 +33,11 @@ const probeSchema = z.object({
     width: z.number().int().optional(),
     height: z.number().int().optional(),
   })),
-  format: z.object({ duration: z.string(), format_name: z.string() }),
+  format: z.object({
+    duration: z.string(),
+    format_name: z.string(),
+    tags: z.object({ major_brand: z.string().min(1).max(64).optional() }).optional(),
+  }),
 });
 
 function gap(capability: "professional_media" | "video_probe", reason: string, message: string, retryable = false): DomainError {
@@ -203,7 +208,7 @@ export class MediaValidator {
       const provenance = probeVersion(versionOutput.stdout);
       const inspection = await runFfprobe(this.options.ffprobeCommand, [
         "-v", "error",
-        "-show_entries", "stream=codec_type,codec_name,width,height:format=duration,format_name",
+        "-show_entries", "stream=codec_type,codec_name,width,height:format=duration,format_name:format_tags=major_brand",
         "-show_streams",
         "-show_format",
         "-of", "json",
@@ -219,6 +224,10 @@ export class MediaValidator {
       if (!parsed.success) throw probeGap("ffprobe_invalid_response", "ffprobe returned an invalid inspection schema");
       if (!parsed.data.format.format_name.split(",").includes("mp4")) {
         throw probeGap("media_format_mismatch", "Channels video bytes are not an MP4 container");
+      }
+      const majorBrand = parsed.data.format.tags?.major_brand?.trim().toLowerCase() ?? "";
+      if (!MP4_MAJOR_BRANDS.has(majorBrand)) {
+        throw probeGap("media_format_mismatch", "Channels video bytes do not have a compatible MP4 major brand");
       }
       const videos = parsed.data.streams.filter((stream) => stream.codec_type === "video");
       const audio = parsed.data.streams.filter((stream) => stream.codec_type === "audio");
