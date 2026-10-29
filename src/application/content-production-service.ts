@@ -14,6 +14,7 @@ import {
   type EvidenceAssetRef,
   type SourceMaterialDescriptor,
 } from "../domain/content-production-model.js";
+import type { CompetitorDiff } from "../domain/data-research-model.js";
 import { assertRecord } from "../domain/contract-validation.js";
 import { DomainError } from "../domain/errors.js";
 import {
@@ -93,6 +94,7 @@ interface MaterialSnapshot {
 interface GenerationSnapshot {
   brief: ContentBrief;
   benchmark: BenchmarkAnalysis;
+  competitorDiff: CompetitorDiff | null;
   task: Task;
   recommendation: Recommendation;
   lineage: BriefLineage;
@@ -272,6 +274,25 @@ async function requireBenchmark(repos: Repositories, workspaceId: string, id: st
   return benchmark;
 }
 
+async function requireBenchmarkCompetitorDiff(
+  repos: Repositories,
+  benchmark: BenchmarkAnalysis,
+): Promise<CompetitorDiff | null> {
+  if (benchmark.competitorDiffId === null) return null;
+  const expected = benchmark.sourceVersions.find((reference) =>
+    reference.entityType === "competitor_diff" && reference.id === benchmark.competitorDiffId
+  );
+  if (!expected) conflict("BenchmarkAnalysis CompetitorDiff source version descriptor is missing");
+  const diff = await repos.competitorDiffs.get(benchmark.competitorDiffId, benchmark.workspaceId);
+  if (!diff) {
+    notFound("Benchmark CompetitorDiff not found in workspace", {
+      competitorDiffId: benchmark.competitorDiffId, workspaceId: benchmark.workspaceId,
+    });
+  }
+  if (diff.version !== expected.version) conflict("CompetitorDiff version differs from BenchmarkAnalysis sourceVersions");
+  return diff;
+}
+
 async function requireEvidence(repos: Repositories, workspaceId: string, id: string): Promise<Evidence> {
   const evidence = await repos.evidence.get(id, workspaceId) as Evidence | undefined;
   if (!evidence) notFound("Evidence not found in workspace", { evidenceId: id, workspaceId });
@@ -449,6 +470,7 @@ async function loadGenerationSnapshot(
   if (!brief) notFound("ContentBrief not found in workspace", { briefId: input.briefId, workspaceId: input.workspaceId });
   if (brief.version !== input.expectedBriefVersion) conflict("ContentBrief version does not match expectedBriefVersion");
   const benchmark = await requireBenchmark(repos, input.workspaceId, brief.benchmarkAnalysisId);
+  const competitorDiff = await requireBenchmarkCompetitorDiff(repos, benchmark);
   const task = await requireTask(repos, input.workspaceId, brief.taskId);
   const recommendation = await requireRecommendation(repos, input.workspaceId, brief.recommendationId);
   if (!task.recommendationIds.includes(recommendation.id)) invalid("Content brief Recommendation must belong to its Task");
@@ -519,7 +541,7 @@ async function loadGenerationSnapshot(
     invalid("Production source and parent bytes exceed 16 MiB");
   }
   return {
-    brief, benchmark, task, recommendation, lineage, benchmarkEvidence, benchmarkSources,
+    brief, benchmark, competitorDiff, task, recommendation, lineage, benchmarkEvidence, benchmarkSources,
     parent, latestId: latest?.id ?? null, materials,
   };
 }
@@ -533,6 +555,11 @@ function assetSourceVersions(snapshot: GenerationSnapshot): ContentEntityVersion
     { entityType: "task", id: snapshot.task.id, version: snapshot.task.version },
     { entityType: "recommendation", id: snapshot.recommendation.id, version: snapshot.recommendation.version },
     { entityType: "benchmark_analysis", id: snapshot.benchmark.id, version: snapshot.benchmark.version },
+    ...(snapshot.competitorDiff ? [{
+      entityType: "competitor_diff" as const,
+      id: snapshot.competitorDiff.id,
+      version: snapshot.competitorDiff.version,
+    }] : []),
     ...lineageVersionRefs(snapshot.lineage),
   ];
   const references: ContentEntityVersionRef[] = [

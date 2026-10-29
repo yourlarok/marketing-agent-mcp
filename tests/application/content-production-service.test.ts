@@ -15,9 +15,11 @@ import type { Store } from "../../src/application/ports.js";
 import {
   CHANNEL_PROFILES,
   createBenchmarkAnalysis,
+  type AssetVersion,
   type ContentBrief,
   type ContentSegment,
 } from "../../src/domain/content-production-model.js";
+import type { CompetitorDiff } from "../../src/domain/data-research-model.js";
 import { DomainError } from "../../src/domain/errors.js";
 import type { Evidence, Finding, Recommendation, Source, Task } from "../../src/domain/model.js";
 import { ArtifactStore } from "../../src/infrastructure/artifact-store.js";
@@ -235,6 +237,30 @@ describe("ContentProductionService", () => {
 
   async function createBrief(channel: "xhs" | "channels" = "xhs", suffix = channel): Promise<ContentBrief> {
     return service.createBrief({ input: briefInput(channel), context: context(`brief-${suffix}`) });
+  }
+
+  async function createDiffBrief(suffix: string): Promise<{ brief: ContentBrief; diff: CompetitorDiff }> {
+    const benchmark = (await store.transaction((repos) => repos.benchmarkAnalyses.get("benchmark-1", workspaceId)))!;
+    const diff: CompetitorDiff = {
+      id: `diff-${suffix}`, workspaceId, version: 1, createdAt: now, updatedAt: now,
+      competitorIds: [], entries: [{ dimension: "structure", result: "different", evidenceIds: ["evidence-benchmark"] }],
+      findingIds: ["finding-fact"],
+    };
+    const analysis = createBenchmarkAnalysis({
+      ...benchmark,
+      id: `benchmark-${suffix}`,
+      competitorDiffId: diff.id,
+      sourceVersions: [...benchmark.sourceVersions, { entityType: "competitor_diff", id: diff.id, version: 1 }],
+    });
+    await store.transaction(async (repos) => {
+      await repos.competitorDiffs.insert(diff);
+      await repos.benchmarkAnalyses.insert(analysis);
+    });
+    const brief = await service.createBrief({
+      input: { ...briefInput(), id: `brief-${suffix}`, benchmarkAnalysisId: analysis.id },
+      context: context(`brief-${suffix}`),
+    });
+    return { brief, diff };
   }
 
   async function getAsset(id: string) {
@@ -624,6 +650,45 @@ describe("ContentProductionService", () => {
     expect(brief.channel).toBe("xhs");
     const asset = await service.generate({ input: generationInput(brief.id), context: context("mixed-target-asset") });
     expect(asset.channel).toBe("xhs");
+  });
+
+  it("persists the current CompetitorDiff ref on an unchanged diff-linked generation", async () => {
+    const { brief, diff } = await createDiffBrief("diff-valid");
+    const asset = await service.generate({ input: generationInput(brief.id), context: context("diff-valid") });
+    expect(asset.sourceVersions).toContainEqual({ entityType: "competitor_diff", id: diff.id, version: 1 });
+    expect(await service.getAssetVersion({ id: asset.id, workspaceId })).toEqual(asset);
+  });
+
+  it.each(["generate", "derive"] as const)("rejects a deferred-provider stale CompetitorDiff during %s without success residue", async (mode) => {
+    const { brief, diff } = await createDiffBrief(`diff-stale-${mode}`);
+    let root: AssetVersion | undefined;
+    if (mode === "derive") {
+      root = await service.generate({ input: generationInput(brief.id), context: context(`diff-stale-${mode}-root`) });
+    }
+    provider = new StubProvider(async () => {
+      await store.transaction(async (repos) => {
+        const current = (await repos.competitorDiffs.get(diff.id, workspaceId))!;
+        await repos.competitorDiffs.update({
+          ...current,
+          entries: [{ dimension: "structure", result: "unknown", evidenceIds: ["evidence-benchmark"] }],
+        }, 1);
+      });
+      return Buffer.from(`changed-diff-${mode}`);
+    });
+    service = createService();
+    const id = `asset-stale-diff-${mode}`;
+    const attemptContext = context(`stale-diff-${mode}`);
+    const attempt = mode === "generate"
+      ? service.generate({ input: { ...generationInput(brief.id), id }, context: attemptContext })
+      : service.derive({
+          input: {
+            id, workspaceId, contentId: root!.contentId, parentVersionId: root!.id, expectedParentVersion: 1,
+            briefId: brief.id, expectedBriefVersion: 1, sourceMaterials: [], revisionInstructions: "Deferred diff derivative",
+          },
+          context: attemptContext,
+        });
+    await expect(attempt).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    await expectNoSuccess(id, attemptContext.idempotencyKey);
   });
 
   it("reads raw multi-chunk artifacts with stable total hash and workspace/range checks", async () => {
