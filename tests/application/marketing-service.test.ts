@@ -22,6 +22,15 @@ import {
   createBenchmarkAnalysis,
   createContentBrief,
 } from "../../src/domain/content-production-model.js";
+import {
+  createApproval,
+  createPublication,
+  createSchedule,
+} from "../../src/domain/publishing-model.js";
+import {
+  createEffectReview,
+  createMetricSnapshot,
+} from "../../src/domain/effect-model.js";
 import type { ToolHealthEvidence } from "../../src/domain/model.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
 
@@ -2587,6 +2596,68 @@ describe("MarketingService content production lineage", () => {
         { from: { entityType: "recommendation", id: "recommendation-1" }, to: { entityType: "content_brief", id: "brief-1" } },
         { from: { entityType: "content_brief", id: "brief-1" }, to: { entityType: "asset_version", id: "asset-2" } },
         { from: { entityType: "asset_version", id: "asset-1" }, to: { entityType: "asset_version", id: "asset-2" } },
+      ]));
+
+      await store.transaction(async (repos) => {
+        await repos.approvals.insert(createApproval({
+          id: "approval-1", workspaceId: "workspace-1", createdAt: secondNow,
+          assetVersionId: "asset-1", assetVersion: 1, artifactHash: "c".repeat(64), decision: "approved",
+          reviewer: { actor: "human-1", attestation: "human_attested" }, comment: "Approved", decidedAt: secondNow,
+        }));
+        await repos.schedules.insert(createSchedule({
+          id: "schedule-1", workspaceId: "workspace-1", createdAt: secondNow,
+          assetVersionId: "asset-1", assetVersion: 1, approvalId: "approval-1", channel: "xhs", accountId: "account-1",
+          scheduledFor: secondNow, timeZone: "UTC", deliveryMode: "manual_assisted", status: "completed",
+        }));
+        await repos.publications.insert(createPublication({
+          id: "publication-1", workspaceId: "workspace-1", createdAt: secondNow,
+          scheduleId: "schedule-1", scheduleVersion: 1, assetVersionId: "asset-1", assetVersion: 1,
+          approvalId: "approval-1", artifactHash: "c".repeat(64), operationKey: `publish:v1:${"e".repeat(64)}`,
+          channel: "xhs", accountId: "account-1", deliveryMode: "manual_assisted", status: "verified",
+          attempts: [], receipts: [], failure: null,
+          delivery: { method: "manual_evidence", externalPublicationId: "external-1", publishedAt: secondNow, evidenceIds: ["evidence-1"] },
+          verification: { method: "manual_evidence", verifiedAt: secondNow, externalPublicationId: "external-1", evidenceIds: ["evidence-1"] },
+        }));
+        await repos.metricSnapshots.insert(createMetricSnapshot({
+          id: "snapshot-1", workspaceId: "workspace-1", createdAt: secondNow,
+          publicationId: "publication-1", publicationVersion: 1, windowStart: firstNow, windowEnd: secondNow, observedAt: secondNow,
+          observations: [{ metric: "impressions", evidenceIds: ["evidence-1"], value: 10 }],
+        }));
+        const section = {
+          metrics: [{ name: "observed", value: 1, status: "ok" as const, reason: null, numerator: 1, denominator: 1 }],
+          notes: [], limitations: [], causality: "not_established" as const,
+        };
+        await repos.effectReviews.insert(createEffectReview({
+          id: "review-1", workspaceId: "workspace-1", createdAt: secondNow,
+          publicationRefs: [{ id: "publication-1", version: 1 }], metricSnapshotIds: ["snapshot-1"],
+          baselineMetricSnapshotIds: [], benchmarkEvidenceIds: ["evidence-1"],
+          sourceVersions: [
+            { entityType: "publication", id: "publication-1", version: 1 },
+            { entityType: "metric_snapshot", id: "snapshot-1", version: 1 },
+            { entityType: "evidence", id: "evidence-1", version: 1 },
+          ],
+          efficiency: section, content: section, conversion: section, automation: section,
+        }));
+      });
+      const completeLineage = await service.getLineage({
+        entityType: "effect_review", id: "review-1", workspaceId: "workspace-1",
+      });
+      expect(completeLineage.nodes.map((node) => [node.entityType, node.id])).toEqual(expect.arrayContaining([
+        ["source", "source-1"], ["evidence", "evidence-1"], ["finding", "finding-1"],
+        ["competitor_diff", "diff-1"], ["recommendation", "recommendation-1"], ["task", "task-1"],
+        ["benchmark_analysis", "benchmark-1"], ["content_brief", "brief-1"], ["asset_version", "asset-1"],
+        ["approval", "approval-1"], ["schedule", "schedule-1"], ["publication", "publication-1"],
+        ["metric_snapshot", "snapshot-1"], ["effect_review", "review-1"],
+      ]));
+      expect(completeLineage.edges).toEqual(expect.arrayContaining([
+        { from: { entityType: "asset_version", id: "asset-1" }, to: { entityType: "approval", id: "approval-1" } },
+        { from: { entityType: "approval", id: "approval-1" }, to: { entityType: "schedule", id: "schedule-1" } },
+        { from: { entityType: "schedule", id: "schedule-1" }, to: { entityType: "publication", id: "publication-1" } },
+        { from: { entityType: "evidence", id: "evidence-1" }, to: { entityType: "publication", id: "publication-1" } },
+        { from: { entityType: "publication", id: "publication-1" }, to: { entityType: "metric_snapshot", id: "snapshot-1" } },
+        { from: { entityType: "evidence", id: "evidence-1" }, to: { entityType: "metric_snapshot", id: "snapshot-1" } },
+        { from: { entityType: "metric_snapshot", id: "snapshot-1" }, to: { entityType: "effect_review", id: "review-1" } },
+        { from: { entityType: "evidence", id: "evidence-1" }, to: { entityType: "effect_review", id: "review-1" } },
       ]));
     } finally {
       store.close();

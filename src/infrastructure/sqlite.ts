@@ -24,6 +24,10 @@ const migrations = [
     version: 5,
     path: fileURLToPath(new URL("../../migrations/005_content_production.sql", import.meta.url)),
   },
+  {
+    version: 6,
+    path: fileURLToPath(new URL("../../migrations/006_publishing_effect.sql", import.meta.url)),
+  },
 ] as const;
 
 export interface AnalysisGraphReferenceIds {

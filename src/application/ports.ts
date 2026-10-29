@@ -12,6 +12,8 @@ import type {
   BenchmarkAnalysis,
   ContentBrief,
 } from "../domain/content-production-model.js";
+import type { Approval, Publication, Schedule } from "../domain/publishing-model.js";
+import type { EffectReview, MetricSnapshot } from "../domain/effect-model.js";
 
 export type Id = string;
 export type Instant = string;
@@ -51,6 +53,25 @@ export interface AssetVersionRepository {
   latest(contentId: Id, workspaceId: Id): Promise<AssetVersion | undefined>;
 }
 
+export interface ImmutableEntityRepository<T extends EntityRecord> {
+  get(id: Id, workspaceId: Id): Promise<T | undefined>;
+  insert(record: T): Promise<T>;
+}
+
+export type ApprovalRepository = ImmutableEntityRepository<Approval>;
+
+export interface ScheduleRepository extends EntityRepository<Schedule> {
+  listDue(workspaceId: Id, dueBy: Instant, limit?: number): Promise<Schedule[]>;
+}
+
+export interface PublicationRepository extends EntityRepository<Publication> {
+  listRecoveryCandidates(workspaceId: Id, limit?: number): Promise<Publication[]>;
+  getByScheduleId(scheduleId: Id, workspaceId: Id): Promise<Publication | undefined>;
+}
+
+export type MetricSnapshotRepository = ImmutableEntityRepository<MetricSnapshot>;
+export type EffectReviewRepository = ImmutableEntityRepository<EffectReview>;
+
 export interface TaskRepository extends EntityRepository {
   list(workspaceId: Id): Promise<EntityRecord[]>;
 }
@@ -87,7 +108,12 @@ export type LineageEntityType =
   | "dashboard"
   | "benchmark_analysis"
   | "content_brief"
-  | "asset_version";
+  | "asset_version"
+  | "approval"
+  | "schedule"
+  | "publication"
+  | "metric_snapshot"
+  | "effect_review";
 
 export interface EntityRef {
   entityType: LineageEntityType;
@@ -151,6 +177,11 @@ export interface Repositories {
   benchmarkAnalyses: EntityRepository<BenchmarkAnalysis>;
   contentBriefs: EntityRepository<ContentBrief>;
   assetVersions: AssetVersionRepository;
+  approvals: ApprovalRepository;
+  schedules: ScheduleRepository;
+  publications: PublicationRepository;
+  metricSnapshots: MetricSnapshotRepository;
+  effectReviews: EffectReviewRepository;
   capabilities: CapabilityRepository;
   audit: AuditRepository;
   idempotency: IdempotencyRepository;

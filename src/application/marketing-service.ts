@@ -24,6 +24,12 @@ import {
   assertTaskDependencyGraph,
   assertTaskTransition,
 } from "../domain/task-machine.js";
+import { publicationEvidenceIds, type Publication } from "../domain/publishing-model.js";
+import {
+  metricSnapshotEvidenceIds,
+  type EffectReview,
+  type MetricSnapshot,
+} from "../domain/effect-model.js";
 import { analysisGraphReferenceIds, assertUtcInstant } from "../infrastructure/sqlite.js";
 import {
   AuditableCommandPipeline,
@@ -79,6 +85,11 @@ const lineageEntityTypes: Record<LineageEntityType, keyof Repositories> = {
   benchmark_analysis: "benchmarkAnalyses",
   content_brief: "contentBriefs",
   asset_version: "assetVersions",
+  approval: "approvals",
+  schedule: "schedules",
+  publication: "publications",
+  metric_snapshot: "metricSnapshots",
+  effect_review: "effectReviews",
 };
 
 function lineageReferences(record: EntityRecord, entityType: LineageEntityType): EntityRef[] {
@@ -172,6 +183,66 @@ function lineageReferences(record: EntityRecord, entityType: LineageEntityType):
           references.push({ entityType: "source", id: sourceId as string });
         }
       }
+    }
+    const seen = new Set<string>();
+    return references.filter((reference) => {
+      const key = JSON.stringify([reference.entityType, reference.id]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+  if (
+    entityType === "approval" ||
+    entityType === "schedule" ||
+    entityType === "publication" ||
+    entityType === "metric_snapshot" ||
+    entityType === "effect_review"
+  ) {
+    const fail = (): never => {
+      throw new DomainError("NOT_FOUND", "Lineage reference is invalid", false, {
+        entityType,
+        id: record.id,
+      });
+    };
+    const references: EntityRef[] = [];
+    const addScalar = (key: string, referencedType: EntityRef["entityType"]) => {
+      const id = record[key];
+      if (typeof id !== "string" || id.trim().length === 0) fail();
+      references.push({ entityType: referencedType, id: id as string });
+    };
+    const addIds = (ids: unknown, referencedType: EntityRef["entityType"]) => {
+      if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string" || id.trim().length === 0)) fail();
+      references.push(...(ids as string[]).map((id) => ({ entityType: referencedType, id })));
+    };
+    try {
+      if (entityType === "approval") {
+        addScalar("assetVersionId", "asset_version");
+      } else if (entityType === "schedule") {
+        addScalar("assetVersionId", "asset_version");
+        addScalar("approvalId", "approval");
+      } else if (entityType === "publication") {
+        addScalar("scheduleId", "schedule");
+        addScalar("assetVersionId", "asset_version");
+        addScalar("approvalId", "approval");
+        addIds(publicationEvidenceIds(record as unknown as Publication), "evidence");
+      } else if (entityType === "metric_snapshot") {
+        addScalar("publicationId", "publication");
+        addIds(metricSnapshotEvidenceIds(record as unknown as MetricSnapshot), "evidence");
+      } else {
+        const review = record as unknown as EffectReview;
+        if (!Array.isArray(review.publicationRefs)) fail();
+        for (const reference of review.publicationRefs) {
+          if (reference === null || typeof reference !== "object" || Array.isArray(reference)) fail();
+          addIds([reference.id], "publication");
+        }
+        addIds(review.metricSnapshotIds, "metric_snapshot");
+        addIds(review.baselineMetricSnapshotIds, "metric_snapshot");
+        addIds(review.benchmarkEvidenceIds, "evidence");
+      }
+    } catch (error) {
+      if (error instanceof DomainError) throw error;
+      fail();
     }
     const seen = new Set<string>();
     return references.filter((reference) => {

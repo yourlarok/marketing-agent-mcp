@@ -11,6 +11,22 @@ import {
   type BenchmarkAnalysis,
   type ContentBrief,
 } from "../domain/content-production-model.js";
+import {
+  publicationEvidenceIds,
+  validateApproval,
+  validatePublication,
+  validateSchedule,
+  type Approval,
+  type Publication,
+  type Schedule,
+} from "../domain/publishing-model.js";
+import {
+  metricSnapshotEvidenceIds,
+  validateEffectReview,
+  validateMetricSnapshot,
+  type EffectReview,
+  type MetricSnapshot,
+} from "../domain/effect-model.js";
 import type {
   AnalysisGraphRepository,
   AssetVersionRepository,
@@ -21,7 +37,9 @@ import type {
   EntityRepository,
   IdempotencyRecord,
   IdempotencyRepository,
+  PublicationRepository,
   Repositories,
+  ScheduleRepository,
   Store,
   TaskRepository,
 } from "../application/ports.js";
@@ -83,6 +101,7 @@ interface EntityConfig {
   referenceColumn?: "source_id" | "evidence_id" | "parent_graph_id";
   referenceKey?: "sourceId" | "evidenceId" | "parentGraphId";
   scalarReferences?: ScalarReference[];
+  scalarColumns?: ScalarReference[];
   references?: ReferenceTable | ReferenceTable[];
 }
 
@@ -288,6 +307,72 @@ const entityConfigs: Record<string, EntityConfig> = {
       },
     ],
   },
+  approvals: {
+    table: "approvals",
+    scalarReferences: [{ column: "asset_version_id", key: "assetVersionId" }],
+  },
+  schedules: {
+    table: "schedules",
+    scalarReferences: [
+      { column: "asset_version_id", key: "assetVersionId" },
+      { column: "approval_id", key: "approvalId" },
+    ],
+    scalarColumns: [
+      { column: "scheduled_for", key: "scheduledFor" },
+      { column: "status", key: "status" },
+    ],
+  },
+  publications: {
+    table: "publications",
+    scalarReferences: [
+      { column: "schedule_id", key: "scheduleId" },
+      { column: "asset_version_id", key: "assetVersionId" },
+      { column: "approval_id", key: "approvalId" },
+    ],
+    scalarColumns: [
+      { column: "operation_key", key: "operationKey" },
+      { column: "status", key: "status" },
+    ],
+    references: {
+      table: "publication_evidence",
+      ownerColumn: "publication_id",
+      targetColumn: "evidence_id",
+      recordKey: "evidenceIds",
+    },
+  },
+  metricSnapshots: {
+    table: "metric_snapshots",
+    scalarReferences: [{ column: "publication_id", key: "publicationId" }],
+    references: {
+      table: "metric_snapshot_evidence",
+      ownerColumn: "snapshot_id",
+      targetColumn: "evidence_id",
+      recordKey: "evidenceIds",
+    },
+  },
+  effectReviews: {
+    table: "effect_reviews",
+    references: [
+      {
+        table: "effect_review_publications",
+        ownerColumn: "review_id",
+        targetColumn: "publication_id",
+        recordKey: "publicationIds",
+      },
+      {
+        table: "effect_review_metric_snapshots",
+        ownerColumn: "review_id",
+        targetColumn: "snapshot_id",
+        recordKey: "snapshotIds",
+      },
+      {
+        table: "effect_review_evidence",
+        ownerColumn: "review_id",
+        targetColumn: "evidence_id",
+        recordKey: "benchmarkEvidenceIds",
+      },
+    ],
+  },
 };
 
 function assertId(value: string, name: string): void {
@@ -397,6 +482,7 @@ class SqliteEntityRepository implements EntityRepository {
         ? [{ column: this.config.referenceColumn as string, key: this.config.referenceKey as string }]
         : []),
       ...(this.config.scalarReferences ?? []),
+      ...(this.config.scalarColumns ?? []),
     ];
     return configured.map(({ column, key }) => {
       const value = record[key];
@@ -524,6 +610,124 @@ class SqliteContentBriefRepository extends SqliteEntityRepository {
 
   protected override referenceIds(record: EntityRecord, recordKey: string): unknown {
     return recordKey === "sourceIds" ? contentSourceIds(record) : super.referenceIds(record, recordKey);
+  }
+}
+
+function queryLimit(limit: number | undefined): number {
+  const normalized = limit ?? 100;
+  if (!Number.isSafeInteger(normalized) || normalized < 1 || normalized > 1000) {
+    throw new TypeError("Query limit must be an integer between 1 and 1000");
+  }
+  return normalized;
+}
+
+class SqliteApprovalRepository extends SqliteEntityRepository {
+  override async get(id: string, workspaceId: string): Promise<Approval | undefined> {
+    return super.get(id, workspaceId) as Promise<Approval | undefined>;
+  }
+
+  override async insert(record: EntityRecord): Promise<Approval> {
+    validateApproval(record as unknown as Approval);
+    return super.insert(record) as Promise<Approval>;
+  }
+}
+
+class SqliteScheduleRepository extends SqliteEntityRepository implements ScheduleRepository {
+  override async get(id: string, workspaceId: string): Promise<Schedule | undefined> {
+    return super.get(id, workspaceId) as Promise<Schedule | undefined>;
+  }
+
+  override async insert(record: EntityRecord): Promise<Schedule> {
+    validateSchedule(record as unknown as Schedule);
+    return super.insert(record) as Promise<Schedule>;
+  }
+
+  override async update(record: EntityRecord, expectedVersion: number): Promise<Schedule> {
+    validateSchedule(record as unknown as Schedule);
+    return super.update(record, expectedVersion) as Promise<Schedule>;
+  }
+
+  async listDue(workspaceId: string, dueBy: string, limit?: number): Promise<Schedule[]> {
+    assertUtcInstant(dueBy);
+    const rows = this.database.prepare(
+      `SELECT payload FROM schedules
+       WHERE workspace_id = ? AND status = 'scheduled' AND scheduled_for <= ?
+       ORDER BY scheduled_for, id LIMIT ?`,
+    ).all(workspaceId, dueBy, queryLimit(limit)) as unknown as { payload: string }[];
+    return rows.map((row) => JSON.parse(row.payload) as Schedule);
+  }
+}
+
+class SqlitePublicationRepository extends SqliteEntityRepository implements PublicationRepository {
+  override async get(id: string, workspaceId: string): Promise<Publication | undefined> {
+    return super.get(id, workspaceId) as Promise<Publication | undefined>;
+  }
+
+  override async insert(record: EntityRecord): Promise<Publication> {
+    validatePublication(record as unknown as Publication);
+    return super.insert(record) as Promise<Publication>;
+  }
+
+  override async update(record: EntityRecord, expectedVersion: number): Promise<Publication> {
+    validatePublication(record as unknown as Publication);
+    return super.update(record, expectedVersion) as Promise<Publication>;
+  }
+
+  protected override referenceIds(record: EntityRecord, recordKey: string): unknown {
+    return recordKey === "evidenceIds"
+      ? publicationEvidenceIds(record as unknown as Publication)
+      : super.referenceIds(record, recordKey);
+  }
+
+  async listRecoveryCandidates(workspaceId: string, limit?: number): Promise<Publication[]> {
+    const rows = this.database.prepare(
+      `SELECT payload FROM publications
+       WHERE workspace_id = ? AND status IN ('submitting', 'submitted', 'unknown')
+       ORDER BY updated_at, id LIMIT ?`,
+    ).all(workspaceId, queryLimit(limit)) as unknown as { payload: string }[];
+    return rows.map((row) => JSON.parse(row.payload) as Publication);
+  }
+
+  async getByScheduleId(scheduleId: string, workspaceId: string): Promise<Publication | undefined> {
+    const row = this.database.prepare(
+      "SELECT payload FROM publications WHERE schedule_id = ? AND workspace_id = ?",
+    ).get(scheduleId, workspaceId) as { payload: string } | undefined;
+    return row ? (JSON.parse(row.payload) as Publication) : undefined;
+  }
+}
+
+class SqliteMetricSnapshotRepository extends SqliteEntityRepository {
+  override async get(id: string, workspaceId: string): Promise<MetricSnapshot | undefined> {
+    return super.get(id, workspaceId) as Promise<MetricSnapshot | undefined>;
+  }
+
+  override async insert(record: EntityRecord): Promise<MetricSnapshot> {
+    validateMetricSnapshot(record as unknown as MetricSnapshot);
+    return super.insert(record) as Promise<MetricSnapshot>;
+  }
+
+  protected override referenceIds(record: EntityRecord, recordKey: string): unknown {
+    return recordKey === "evidenceIds"
+      ? metricSnapshotEvidenceIds(record as unknown as MetricSnapshot)
+      : super.referenceIds(record, recordKey);
+  }
+}
+
+class SqliteEffectReviewRepository extends SqliteEntityRepository {
+  override async get(id: string, workspaceId: string): Promise<EffectReview | undefined> {
+    return super.get(id, workspaceId) as Promise<EffectReview | undefined>;
+  }
+
+  override async insert(record: EntityRecord): Promise<EffectReview> {
+    validateEffectReview(record as unknown as EffectReview);
+    return super.insert(record) as Promise<EffectReview>;
+  }
+
+  protected override referenceIds(record: EntityRecord, recordKey: string): unknown {
+    const review = record as unknown as EffectReview;
+    if (recordKey === "publicationIds") return review.publicationRefs.map((reference) => reference.id);
+    if (recordKey === "snapshotIds") return [...review.metricSnapshotIds, ...review.baselineMetricSnapshotIds];
+    return super.referenceIds(record, recordKey);
   }
 }
 
@@ -863,6 +1067,11 @@ class SqliteStore implements Store {
       benchmarkAnalyses: repository("benchmarkAnalyses"),
       contentBriefs: repository("contentBriefs"),
       assetVersions: new SqliteAssetVersionRepository(this.database),
+      approvals: new SqliteApprovalRepository(this.database, entityConfigs.approvals!),
+      schedules: new SqliteScheduleRepository(this.database, entityConfigs.schedules!),
+      publications: new SqlitePublicationRepository(this.database, entityConfigs.publications!),
+      metricSnapshots: new SqliteMetricSnapshotRepository(this.database, entityConfigs.metricSnapshots!),
+      effectReviews: new SqliteEffectReviewRepository(this.database, entityConfigs.effectReviews!),
       capabilities: new SqliteCapabilityRepository(
         this.database,
         entityConfigs.capabilities!,
