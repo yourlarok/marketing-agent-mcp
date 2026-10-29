@@ -4,7 +4,7 @@ import type {
   IdGenerator,
   Store,
 } from "../../src/application/ports.js";
-import { MarketingService } from "../../src/application/marketing-service.js";
+import { MarketingService, requireWorkspace } from "../../src/application/marketing-service.js";
 import type {
   CommandContext,
   CreateWorkspace,
@@ -2419,6 +2419,18 @@ describe("MarketingService capability registry", () => {
 });
 
 describe("MarketingService content production lineage", () => {
+  it("shares the workspace-scoped prerequisite used by content production commands", async () => {
+    const store = openStore(":memory:");
+    try {
+      await store.transaction((repos) => requireWorkspace(repos, "workspace-missing"));
+      throw new Error("Expected a missing workspace to fail");
+    } catch (error) {
+      expect(error).toMatchObject<DomainError>({ code: "NOT_FOUND" });
+    } finally {
+      store.close();
+    }
+  });
+
   it("traverses benchmark, brief, source, strategy, and immutable parent references", async () => {
     const store = openStore(":memory:");
     try {

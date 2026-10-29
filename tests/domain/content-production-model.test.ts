@@ -420,6 +420,38 @@ describe("AssetVersion contracts", () => {
     expect(value).toMatchObject({ version: 2, parentVersionId: "asset-version-1", parentVersion: 1 });
   });
 
+  it("requires the persisted source materials to match root and derivative parent lineage", () => {
+    const parent = {
+      role: "parent" as const,
+      assetVersionId: "asset-version-1",
+      artifactId: "primary-1",
+      mediaType: "image/png" as const,
+      contentHash: hash,
+      byteLength: 1024,
+    };
+    expect(() => asset({ sourceMaterials: [parent] })).toThrow(/root|parent/i);
+    expect(() => asset({
+      id: "asset-version-2", version: 2, parentVersionId: "asset-version-1", parentVersion: 1,
+      sourceMaterials: [], sourceVersions: [...asset().sourceVersions, { entityType: "asset_version", id: "asset-version-1", version: 1 }],
+    })).toThrow(/parent/i);
+    expect(() => asset({
+      id: "asset-version-2", version: 2, parentVersionId: "asset-version-1", parentVersion: 1,
+      sourceMaterials: [{ ...parent, assetVersionId: "asset-version-other" }],
+      sourceVersions: [...asset().sourceVersions, { entityType: "asset_version", id: "asset-version-1", version: 1 }],
+    })).toThrow(/parent/i);
+  });
+
+  it("bounds unique production source materials and revision guidance", () => {
+    expect(() => asset({ sourceMaterials: [
+      { role: "source", source: assetRef(), ownership: "owned" },
+      { role: "source", source: assetRef(), ownership: "authorized" },
+    ] })).toThrow(/duplicate/i);
+    expect(() => asset({ sourceMaterials: [{
+      role: "source", source: assetRef({ byteLength: 16 * 1024 * 1024 + 1 }), ownership: "owned",
+    }] })).toThrow(/16|byte/i);
+    expect(() => asset({ modification: { ...asset().modification, revisionInstructions: "x".repeat(32 * 1024 + 1) } })).toThrow(/revision/i);
+  });
+
   it.each(["approved", "scheduled", "published", "performance"])("has no %s field", (field) => {
     expect(asset()).not.toHaveProperty(field);
     expect(() => validateAssetVersion({ ...asset(), [field]: true } as AssetVersion)).toThrow(/unsupported/i);

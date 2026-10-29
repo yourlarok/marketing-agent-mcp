@@ -717,7 +717,30 @@ export function validateAssetVersion(asset: AssetVersion): void {
   if (!Array.isArray(asset.sourceMaterials) || asset.sourceMaterials.length > 9) {
     invalid("AssetVersion sourceMaterials must be a bounded array");
   }
-  for (const material of asset.sourceMaterials) validateSourceMaterial(material);
+  const sourceIdentities = new Set<string>();
+  let totalSourceBytes = 0;
+  for (const material of asset.sourceMaterials) {
+    validateSourceMaterial(material);
+    totalSourceBytes += material.role === "source" ? material.source.byteLength : material.byteLength;
+    if (material.role === "source") {
+      const identity = JSON.stringify([material.source.evidenceId, material.source.assetId]);
+      if (sourceIdentities.has(identity)) invalid("AssetVersion sourceMaterials must not contain duplicates");
+      sourceIdentities.add(identity);
+    }
+  }
+  if (totalSourceBytes > 16 * 1024 * 1024) {
+    invalid("AssetVersion source and parent bytes must not exceed 16 MiB");
+  }
+  const parents = asset.sourceMaterials.filter((material) => material.role === "parent");
+  if (asset.version === 1) {
+    if (parents.length !== 0) invalid("Root AssetVersion must not contain a parent source material");
+  } else {
+    if (parents.length !== 1) invalid("Derivative AssetVersion requires exactly one parent source material");
+    const parent = parents[0]!;
+    if (parent.role !== "parent" || parent.assetVersionId !== asset.parentVersionId) {
+      invalid("Derivative parent source material must match parentVersionId");
+    }
+  }
   assertRecord(asset.modification, "Asset modification", [
     "summary",
     "revisionInstructions",
@@ -727,6 +750,9 @@ export function validateAssetVersion(asset: AssetVersion): void {
   ]);
   assertNonEmptyString(asset.modification.summary, "Asset modification summary");
   assertNonEmptyString(asset.modification.revisionInstructions, "Asset modification revisionInstructions");
+  if (asset.modification.revisionInstructions.length > 32 * 1024) {
+    invalid("Asset modification revisionInstructions must not exceed 32 KiB of UTF-16 code units");
+  }
   assertNonEmptyString(asset.modification.actor, "Asset modification actor");
   assertNonEmptyString(asset.modification.requestId, "Asset modification requestId");
   assertUtcInstant(asset.modification.createdAt, "Asset modification createdAt");

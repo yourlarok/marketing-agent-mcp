@@ -271,7 +271,7 @@ function lineageReferences(record: EntityRecord, entityType: LineageEntityType):
   });
 }
 
-async function requireWorkspace(
+export async function requireWorkspace(
   repos: Repositories,
   workspaceId: string,
 ): Promise<void> {

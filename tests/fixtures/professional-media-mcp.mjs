@@ -29,7 +29,7 @@ function generateMp4(width, color, duration, audio, videoCodec = "libx264") {
   return execFileSync(process.env.MARKETING_TEST_FFMPEG, [
     "-v", "error", "-f", "lavfi", "-i", `color=c=${color}:s=${width}x1920:r=1`,
     ...(audio ? ["-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=44100"] : []),
-    "-t", duration, "-c:v", videoCodec, "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+    "-t", duration, "-c:v", videoCodec, "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-enc_time_base", "1",
     ...(audio ? ["-c:a", "aac"] : []),
     "-movflags", "frag_keyframe+empty_moov", "-video_track_timescale", "1000", "-f", "mp4", "pipe:1",
   ], { maxBuffer: 32 * 1024 * 1024, timeout: 30_000 });
