@@ -1,6 +1,8 @@
 import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { AnalysisService } from "./application/analysis-service.js";
+import { BenchmarkService } from "./application/benchmark-service.js";
+import { ContentProductionService } from "./application/content-production-service.js";
 import { DashboardService } from "./application/dashboard-service.js";
 import { DataResearchService } from "./application/data-research-service.js";
 import { MarketingService } from "./application/marketing-service.js";
@@ -8,6 +10,9 @@ import { StrategyService } from "./application/strategy-service.js";
 import { loadConfig } from "./config.js";
 import { ArtifactStore } from "./infrastructure/artifact-store.js";
 import { McpAnalyticsProvider } from "./infrastructure/analytics-provider.js";
+import { McpBenchmarkReverseProvider } from "./infrastructure/benchmark-reverse-provider.js";
+import { McpMediaProvider } from "./infrastructure/media-provider.js";
+import { MediaValidator } from "./infrastructure/media-validation.js";
 import { SqliteConnector } from "./infrastructure/sqlite-connector.js";
 import { openStore } from "./infrastructure/sqlite-store.js";
 import {
@@ -45,6 +50,30 @@ async function run(): Promise<void> {
     );
     const dashboard = new DashboardService(store, clock, ids, artifacts);
     const strategy = new StrategyService(store, clock, ids);
+    const benchmark = new BenchmarkService(
+      store,
+      clock,
+      ids,
+      artifacts,
+      config.benchmarkMcp ? new McpBenchmarkReverseProvider({
+        command: config.benchmarkMcp.command,
+        args: config.benchmarkMcp.args,
+      }) : undefined,
+    );
+    const contentProduction = new ContentProductionService(
+      store,
+      clock,
+      ids,
+      artifacts,
+      config.mediaMcp ? new McpMediaProvider({
+        command: config.mediaMcp.command,
+        args: config.mediaMcp.args,
+        envAllowlist: config.mediaMcp.envAllowlist,
+      }) : undefined,
+      new MediaValidator({
+        ...(config.ffprobeCommand ? { ffprobeCommand: config.ffprobeCommand } : {}),
+      }),
+    );
     const server = createMcpServer(
       service,
       dataResearch,
@@ -52,6 +81,8 @@ async function run(): Promise<void> {
       {},
       dashboard,
       strategy,
+      benchmark,
+      contentProduction,
     );
     const transport = new StdioServerTransport();
     let shutdown: Promise<void> | undefined;

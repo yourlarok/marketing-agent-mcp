@@ -4,12 +4,15 @@ import {
   type AnalysisCapabilityConfiguration,
   type AnalysisService,
 } from "../application/analysis-service.js";
+import type { BenchmarkService } from "../application/benchmark-service.js";
+import type { ContentProductionService } from "../application/content-production-service.js";
 import type { DashboardService } from "../application/dashboard-service.js";
 import type { DataResearchService } from "../application/data-research-service.js";
 import type { MarketingService } from "../application/marketing-service.js";
 import type { StrategyService } from "../application/strategy-service.js";
 import { DomainError } from "../domain/errors.js";
 import { registerAnalysisTools } from "./register-analysis-tools.js";
+import { registerContentProductionTools } from "./register-content-production-tools.js";
 import { registerDashboardStrategyTools } from "./register-dashboard-strategy-tools.js";
 import { registerDataResearchTools } from "./register-data-research-tools.js";
 import { registerTools } from "./register-tools.js";
@@ -33,12 +36,18 @@ export function createMcpServer(
   options: McpServerOptions = {},
   dashboard?: DashboardService,
   strategy?: StrategyService,
+  benchmark?: BenchmarkService,
+  contentProduction?: ContentProductionService,
 ): McpServer {
   const installed: Required<AnalysisCapabilityConfiguration> = {
     sqliteConfigured: dataResearch?.hasConfiguredSqliteConnector() ?? false,
     professionalAnalyticsConfigured: analysis?.hasProfessionalAnalyticsProvider() ?? false,
     dashboardRendererConfigured: dashboard !== undefined,
     strategyConfigured: strategy !== undefined,
+    benchmarkReverseConfigured: benchmark?.hasBenchmarkReverseProvider() ?? false,
+    professionalMediaConfigured: contentProduction?.hasProfessionalMediaProvider() ?? false,
+    ffprobeConfigured: contentProduction?.hasConfiguredVideoProbe() ?? false,
+    contentProductionConfigured: contentProduction !== undefined,
   };
   for (const key of Object.keys(installed) as (keyof typeof installed)[]) {
     if (options[key] !== undefined && options[key] !== installed[key]) {
@@ -65,6 +74,9 @@ export function createMcpServer(
         ...(strategy ? [
           "Treat strategy tasks as user-controlled drafts that never automatically produce, approve, schedule, or publish material.",
         ] : []),
+        ...(benchmark || contentProduction ? [
+          "Benchmark and content work must use persisted evidence. Video reverse analysis requires real persisted video frames and ASR transcripts; never claim human viewing. Author original expression in the host user's original language, bind factual statements to Finding references, and keep benchmark evidence and owned or authorized production source material in separate channels. PNG output requires actual Chromium decode and MP4 output requires actual ffprobe inspection. Read content artifacts as bounded base64 chunks. Internal channel profiles are disclosed for internal validation only, not publishing or platform-delivery guarantees. Do not use invented metrics or report unavailable provider success. A validated asset is not approved, scheduled, or published.",
+        ] : []),
         "Ask at most one high-impact question that would change the branch, and allow the user to continue with the stated default.",
         "Call the high-level marketing_analysis_start tool first. Use marketing_capability_list to inspect declared capabilities, configuration, fallbacks, and limitations.",
         "Keep facts, inferences, and unknowns separate. Public engagement must not be inferred as CTR or conversion, and observations or scenarios must not be presented as causal effects or guaranteed outcomes.",
@@ -84,5 +96,6 @@ export function createMcpServer(
   if (dashboard || strategy) {
     registerDashboardStrategyTools(server, dashboard, strategy);
   }
+  registerContentProductionTools(server, benchmark, contentProduction);
   return server;
 }

@@ -558,6 +558,15 @@ export class ContentProductionService {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
 
+  hasProfessionalMediaProvider(): boolean {
+    const provider = this.provider as MediaProvider & { isConfigured?: () => boolean };
+    return provider.isConfigured?.() ?? true;
+  }
+
+  hasConfiguredVideoProbe(): boolean {
+    return this.validator.hasConfiguredFfprobe?.() ?? true;
+  }
+
   async createBrief(command: Command<CreateContentBrief>): Promise<ContentBrief> {
     validateCreateInput(command.input);
     let prepared: { snapshot: BriefSnapshot; externalTexts: string[] } | undefined;

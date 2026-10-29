@@ -5,7 +5,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AnalysisService } from "../../src/application/analysis-service.js";
+import { BenchmarkService } from "../../src/application/benchmark-service.js";
 import type { CommandContext } from "../../src/application/commands.js";
+import { ContentProductionService } from "../../src/application/content-production-service.js";
 import { DashboardService } from "../../src/application/dashboard-service.js";
 import { DataResearchService } from "../../src/application/data-research-service.js";
 import { MarketingService } from "../../src/application/marketing-service.js";
@@ -56,7 +58,15 @@ const analysisToolNames = [
   "analysis_graph_expand",
   "analysis_graph_fork",
   "analysis_graph_get",
+  "benchmark_reverse_create",
+  "benchmark_reverse_get",
   "connector_sqlite_discover",
+  "content_artifact_get",
+  "content_asset_derive",
+  "content_asset_generate",
+  "content_asset_get",
+  "content_brief_create",
+  "content_brief_get",
   "dashboard_artifact_get",
   "dashboard_drilldown_get",
   "dashboard_get",
@@ -79,6 +89,10 @@ const analysisToolNames = [
 const writeToolNames = [
   "analysis_graph_expand",
   "analysis_graph_fork",
+  "benchmark_reverse_create",
+  "content_asset_derive",
+  "content_asset_generate",
+  "content_brief_create",
   "dashboard_render",
   "ingest_sqlite",
   "marketing_analysis_start",
@@ -147,11 +161,15 @@ describe("analysis MCP tools and initialization", () => {
     const analysis = new AnalysisService(store, clock, ids, artifacts);
     const dashboard = new DashboardService(store, clock, ids, artifacts);
     const strategy = new StrategyService(store, clock, ids);
+    const benchmark = new BenchmarkService(store, clock, ids, artifacts);
+    const contentProduction = new ContentProductionService(store, clock, ids, artifacts);
     await marketing.createWorkspace({
       input: { id: "workspace-1", name: "Analysis" },
       context: context("setup-workspace"),
     });
-    server = createMcpServer(marketing, dataResearch, analysis, {}, dashboard, strategy);
+    server = createMcpServer(
+      marketing, dataResearch, analysis, {}, dashboard, strategy, benchmark, contentProduction,
+    );
     client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
@@ -200,7 +218,7 @@ describe("analysis MCP tools and initialization", () => {
     expect(tools.map((tool) => tool.name).sort()).toEqual(
       [...priorToolNames, ...analysisToolNames].sort(),
     );
-    expect(tools).toHaveLength(46);
+    expect(tools).toHaveLength(54);
     for (const tool of tools) {
       expect(tool.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
     }

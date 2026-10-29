@@ -71,12 +71,20 @@ describe("built stdio server acceptance", () => {
       "analysis_graph_expand",
       "analysis_graph_fork",
       "analysis_graph_get",
+      "benchmark_reverse_create",
+      "benchmark_reverse_get",
       "capability_health_record",
       "capability_list",
       "capability_register",
       "competitor_confirm",
       "competitor_diff_create",
       "connector_sqlite_discover",
+      "content_artifact_get",
+      "content_asset_derive",
+      "content_asset_generate",
+      "content_asset_get",
+      "content_brief_create",
+      "content_brief_get",
       "dashboard_artifact_get",
       "dashboard_drilldown_get",
       "dashboard_get",
@@ -385,7 +393,7 @@ describe("built stdio server acceptance", () => {
     expect(malformed).toMatchObject({ isError: true });
     expect(JSON.stringify(malformed)).toContain("Input validation error");
     expect(JSON.stringify(malformed)).not.toContain("stack");
-    expect((await client.listTools()).tools).toHaveLength(46);
+    expect((await client.listTools()).tools).toHaveLength(54);
 
     await firstProcess.client.close();
     clients.splice(clients.indexOf(firstProcess.client), 1);

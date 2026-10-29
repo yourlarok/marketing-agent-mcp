@@ -294,6 +294,11 @@ export class BenchmarkService {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
 
+  hasBenchmarkReverseProvider(): boolean {
+    const provider = this.provider as BenchmarkReverseProvider & { isConfigured?: () => boolean };
+    return provider.isConfigured?.() ?? true;
+  }
+
   async reverse(command: Command<ReverseBenchmark>): Promise<BenchmarkAnalysis> {
     validateReverseInput(command.input);
     let prepared: PreparedBenchmark | undefined;

@@ -244,6 +244,10 @@ export class McpBenchmarkReverseProvider implements BenchmarkReverseProvider {
     }
   }
 
+  isConfigured(): boolean {
+    return this.options.command !== undefined;
+  }
+
   async reverse(request: BenchmarkReverseProviderRequest): Promise<BenchmarkReverseProviderResponse> {
     if (!this.options.command) {
       throw benchmarkReverseCapabilityGap("mcp_not_configured", "Benchmark reverse MCP is not configured");

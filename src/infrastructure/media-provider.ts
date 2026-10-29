@@ -284,6 +284,10 @@ export class McpMediaProvider implements MediaProvider {
     }
   }
 
+  isConfigured(): boolean {
+    return this.options.command !== undefined;
+  }
+
   async render(request: MediaRenderRequest): Promise<MediaRenderResponse> {
     if (!this.options.command) {
       throw mediaProviderCapabilityGap("mcp_not_configured", "Professional media MCP is not configured");

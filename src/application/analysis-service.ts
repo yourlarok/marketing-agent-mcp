@@ -1381,6 +1381,10 @@ export interface AnalysisCapabilityConfiguration {
   professionalAnalyticsConfigured?: boolean;
   dashboardRendererConfigured?: boolean;
   strategyConfigured?: boolean;
+  benchmarkReverseConfigured?: boolean;
+  professionalMediaConfigured?: boolean;
+  ffprobeConfigured?: boolean;
+  contentProductionConfigured?: boolean;
 }
 
 export class AnalysisCapabilityService {
@@ -1598,6 +1602,114 @@ export class AnalysisCapabilityService {
           "Recommendations do not guarantee outcomes or establish causality.",
           "Reads are workspace scoped and do not require write context; every mutation is auditable and idempotent.",
         ],
+      }),
+      capability({
+        id: "content.reverse",
+        operation: "benchmark_reverse_create / benchmark_reverse_get",
+        description: "Reverse persisted benchmark observations into evidence-bound transferable methods without human-viewing claims.",
+        requiredInputs: ["id", "workspaceId", "modality", "1-10 unique persisted evidenceIds", "actor", "requestId", "idempotencyKey"],
+        configuration: [
+          "MARKETING_BENCHMARK_MCP_COMMAND and MARKETING_BENCHMARK_MCP_ARGS in the trusted deployment environment",
+          "16 MiB maximum per asset; 24 MiB total assets; 1 MiB total text; 1 MiB provider response; 20 methods; 60 seconds timeout",
+          "Provider health, response provenance, Evidence references, and actual observation availability are checked on each explicit call",
+        ],
+        availability: this.configuration.benchmarkReverseConfigured ? {
+          state: "available",
+          detail: "BenchmarkService and its configured reverse MCP provider are installed; readiness is still validated per call.",
+        } : {
+          state: "unavailable",
+          detail: "The benchmark reverse MCP provider is not configured; no local reverse-analysis substitute is advertised.",
+        },
+        fallback: ["Persist the missing image observations, video frames, or ASR transcript before retrying"],
+        limitations: [
+          "Video analysis requires real persisted video frames and ASR for every selected Evidence; human review is not performed.",
+          "Methods are structural observations, not invented metrics, causal findings, generated assets, or publishing approval.",
+        ],
+      }),
+      capability({
+        id: "content.authoring",
+        operation: "content_brief_create / content_brief_get / content_asset_generate / content_asset_derive / content_asset_get / content_artifact_get",
+        description: "Author original host-language briefs and produce versioned assets only through the configured professional media provider.",
+        requiredInputs: ["Persisted Task, Recommendation, BenchmarkAnalysis, Finding, Evidence, and expected versions", "actor", "requestId", "idempotencyKey for every write"],
+        configuration: [
+          "Original expression in the host user's language; fact segments require persisted Finding references; benchmark evidence and production source channels remain separate",
+          "At most 20 frames and 60,000 ms total Channels duration; at most 8 independent source assets plus one derivative parent; 16 MiB total source/parent bytes; revisionInstructions at most 32 KiB",
+          "64 KiB maximum serialized MCP input/output; content artifact reads default to and are capped at 32 KiB decoded chunks",
+          "Provider health, source ownership, immutable versions, and actual media validation are enforced on each explicit generation or derivation call",
+        ],
+        availability: this.configuration.contentProductionConfigured ? {
+          state: "available",
+          detail: "ContentProductionService is installed with shared persistence; media generation additionally depends on media.professional and channel validation.",
+        } : {
+          state: "unavailable",
+          detail: "ContentProductionService is not installed.",
+        },
+        fallback: ["content_brief_create remains independent of media generation; no local generator fallback is provided"],
+        limitations: [
+          "No raw media, provider command, path, code, arguments, or environment is accepted through MCP.",
+          "Validation is internal acceptance only and never means approved, scheduled, published, legally cleared, or guaranteed to perform.",
+        ],
+      }),
+      capability({
+        id: "media.professional",
+        operation: "content_asset_generate / content_asset_derive",
+        description: "Render original channel assets from persisted briefs through the separately configured professional media MCP provider.",
+        requiredInputs: ["Persisted ContentBrief and expected version", "Independent owned or authorized source Evidence IDs", "Revision instructions", "actor", "requestId", "idempotencyKey"],
+        configuration: [
+          "MARKETING_MEDIA_MCP_COMMAND and MARKETING_MEDIA_MCP_ARGS in the trusted deployment environment",
+          "MARKETING_MEDIA_MCP_ENV_ALLOWLIST controls the only optional provider environment names; callers cannot supply environment values",
+          "24 MiB maximum provider response; 4 MiB XHS PNG output; 16 MiB Channels MP4 output; 120 seconds timeout",
+          "Provider health, input hash, media descriptor, and persisted output hash are checked on each explicit call",
+        ],
+        availability: this.configuration.professionalMediaConfigured ? {
+          state: "available",
+          detail: "A professional media MCP provider is configured; actual decode or probe remains a separate per-call requirement.",
+        } : {
+          state: "unavailable",
+          detail: "Professional media MCP is not configured; there is no local generator fallback.",
+        },
+        fallback: ["content_brief_create for authoring without asset generation"],
+        limitations: ["A provider response is not successful output until actual bytes are stored and validated.", "No publishing, scheduling, approval, or platform-delivery guarantee is provided."],
+      }),
+      capability({
+        id: "media.video_probe",
+        operation: "Internal validation during content_asset_generate / content_asset_derive for channels",
+        description: "Independently probe actual Channels MP4 bytes with deployment-controlled ffprobe.",
+        requiredInputs: ["Actual provider-returned MP4 bytes from a persisted generation request"],
+        configuration: [
+          "MARKETING_FFPROBE_COMMAND as an absolute deployment-controlled executable path, independent of professional media MCP",
+          "Exactly one 1080x1920 H.264 video stream and one AAC audio stream; positive duration at most 60 seconds; 16 MiB maximum bytes",
+          "10 seconds per probe invocation and 64 KiB maximum ffprobe output; probe health and results are checked on each explicit call",
+        ],
+        availability: this.configuration.ffprobeConfigured ? {
+          state: "available",
+          detail: "ffprobe is configured independently and inspects actual returned MP4 bytes on every Channels generation or derivation.",
+        } : {
+          state: "unavailable",
+          detail: "ffprobe is not configured; Channels media cannot be reported as validated.",
+        },
+        fallback: ["XHS generation uses actual Chromium image decode instead of ffprobe"],
+        limitations: ["Probe success is internal_acceptance_only, not approval, scheduling, publishing, or platform-delivery verification."],
+      }),
+      capability({
+        id: "content.internal_profiles",
+        operation: "Internal channel profile selection from a persisted ContentBrief",
+        description: "Disclose the exact internal acceptance specifications selected by the server rather than caller-supplied profiles.",
+        requiredInputs: ["Persisted ContentBrief channel=xhs|channels"],
+        configuration: [
+          "xhs_png_1080x1440_v1: PNG, 1080x1440, at most 4 MiB, actual Playwright Chromium decode",
+          "channels_mp4_1080x1920_h264_aac_v1: MP4, 1080x1920, H.264 plus AAC, at most 60 seconds and 16 MiB, actual ffprobe inspection",
+          "Both profiles carry guarantee=internal_acceptance_only and are applied on each explicit generation or derivation call",
+        ],
+        availability: this.configuration.contentProductionConfigured ? {
+          state: "available",
+          detail: "The server selects and discloses internal profiles from the persisted brief; no caller profile override is accepted.",
+        } : {
+          state: "unavailable",
+          detail: "ContentProductionService is not installed.",
+        },
+        fallback: [],
+        limitations: ["Internal profile validation is not human review, legal clearance, publishing approval, scheduling, publication, or a distribution guarantee."],
       }),
       capability({
         id: "connectors.live",

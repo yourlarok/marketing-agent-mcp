@@ -19,6 +19,7 @@ import {
   MAX_ASSET_RESPONSE_BYTES,
 } from "../../src/domain/content-production-model.js";
 import {
+  lineageGetInputSchema,
   MAX_SERIALIZED_INPUT_BYTES,
   recordFindingInputSchema,
   resourceIdInputSchema,
@@ -994,6 +995,17 @@ describe("MCP input contracts", () => {
       }).success,
     ).toBe(false);
   });
+
+  it.each(["benchmark_analysis", "content_brief", "asset_version"]) (
+    "accepts the %s lineage entity without adding another tool",
+    (entityType) => {
+      expect(lineageGetInputSchema.safeParse({
+        entityType,
+        id: "entity-1",
+        workspaceId: "workspace-1",
+      }).success).toBe(true);
+    },
+  );
 
   it("accepts UTC timestamps and rejects non-UTC timestamps", () => {
     expect(

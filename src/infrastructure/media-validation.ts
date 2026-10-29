@@ -120,6 +120,10 @@ export class MediaValidator {
     }
   }
 
+  hasConfiguredFfprobe(): boolean {
+    return this.options.ffprobeCommand !== undefined;
+  }
+
   async validateXhsPng(bytes: Uint8Array): Promise<PngAssetValidation> {
     if (bytes.byteLength < 1 || bytes.byteLength > CHANNEL_PROFILES.xhs.maxBytes) {
       throw new DomainError("INVALID_INPUT", "PNG bytes exceed the internal profile byte limit");

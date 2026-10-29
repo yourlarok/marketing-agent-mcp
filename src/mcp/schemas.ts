@@ -254,16 +254,20 @@ export const transitionTaskInputSchema = z.strictObject({
   ...commandContextInput,
 });
 
+const lineageEntityTypeSchema = z.enum([
+  "source",
+  "dataset",
+  "evidence",
+  "finding",
+  "recommendation",
+  "task",
+  "dashboard",
+  "benchmark_analysis",
+  "content_brief",
+  "asset_version",
+]);
 export const lineageGetInputSchema = z.strictObject({
-  entityType: z.enum([
-    "source",
-    "dataset",
-    "evidence",
-    "finding",
-    "recommendation",
-    "task",
-    "dashboard",
-  ]),
+  entityType: lineageEntityTypeSchema,
   id: idSchema,
   workspaceId: idSchema,
 });
@@ -777,6 +781,164 @@ export const strategyTaskListInputSchema = z.strictObject({
   }).optional(),
 });
 
+const contentStableIdSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,127}$/);
+const contentTextSchema = z.string().trim().min(1).max(8_192);
+const contentSegmentInputSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    id: contentStableIdSchema,
+    kind: z.literal("creative"),
+    text: contentTextSchema,
+  }),
+  z.strictObject({
+    id: contentStableIdSchema,
+    kind: z.literal("fact"),
+    text: contentTextSchema,
+    findingId: idSchema,
+  }),
+]);
+const contentFrameInputSchema = z.strictObject({
+  id: contentStableIdSchema,
+  order: positiveIntegerSchema,
+  purpose: contentTextSchema,
+  visualDirection: contentTextSchema,
+  onScreenText: z.array(contentSegmentInputSchema).max(20),
+  narration: z.array(contentSegmentInputSchema).max(20),
+  durationMs: positiveIntegerSchema.nullable(),
+});
+const productionSourceMaterialInputSchema = z.strictObject({
+  evidenceId: idSchema,
+  assetId: idSchema,
+});
+const sourceMaterialsInputSchema = z.array(productionSourceMaterialInputSchema).max(8)
+  .refine((materials) => new Set(materials.map((material) =>
+    JSON.stringify([material.evidenceId, material.assetId]))).size === materials.length, {
+    message: "Source materials must not contain duplicates",
+  });
+const revisionInstructionsInputSchema = z.string().trim().min(1).max(32 * 1024);
+
+export const benchmarkReverseCreateInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  modality: z.enum(["image", "video"]),
+  evidenceIds: uniqueIdsSchema.min(1).max(10),
+  competitorDiffId: idSchema.optional(),
+  expectedCompetitorDiffVersion: positiveIntegerSchema.optional(),
+  ...commandContextInput,
+}).refine((input) =>
+  (input.competitorDiffId === undefined) === (input.expectedCompetitorDiffVersion === undefined), {
+  message: "competitorDiffId and expectedCompetitorDiffVersion must be provided together",
+});
+export const benchmarkReverseGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+});
+export const contentBriefCreateInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  taskId: idSchema,
+  expectedTaskVersion: positiveIntegerSchema,
+  recommendationId: idSchema,
+  expectedRecommendationVersion: positiveIntegerSchema,
+  benchmarkAnalysisId: idSchema,
+  expectedBenchmarkVersion: positiveIntegerSchema,
+  channel: z.enum(["xhs", "channels"]),
+  methodIds: uniqueIdsSchema.min(1).max(20),
+  objective: contentTextSchema,
+  audience: contentTextSchema,
+  copy: z.strictObject({
+    hook: contentSegmentInputSchema,
+    body: z.array(contentSegmentInputSchema).min(1).max(20),
+    cta: contentSegmentInputSchema,
+  }),
+  frames: z.array(contentFrameInputSchema).max(20),
+  assetRequirements: z.array(contentTextSchema).max(100).refine(
+    (requirements) => new Set(requirements).size === requirements.length,
+    { message: "Asset requirements must not contain duplicates" },
+  ),
+  ...commandContextInput,
+}).superRefine((input, context) => {
+  const segments = [
+    input.copy.hook,
+    ...input.copy.body,
+    input.copy.cta,
+    ...input.frames.flatMap((frame) => [...frame.onScreenText, ...frame.narration]),
+  ];
+  if (new Set(segments.map((segment) => segment.id)).size !== segments.length) {
+    context.addIssue({ code: "custom", message: "Content segment IDs must not contain duplicates" });
+  }
+  if (new Set(input.frames.map((frame) => frame.id)).size !== input.frames.length) {
+    context.addIssue({ code: "custom", message: "Content frame IDs must not contain duplicates" });
+  }
+  let totalDuration = 0;
+  for (const [index, frame] of input.frames.entries()) {
+    if (frame.order !== index + 1) {
+      context.addIssue({
+        code: "custom",
+        message: "Content frame orders must be consecutive starting at 1",
+        path: ["frames", index, "order"],
+      });
+    }
+    if (input.channel === "xhs" && frame.durationMs !== null) {
+      context.addIssue({
+        code: "custom",
+        message: "XHS frame durationMs must be null",
+        path: ["frames", index, "durationMs"],
+      });
+    }
+    if (input.channel === "channels") {
+      if (frame.durationMs === null) {
+        context.addIssue({
+          code: "custom",
+          message: "Channels frame durationMs must be positive",
+          path: ["frames", index, "durationMs"],
+        });
+      } else {
+        totalDuration += frame.durationMs;
+      }
+    }
+  }
+  if (totalDuration > 60_000) {
+    context.addIssue({ code: "custom", message: "Channels frame durations must not exceed 60,000 ms" });
+  }
+});
+export const contentBriefGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+});
+export const contentAssetGenerateInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  contentId: idSchema,
+  briefId: idSchema,
+  expectedBriefVersion: positiveIntegerSchema,
+  sourceMaterials: sourceMaterialsInputSchema,
+  revisionInstructions: revisionInstructionsInputSchema,
+  ...commandContextInput,
+});
+export const contentAssetDeriveInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  contentId: idSchema,
+  parentVersionId: idSchema,
+  expectedParentVersion: positiveIntegerSchema,
+  briefId: idSchema,
+  expectedBriefVersion: positiveIntegerSchema,
+  sourceMaterials: sourceMaterialsInputSchema,
+  revisionInstructions: revisionInstructionsInputSchema,
+  ...commandContextInput,
+});
+export const contentAssetGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+});
+export const contentArtifactGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  artifactId: idSchema,
+  offset: nonNegativeIntegerSchema.optional(),
+  length: positiveIntegerSchema.max(32 * 1024).optional(),
+});
+
 const rawStringSchema = z.string();
 const rawNumberSchema = z.number();
 const rawCommandContextInput = {
@@ -1191,7 +1353,7 @@ export const transitionTaskToolSchema = z.strictObject({
   ...rawCommandContextInput,
 });
 export const lineageGetToolSchema = z.strictObject({
-  entityType: rawStringSchema,
+  entityType: lineageEntityTypeSchema,
   id: rawStringSchema,
   workspaceId: rawStringSchema,
 });
@@ -1321,6 +1483,106 @@ export const evidenceAssetGetToolSchema = z.strictObject({
   workspaceId: rawStringSchema,
   evidenceId: rawStringSchema,
   assetId: rawStringSchema,
+  offset: rawNumberSchema.optional(),
+  length: rawNumberSchema.optional(),
+});
+
+const rawContentSegmentSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    id: rawStringSchema,
+    kind: z.literal("creative"),
+    text: rawStringSchema,
+  }),
+  z.strictObject({
+    id: rawStringSchema,
+    kind: z.literal("fact"),
+    text: rawStringSchema,
+    findingId: rawStringSchema,
+  }),
+]);
+const rawContentFrameSchema = z.strictObject({
+  id: rawStringSchema,
+  order: rawNumberSchema,
+  purpose: rawStringSchema,
+  visualDirection: rawStringSchema,
+  onScreenText: z.array(rawContentSegmentSchema),
+  narration: z.array(rawContentSegmentSchema),
+  durationMs: rawNumberSchema.nullable(),
+});
+const rawProductionSourceMaterialSchema = z.strictObject({
+  evidenceId: rawStringSchema,
+  assetId: rawStringSchema,
+});
+
+export const benchmarkReverseCreateToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  modality: rawStringSchema,
+  evidenceIds: z.array(rawStringSchema),
+  competitorDiffId: rawStringSchema.optional(),
+  expectedCompetitorDiffVersion: rawNumberSchema.optional(),
+  ...rawCommandContextInput,
+});
+export const benchmarkReverseGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+});
+export const contentBriefCreateToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  taskId: rawStringSchema,
+  expectedTaskVersion: rawNumberSchema,
+  recommendationId: rawStringSchema,
+  expectedRecommendationVersion: rawNumberSchema,
+  benchmarkAnalysisId: rawStringSchema,
+  expectedBenchmarkVersion: rawNumberSchema,
+  channel: rawStringSchema,
+  methodIds: z.array(rawStringSchema),
+  objective: rawStringSchema,
+  audience: rawStringSchema,
+  copy: z.strictObject({
+    hook: rawContentSegmentSchema,
+    body: z.array(rawContentSegmentSchema),
+    cta: rawContentSegmentSchema,
+  }),
+  frames: z.array(rawContentFrameSchema),
+  assetRequirements: z.array(rawStringSchema),
+  ...rawCommandContextInput,
+});
+export const contentBriefGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+});
+export const contentAssetGenerateToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  contentId: rawStringSchema,
+  briefId: rawStringSchema,
+  expectedBriefVersion: rawNumberSchema,
+  sourceMaterials: z.array(rawProductionSourceMaterialSchema),
+  revisionInstructions: rawStringSchema,
+  ...rawCommandContextInput,
+});
+export const contentAssetDeriveToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  contentId: rawStringSchema,
+  parentVersionId: rawStringSchema,
+  expectedParentVersion: rawNumberSchema,
+  briefId: rawStringSchema,
+  expectedBriefVersion: rawNumberSchema,
+  sourceMaterials: z.array(rawProductionSourceMaterialSchema),
+  revisionInstructions: rawStringSchema,
+  ...rawCommandContextInput,
+});
+export const contentAssetGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+});
+export const contentArtifactGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  artifactId: rawStringSchema,
   offset: rawNumberSchema.optional(),
   length: rawNumberSchema.optional(),
 });
