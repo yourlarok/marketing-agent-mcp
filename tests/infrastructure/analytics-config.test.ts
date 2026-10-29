@@ -102,6 +102,61 @@ describe("professional media and video probe deployment configuration", () => {
   });
 });
 
+describe("trusted publishing MCP deployment configuration", () => {
+  it("loads only trusted command, JSON string-array args, and environment allowlist", async () => {
+    const dataDir = await createTempDir();
+    try {
+      expect(loadConfig({
+        MARKETING_DATA_DIR: dataDir,
+        MARKETING_PUBLISHING_MCP_COMMAND: "/trusted/publishing",
+        MARKETING_PUBLISHING_MCP_ARGS: JSON.stringify(["--mode", "fixture"]),
+        MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST: " PUBLISHING_FIXTURE_STATE, PUBLISHING_FIXTURE_MODE ",
+      })).toEqual({
+        dataDir,
+        publishingMcp: {
+          command: "/trusted/publishing",
+          args: ["--mode", "fixture"],
+          envAllowlist: ["PUBLISHING_FIXTURE_STATE", "PUBLISHING_FIXTURE_MODE"],
+        },
+        logLevel: "info",
+      });
+    } finally {
+      await import("node:fs/promises").then(({ rm }) => rm(dataDir, { recursive: true, force: true }));
+    }
+  });
+
+  it("rejects orphaned settings, malformed args, empty commands, and invalid environment names", async () => {
+    const dataDir = await createTempDir();
+    try {
+      for (const env of [
+        { MARKETING_PUBLISHING_MCP_ARGS: "[]" },
+        { MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST: "PUBLISHING_FIXTURE_STATE" },
+      ]) {
+        expect(() => loadConfig({ MARKETING_DATA_DIR: dataDir, ...env }))
+          .toThrow("MARKETING_PUBLISHING_MCP_COMMAND");
+      }
+      for (const args of ["not-json", "{}", "[1]"]) {
+        expect(() => loadConfig({
+          MARKETING_DATA_DIR: dataDir,
+          MARKETING_PUBLISHING_MCP_COMMAND: "/trusted/publishing",
+          MARKETING_PUBLISHING_MCP_ARGS: args,
+        })).toThrow("MARKETING_PUBLISHING_MCP_ARGS must be a JSON string array");
+      }
+      expect(() => loadConfig({
+        MARKETING_DATA_DIR: dataDir,
+        MARKETING_PUBLISHING_MCP_COMMAND: "  ",
+      })).toThrow("MARKETING_PUBLISHING_MCP_COMMAND must not be empty");
+      expect(() => loadConfig({
+        MARKETING_DATA_DIR: dataDir,
+        MARKETING_PUBLISHING_MCP_COMMAND: "/trusted/publishing",
+        MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST: "VALID_NAME,not-a-name",
+      })).toThrow("MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST");
+    } finally {
+      await import("node:fs/promises").then(({ rm }) => rm(dataDir, { recursive: true, force: true }));
+    }
+  });
+});
+
 describe("professional analytics MCP deployment configuration", () => {
   it("loads command and JSON string-array args only from trusted environment configuration", async () => {
     const dataDir = await createTempDir();

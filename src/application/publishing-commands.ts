@@ -47,3 +47,14 @@ export interface GetSchedule {
   id: string;
   workspaceId: string;
 }
+
+export interface PublicationOperation {
+  id: string;
+  workspaceId: string;
+  expectedVersion: number;
+}
+
+export interface GetPublication {
+  id: string;
+  workspaceId: string;
+}

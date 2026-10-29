@@ -28,6 +28,8 @@ const BENCHMARK_CONFIGURATION_ACTION =
   "Configure MARKETING_BENCHMARK_MCP_COMMAND and MARKETING_BENCHMARK_MCP_ARGS in the trusted deployment environment";
 const MEDIA_CONFIGURATION_ACTION =
   "Configure MARKETING_MEDIA_MCP_COMMAND and MARKETING_MEDIA_MCP_ARGS in the trusted deployment environment";
+const PUBLISHING_CONFIGURATION_ACTION =
+  "Configure MARKETING_PUBLISHING_MCP_COMMAND and MARKETING_PUBLISHING_MCP_ARGS in the trusted deployment environment";
 const PROBE_CONFIGURATION_ACTION =
   "Configure MARKETING_FFPROBE_COMMAND as an absolute deployment-controlled executable path";
 const SQLITE_CONFIGURATION_ACTION =
@@ -69,6 +71,16 @@ const MEDIA_GAP_REASONS = new Set([
   "image_decode_failed",
   "media_dimensions_mismatch",
   "media_format_mismatch",
+]);
+const PUBLISHING_GAP_REASONS = new Set([
+  "mcp_not_configured",
+  "mcp_cleanup_failed",
+  "mcp_timeout",
+  "mcp_unavailable",
+  "mcp_invalid_response",
+  "mcp_input_hash_mismatch",
+  "mcp_response_too_large",
+  "mcp_result_mismatch",
 ]);
 const PROBE_GAP_REASONS = new Set([
   "ffprobe_not_configured",
@@ -125,6 +137,12 @@ function safeCapabilityDetails(
     safe.capability = "professional_media";
     safe.configurationAction = MEDIA_CONFIGURATION_ACTION;
     if (typeof details.reason === "string" && MEDIA_GAP_REASONS.has(details.reason)) {
+      safe.reason = details.reason;
+    }
+  } else if (details?.capability === "trusted_publishing") {
+    safe.capability = "trusted_publishing";
+    safe.configurationAction = PUBLISHING_CONFIGURATION_ACTION;
+    if (typeof details.reason === "string" && PUBLISHING_GAP_REASONS.has(details.reason)) {
       safe.reason = details.reason;
     }
   } else if (details?.capability === "video_probe") {

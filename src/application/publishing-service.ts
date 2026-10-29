@@ -6,24 +6,39 @@ import {
   createApproval,
   createPublication,
   createSchedule,
+  MAX_PUBLICATION_ATTEMPTS,
+  MAX_PUBLICATION_RECEIPTS,
   type Approval,
   type Publication,
+  type PublicationAttempt,
+  type PublicationReceipt,
   type Schedule,
 } from "../domain/publishing-model.js";
 import { ArtifactStore } from "../infrastructure/artifact-store.js";
+import {
+  computePublishingSubmitInputHash,
+  McpPublishingProvider,
+  type PublishingProvider,
+  type PublishingProviderResult,
+  type PublishingSubmitRequest,
+} from "../infrastructure/publishing-provider.js";
 import { canonicalJson } from "../infrastructure/sqlite.js";
 import {
+  assertBoundedCommandResponse,
   AuditableCommandPipeline,
   type Command,
+  type CommandContext,
   type CommandPipeline,
 } from "./commands.js";
 import { requireWorkspace } from "./marketing-service.js";
-import type { Clock, IdGenerator, Repositories, Store } from "./ports.js";
+import type { Clock, IdGenerator, JsonValue, Repositories, Store } from "./ports.js";
 import type {
   CancelSchedule,
   CreateSchedule,
   GetApproval,
+  GetPublication,
   GetSchedule,
+  PublicationOperation,
   RecordApproval,
   Reschedule,
 } from "./publishing-commands.js";
@@ -39,6 +54,7 @@ const CREATE_SCHEDULE_KEYS = [
 const RESCHEDULE_KEYS = ["id", "workspaceId", "expectedVersion", "scheduledFor", "timeZone"] as const;
 const CANCEL_SCHEDULE_KEYS = ["id", "workspaceId", "expectedVersion"] as const;
 const GET_KEYS = ["id", "workspaceId"] as const;
+const PUBLICATION_OPERATION_KEYS = ["id", "workspaceId", "expectedVersion"] as const;
 
 export interface PublishingProviderConfiguration {
   isConfigured(channel: ContentChannel, accountId: string): boolean;
@@ -59,6 +75,20 @@ interface ScheduleSnapshot {
   approval: Approval;
 }
 
+interface PublicationSnapshot extends ScheduleSnapshot {
+  schedule: Schedule;
+  publication: Publication;
+}
+
+interface PreparedPublication extends PublicationSnapshot {
+  request: PublishingSubmitRequest;
+  inputHash: string;
+}
+
+type PublicationClaim =
+  | { kind: "claimed"; prepared: PreparedPublication; claimed: Publication }
+  | { kind: "complete"; publication: Publication };
+
 function invalid(message: string): never {
   throw new DomainError("INVALID_INPUT", message);
 }
@@ -75,6 +105,18 @@ function positiveVersion(value: unknown, field: string): asserts value is number
   if (!Number.isSafeInteger(value) || (value as number) < 1) {
     invalid(`${field} must be a positive safe integer`);
   }
+}
+
+function validatePublicationOperation(input: PublicationOperation, context: CommandContext): void {
+  assertRecord(input, "PublicationOperation", PUBLICATION_OPERATION_KEYS);
+  positiveVersion(input.expectedVersion, "expectedVersion");
+  for (const [field, value] of Object.entries(context)) {
+    if (typeof value !== "string" || value.trim().length === 0) invalid(`${field} must not be empty`);
+  }
+}
+
+function publicationRequestHash(action: string, input: PublicationOperation): string {
+  return createHash("sha256").update(canonicalJson({ action, input })).digest("hex");
 }
 
 function assertScheduleTimeSyntax(scheduledFor: string, timeZone: string): void {
@@ -200,6 +242,39 @@ async function requireSchedule(repos: Repositories, input: { id: string; workspa
   return schedule;
 }
 
+async function requirePublicationSnapshot(
+  repos: Repositories,
+  input: { id: string; workspaceId: string },
+): Promise<PublicationSnapshot> {
+  const publication = await repos.publications.get(input.id, input.workspaceId);
+  if (!publication) notFound("Publication not found in workspace", { id: input.id, workspaceId: input.workspaceId });
+  const schedule = await requireSchedule(repos, { id: publication.scheduleId, workspaceId: input.workspaceId });
+  const asset = await repos.assetVersions.get(publication.assetVersionId, input.workspaceId);
+  const approval = await repos.approvals.get(publication.approvalId, input.workspaceId);
+  if (!asset || !approval) conflict("Publication locked AssetVersion or Approval is missing");
+  if (
+    publication.scheduleId !== schedule.id ||
+    publication.assetVersionId !== schedule.assetVersionId ||
+    publication.assetVersion !== schedule.assetVersion ||
+    publication.approvalId !== schedule.approvalId ||
+    publication.channel !== schedule.channel ||
+    publication.accountId !== schedule.accountId ||
+    publication.deliveryMode !== schedule.deliveryMode ||
+    schedule.deliveryMode !== "automatic" ||
+    schedule.assetVersionId !== asset.id ||
+    schedule.assetVersion !== asset.version ||
+    schedule.channel !== asset.channel ||
+    approval.decision !== "approved" ||
+    approval.assetVersionId !== asset.id ||
+    approval.assetVersion !== asset.version ||
+    approval.artifactHash !== asset.artifact.contentHash ||
+    publication.artifactHash !== asset.artifact.contentHash
+  ) {
+    conflict("Publication requires the exact approved AssetVersion, artifact, account, channel, and Schedule");
+  }
+  return { publication, schedule, asset, approval };
+}
+
 export function publicationOperationKey(identity: PublicationOperationIdentity): string {
   const canonicalIdentity = canonicalJson({
     workspaceId: identity.workspaceId,
@@ -218,10 +293,11 @@ export class PublishingService {
 
   constructor(
     private readonly store: Store,
-    clock: Clock,
-    ids: IdGenerator,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
     private readonly artifacts: ArtifactStore = new ArtifactStore(),
     private readonly providerConfiguration: PublishingProviderConfiguration = { isConfigured: () => false },
+    private readonly provider: PublishingProvider = new McpPublishingProvider(),
   ) {
     this.commands = new AuditableCommandPipeline(store, clock, ids);
   }
@@ -407,6 +483,455 @@ export class PublishingService {
     return this.store.transaction((repos) => requireSchedule(repos, query));
   }
 
+  async submit(command: Command<PublicationOperation>): Promise<Publication> {
+    validatePublicationOperation(command.input, command.context);
+    return this.performSubmit(command, "publication.submit");
+  }
+
+  async verify(command: Command<PublicationOperation>): Promise<Publication> {
+    validatePublicationOperation(command.input, command.context);
+    return this.performVerify(command, "publication.verify");
+  }
+
+  async retry(command: Command<PublicationOperation>): Promise<Publication> {
+    validatePublicationOperation(command.input, command.context);
+    const action = "publication.retry";
+    const replay = await this.replay(command, action);
+    if (replay) return replay;
+    const current = await this.store.transaction(async (repos) => {
+      const publication = await repos.publications.get(command.input.id, command.input.workspaceId);
+      if (!publication) notFound("Publication not found in workspace", { id: command.input.id, workspaceId: command.input.workspaceId });
+      return publication;
+    });
+    if (current.status === "verified") {
+      return this.completeNoop(command, action, current.version, ["verified"]);
+    }
+    if (["submitting", "submitted", "unknown"].includes(current.status)) {
+      const checked = await this.performVerify(command, action, true);
+      if (checked.status === "failed" && checked.failure?.code === "not_found") {
+        return this.performSubmit(command, action, checked.version);
+      }
+      return this.store.transaction(async (repos) => {
+        const previous = await this.replayInTransaction(repos, command, action);
+        if (previous) return previous;
+        await this.putIdempotency(repos, command, action, checked);
+        return checked;
+      });
+    }
+    return this.performSubmit(command, action);
+  }
+
+  async get(query: GetPublication): Promise<Publication> {
+    assertRecord(query, "GetPublication", GET_KEYS);
+    return this.store.transaction(async (repos) => {
+      const publication = await repos.publications.get(query.id, query.workspaceId);
+      if (!publication) notFound("Publication not found in workspace", { id: query.id, workspaceId: query.workspaceId });
+      return publication;
+    });
+  }
+
+  private async performSubmit(
+    command: Command<PublicationOperation>,
+    action: string,
+    expectedVersion = command.input.expectedVersion,
+  ): Promise<Publication> {
+    const replay = await this.replay(command, action);
+    if (replay) return replay;
+    const snapshot = await this.store.transaction((repos) => requirePublicationSnapshot(repos, command.input));
+    this.assertPublicationVersion(snapshot.publication, expectedVersion);
+    if (snapshot.publication.status === "verified" || snapshot.publication.status === "submitted") {
+      return this.completeNoop(command, action, expectedVersion, ["verified", "submitted"]);
+    }
+    if (snapshot.publication.status !== "pending" && snapshot.publication.status !== "failed") {
+      conflict("Submission is uncertain; retry must verify before any new submission");
+    }
+    if (Date.parse(snapshot.schedule.scheduledFor) > Date.parse(this.clock.now())) {
+      return this.completeNoop(command, action, expectedVersion, ["pending"], true);
+    }
+    this.assertDueAndConfigured(snapshot);
+    this.assertAttemptCapacity(snapshot.publication);
+    const content = await this.readActualArtifact(snapshot.asset);
+    const prepared = this.preparePublication(snapshot, content);
+    const claim = await this.claim(command, action, "submit", prepared, expectedVersion);
+    if (claim.kind === "complete") return claim.publication;
+    let result: PublishingProviderResult | undefined;
+    let providerError: unknown;
+    try {
+      result = await this.provider.submit(prepared.request);
+    } catch (error) {
+      providerError = error;
+    }
+    return this.completeProviderOperation(command, action, "submit", claim, result, providerError);
+  }
+
+  private async performVerify(
+    command: Command<PublicationOperation>,
+    action: string,
+    deferIdempotency = false,
+  ): Promise<Publication> {
+    const replay = await this.replay(command, action);
+    if (replay) return replay;
+    const snapshot = await this.store.transaction((repos) => requirePublicationSnapshot(repos, command.input));
+    this.assertPublicationVersion(snapshot.publication, command.input.expectedVersion);
+    if (snapshot.publication.status === "verified") {
+      return this.completeNoop(command, action, command.input.expectedVersion, ["verified"]);
+    }
+    if (!["submitting", "submitted", "unknown"].includes(snapshot.publication.status)) {
+      conflict("Only a submitted or uncertain Publication can be verified");
+    }
+    this.assertDueAndConfigured(snapshot);
+    const content = await this.readActualArtifact(snapshot.asset);
+    const prepared = this.preparePublication(snapshot, content);
+    const claim = await this.claim(command, action, "verify", prepared, command.input.expectedVersion);
+    if (claim.kind === "complete") return claim.publication;
+    let result: PublishingProviderResult | undefined;
+    let providerError: unknown;
+    try {
+      result = await this.provider.verify({
+        operationKey: prepared.publication.operationKey,
+        inputHash: prepared.inputHash,
+        channel: prepared.publication.channel,
+        accountId: prepared.publication.accountId,
+      });
+    } catch (error) {
+      providerError = error;
+    }
+    return this.completeProviderOperation(command, action, "verify", claim, result, providerError, deferIdempotency);
+  }
+
+  private preparePublication(snapshot: PublicationSnapshot, content: Buffer): PreparedPublication {
+    const publication = snapshot.publication;
+    const request: PublishingSubmitRequest = {
+      operationKey: publication.operationKey,
+      publicationId: publication.id,
+      workspaceId: publication.workspaceId,
+      scheduleId: publication.scheduleId,
+      assetVersionId: publication.assetVersionId,
+      assetVersion: publication.assetVersion,
+      artifactHash: publication.artifactHash,
+      artifactByteLength: content.length,
+      artifactBase64: content.toString("base64"),
+      channel: publication.channel,
+      accountId: publication.accountId,
+    };
+    return {
+      ...snapshot,
+      request,
+      inputHash: computePublishingSubmitInputHash(request),
+    };
+  }
+
+  private async claim(
+    command: Command<PublicationOperation>,
+    action: string,
+    operation: "submit" | "verify",
+    prepared: PreparedPublication,
+    expectedVersion: number,
+  ): Promise<PublicationClaim> {
+    return this.store.transaction(async (repos): Promise<PublicationClaim> => {
+      const previous = await this.replayInTransaction(repos, command, action);
+      if (previous) return { kind: "complete", publication: previous };
+      const current = await requirePublicationSnapshot(repos, command.input);
+      const currentIdentity = {
+        publication: current.publication,
+        schedule: current.schedule,
+        asset: current.asset,
+        approval: current.approval,
+      };
+      const preparedIdentity = {
+        publication: prepared.publication,
+        schedule: prepared.schedule,
+        asset: prepared.asset,
+        approval: prepared.approval,
+      };
+      if (canonicalJson(currentIdentity) !== canonicalJson(preparedIdentity)) {
+        conflict("Publication, Approval, AssetVersion, or Schedule changed before provider claim");
+      }
+      this.assertPublicationVersion(current.publication, expectedVersion);
+      if (operation === "submit" && ["verified", "submitted"].includes(current.publication.status)) {
+        return { kind: "complete", publication: await this.recordResponse(repos, command, action, current.publication) };
+      }
+      if (operation === "verify" && current.publication.status === "verified") {
+        return { kind: "complete", publication: await this.recordResponse(repos, command, action, current.publication) };
+      }
+      if (operation === "submit" && Date.parse(current.schedule.scheduledFor) > Date.parse(this.clock.now())) {
+        if (current.publication.status !== "pending") conflict("Only a pending Publication can be a before-due no-op");
+        return { kind: "complete", publication: await this.recordResponse(repos, command, action, current.publication) };
+      }
+      this.assertDueAndConfigured(current);
+      const timestamp = this.clock.now();
+      let claimed: Publication;
+      if (operation === "submit") {
+        if (current.publication.status !== "pending" && current.publication.status !== "failed") {
+          conflict("Submission is uncertain; retry must verify before any new submission");
+        }
+        this.assertAttemptCapacity(current.publication);
+        const attempt: PublicationAttempt = {
+          attempt: current.publication.attempts.length + 1,
+          startedAt: timestamp,
+          completedAt: null,
+          outcome: "submitting",
+        };
+        claimed = await repos.publications.update({
+          ...current.publication,
+          status: "submitting",
+          attempts: [...current.publication.attempts, attempt],
+          failure: null,
+          updatedAt: timestamp,
+        }, current.publication.version);
+      } else {
+        if (!["submitting", "submitted", "unknown"].includes(current.publication.status)) {
+          conflict("Only a submitted or uncertain Publication can be verified");
+        }
+        claimed = await repos.publications.update({
+          ...current.publication,
+          updatedAt: timestamp,
+        }, current.publication.version);
+      }
+      await this.appendAudit(repos, command, `${action}.claim`, claimed, timestamp);
+      return { kind: "claimed", prepared: { ...prepared, ...current }, claimed };
+    });
+  }
+
+  private async completeProviderOperation(
+    command: Command<PublicationOperation>,
+    action: string,
+    operation: "submit" | "verify",
+    claim: Extract<PublicationClaim, { kind: "claimed" }>,
+    result: PublishingProviderResult | undefined,
+    providerError: unknown,
+    deferIdempotency = false,
+  ): Promise<Publication> {
+    const timestamp = this.clock.now();
+    return this.store.transaction(async (repos) => {
+      const previous = await this.replayInTransaction(repos, command, action);
+      if (previous) return previous;
+      const current = await repos.publications.get(command.input.id, command.input.workspaceId);
+      if (!current) notFound("Publication not found in workspace", { id: command.input.id, workspaceId: command.input.workspaceId });
+      if (current.version !== claim.claimed.version || current.status !== claim.claimed.status) {
+        conflict("Publication changed before provider outcome commit");
+      }
+      let status = current.status;
+      let failure = current.failure;
+      let delivery = current.delivery;
+      let verification = current.verification;
+      let attempts = current.attempts;
+      if (providerError !== undefined || !result) {
+        status = "unknown";
+        failure = this.uncertainFailure(providerError, timestamp);
+      } else if (operation === "submit") {
+        if (result.status === "accepted") {
+          status = "submitted";
+          failure = null;
+        } else if (result.status === "failed" && result.failure) {
+          status = "failed";
+          failure = { ...result.failure, failedAt: timestamp };
+        } else {
+          conflict("Trusted provider returned an invalid submit outcome");
+        }
+        attempts = current.attempts.map((attempt, index) => index === current.attempts.length - 1 ? {
+          ...attempt,
+          completedAt: timestamp,
+          outcome: status === "submitted" ? "submitted" : "failed",
+        } : attempt);
+      } else if (result.status === "verified" && result.externalPublicationId && result.publishedAt) {
+        status = "verified";
+        failure = null;
+        delivery = {
+          method: "provider",
+          externalPublicationId: result.externalPublicationId,
+          publishedAt: result.publishedAt,
+          evidenceIds: [],
+        };
+        verification = {
+          method: "provider",
+          verifiedAt: timestamp,
+          externalPublicationId: result.externalPublicationId,
+          evidenceIds: [],
+        };
+      } else if (result.status === "pending") {
+        status = "submitted";
+        failure = null;
+      } else if (result.status === "failed" && result.failure) {
+        status = "failed";
+        failure = { ...result.failure, failedAt: timestamp };
+      } else if (result.status === "not_found") {
+        status = "failed";
+        failure = {
+          code: "not_found",
+          message: "Trusted provider explicitly reported that the operation was not found",
+          failedAt: timestamp,
+          retryable: true,
+        };
+      } else {
+        conflict("Trusted provider returned an invalid verification outcome");
+      }
+      if (status === "unknown" && operation === "submit") {
+        attempts = current.attempts.map((attempt, index) => index === current.attempts.length - 1 ? {
+          ...attempt,
+          completedAt: timestamp,
+          outcome: "unknown",
+        } : attempt);
+      }
+      const receipts = result?.receipt ? this.appendReceipt(current.receipts, {
+        kind: operation,
+        provider: "mcp",
+        receiptId: result.receipt.receiptId,
+        receivedAt: timestamp,
+        contentHash: result.receipt.contentHash,
+      }) : current.receipts;
+      const updated = await repos.publications.update({
+        ...current,
+        status,
+        attempts,
+        receipts,
+        failure,
+        delivery,
+        verification,
+        updatedAt: timestamp,
+      }, claim.claimed.version);
+      assertBoundedCommandResponse(updated);
+      await this.appendAudit(repos, command, action, updated, timestamp);
+      if (!deferIdempotency) await this.putIdempotency(repos, command, action, updated, timestamp);
+      return updated;
+    });
+  }
+
+  private appendReceipt(receipts: PublicationReceipt[], receipt: PublicationReceipt): PublicationReceipt[] {
+    if (receipts.some((current) => current.kind === receipt.kind && current.receiptId === receipt.receiptId)) {
+      return receipts;
+    }
+    if (receipts.length >= MAX_PUBLICATION_RECEIPTS) return receipts;
+    return [...receipts, receipt];
+  }
+
+  private uncertainFailure(error: unknown, timestamp: string): NonNullable<Publication["failure"]> {
+    const reason = error instanceof DomainError && typeof error.details?.reason === "string"
+      ? error.details.reason
+      : error instanceof DomainError ? error.code.toLowerCase() : "provider_outcome_unknown";
+    return {
+      code: reason,
+      message: "Trusted publishing outcome is unknown and requires verification before retry",
+      failedAt: timestamp,
+      retryable: true,
+    };
+  }
+
+  private async completeNoop(
+    command: Command<PublicationOperation>,
+    action: string,
+    expectedVersion: number,
+    statuses: Publication["status"][],
+    beforeDueOnly = false,
+  ): Promise<Publication> {
+    return this.store.transaction(async (repos) => {
+      const previous = await this.replayInTransaction(repos, command, action);
+      if (previous) return previous;
+      const snapshot = await requirePublicationSnapshot(repos, command.input);
+      this.assertPublicationVersion(snapshot.publication, expectedVersion);
+      if (!statuses.includes(snapshot.publication.status)) conflict("Publication state changed before no-op completion");
+      const beforeDue = Date.parse(snapshot.schedule.scheduledFor) > Date.parse(this.clock.now());
+      if (beforeDueOnly && !beforeDue) conflict("Publication became due before no-op completion");
+      return this.recordResponse(repos, command, action, snapshot.publication);
+    });
+  }
+
+  private async replay(
+    command: Command<PublicationOperation>,
+    action: string,
+  ): Promise<Publication | undefined> {
+    return this.store.transaction((repos) => this.replayInTransaction(repos, command, action));
+  }
+
+  private async replayInTransaction(
+    repos: Repositories,
+    command: Command<PublicationOperation>,
+    action: string,
+  ): Promise<Publication | undefined> {
+    const previous = await repos.idempotency.get(command.input.workspaceId, command.context.idempotencyKey);
+    if (!previous) return undefined;
+    if (previous.requestHash !== publicationRequestHash(action, command.input)) {
+      throw new DomainError("IDEMPOTENCY_CONFLICT", "Idempotency key was used with different input", false, {
+        key: command.context.idempotencyKey,
+      });
+    }
+    return previous.response as unknown as Publication;
+  }
+
+  private async recordResponse(
+    repos: Repositories,
+    command: Command<PublicationOperation>,
+    action: string,
+    publication: Publication,
+    timestamp = this.clock.now(),
+  ): Promise<Publication> {
+    assertBoundedCommandResponse(publication);
+    await this.appendAudit(repos, command, action, publication, timestamp);
+    await this.putIdempotency(repos, command, action, publication, timestamp);
+    return publication;
+  }
+
+  private async putIdempotency(
+    repos: Repositories,
+    command: Command<PublicationOperation>,
+    action: string,
+    publication: Publication,
+    timestamp = this.clock.now(),
+  ): Promise<void> {
+    await repos.idempotency.put({
+      workspaceId: publication.workspaceId,
+      key: command.context.idempotencyKey,
+      requestHash: publicationRequestHash(action, command.input),
+      response: publication as unknown as JsonValue,
+      createdAt: timestamp,
+    });
+  }
+
+  private async appendAudit(
+    repos: Repositories,
+    command: Command<PublicationOperation>,
+    action: string,
+    publication: Publication,
+    timestamp: string,
+  ): Promise<void> {
+    await repos.audit.append({
+      id: this.ids.next(),
+      workspaceId: publication.workspaceId,
+      requestId: command.context.requestId,
+      actor: command.context.actor,
+      action,
+      entityType: "publication",
+      entityId: publication.id,
+      details: { input: { ...command.input } },
+      createdAt: timestamp,
+    });
+  }
+
+  private assertPublicationVersion(publication: Publication, expectedVersion: number): void {
+    if (publication.version !== expectedVersion) conflict("Publication version does not match expectedVersion");
+  }
+
+  private assertDueAndConfigured(snapshot: PublicationSnapshot): void {
+    if (snapshot.schedule.status !== "scheduled") conflict("Only a scheduled Schedule can publish");
+    if (Date.parse(snapshot.schedule.scheduledFor) > Date.parse(this.clock.now())) {
+      conflict("Publication is not due");
+    }
+    if (!this.provider.isConfigured(snapshot.publication.channel, snapshot.publication.accountId)) {
+      throw new DomainError(
+        "CAPABILITY_UNAVAILABLE",
+        "Trusted publishing provider is not configured for the exact channel and account",
+        false,
+        { channel: snapshot.publication.channel, accountId: snapshot.publication.accountId },
+      );
+    }
+  }
+
+  private assertAttemptCapacity(publication: Publication): void {
+    if (publication.attempts.length >= MAX_PUBLICATION_ATTEMPTS) {
+      conflict(`Publication cannot exceed ${MAX_PUBLICATION_ATTEMPTS} submit attempts`);
+    }
+  }
+
   private assertScheduledVersion(schedule: Schedule, expectedVersion: number): void {
     if (schedule.version !== expectedVersion) {
       conflict("Schedule version does not match expectedVersion");
@@ -430,10 +955,11 @@ export class PublishingService {
     }
   }
 
-  private async readActualArtifact(asset: AssetVersion): Promise<void> {
+  private async readActualArtifact(asset: AssetVersion): Promise<Buffer> {
     const content = await this.artifacts.read(asset.artifact.contentHash, asset.artifact.byteLength);
     if (content.length !== asset.artifact.byteLength) {
       conflict("AssetVersion artifact length does not match its descriptor");
     }
+    return content;
   }
 }

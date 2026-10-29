@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type {
   CreateSchedule,
+  PublicationOperation,
   RecordApproval,
   Reschedule,
 } from "../../src/application/publishing-commands.js";
@@ -19,6 +21,11 @@ import {
 import { DomainError } from "../../src/domain/errors.js";
 import { createApproval, type Approval } from "../../src/domain/publishing-model.js";
 import { ArtifactStore, type StoredArtifact } from "../../src/infrastructure/artifact-store.js";
+import {
+  McpPublishingProvider,
+  type PublishingProvider,
+  type PublishingProviderResult,
+} from "../../src/infrastructure/publishing-provider.js";
 import { canonicalJson } from "../../src/infrastructure/sqlite.js";
 import { openStore } from "../../src/infrastructure/sqlite-store.js";
 import { createTempDir, removeTempDir } from "../helpers.js";
@@ -436,6 +443,288 @@ describe("PublishingService approval and schedule gates", () => {
     expect(await store.transaction((repos) => repos.idempotency.get(workspaceId, "publishing-schedule-new-outer-key"))).toBeUndefined();
     await expect(service.getSchedule({ id: first.id, workspaceId: "workspace-other" }))
       .rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
+  });
+});
+
+describe("PublishingService verified publication state machine", () => {
+  const fixture = fileURLToPath(new URL("../fixtures/trusted-publishing-mcp.mjs", import.meta.url));
+  let tempDir: string;
+  let artifactRoot: string;
+  let storePath: string;
+  let fixtureState: string;
+  let capture: string;
+  let store: Store;
+  let artifacts: ArtifactStore;
+  let stored: StoredArtifact;
+  let service: PublishingService;
+  let sequence: number;
+  let now: string;
+  let mode: string | undefined;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    artifactRoot = await createTempDir();
+    storePath = join(tempDir, "publishing.db");
+    fixtureState = join(tempDir, "provider-state.json");
+    capture = join(tempDir, "provider-calls.jsonl");
+    store = openStore(storePath);
+    artifacts = new ArtifactStore(artifactRoot);
+    stored = await artifacts.put(Buffer.from("exact approved artifact"));
+    sequence = 0;
+    now = initialNow;
+    mode = undefined;
+    service = createService();
+    await seedGraph(store, workspaceId, "asset-1", stored);
+  });
+
+  afterEach(async () => {
+    store.close();
+    await Promise.all([removeTempDir(tempDir), removeTempDir(artifactRoot)]);
+  });
+
+  function realProvider(patch: { timeoutMs?: number; maxResponseBytes?: number } = {}): McpPublishingProvider {
+    return new McpPublishingProvider({
+      command: process.execPath,
+      args: [fixture],
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        MARKETING_TEST_BUSINESS_SECRET: "must-not-reach-child",
+        PUBLISHING_FIXTURE_STATE: fixtureState,
+        PUBLISHING_FIXTURE_CAPTURE: capture,
+        ...(mode === undefined ? {} : { PUBLISHING_FIXTURE_MODE: mode }),
+      },
+      envAllowlist: ["PUBLISHING_FIXTURE_STATE", "PUBLISHING_FIXTURE_CAPTURE", "PUBLISHING_FIXTURE_MODE"],
+      ...patch,
+    });
+  }
+
+  function createService(currentStore = store, provider: PublishingProvider = realProvider()): PublishingService {
+    return new PublishingService(
+      currentStore,
+      { now: () => now },
+      { next: () => `audit-${++sequence}` },
+      artifacts,
+      provider,
+      provider,
+    );
+  }
+
+  async function prepareDue(): Promise<void> {
+    await service.recordApproval({
+      input: {
+        id: "approval-1", workspaceId, assetVersionId: "asset-1", expectedAssetVersion: 1,
+        decision: "approved", comment: "Human reviewed the exact artifact",
+      },
+      context: context("state-approve"),
+    });
+    await service.createSchedule({
+      input: {
+        id: "schedule-1", publicationId: "publication-1", workspaceId, assetVersionId: "asset-1",
+        expectedAssetVersion: 1, approvalId: "approval-1", channel: "xhs", accountId: "account-1",
+        scheduledFor: future, timeZone: "UTC", deliveryMode: "automatic",
+      },
+      context: context("state-schedule"),
+    });
+    now = future;
+  }
+
+  function operation(expectedVersion: number): PublicationOperation {
+    return { id: "publication-1", workspaceId, expectedVersion };
+  }
+
+  async function calls(): Promise<{ tool: string; input: Record<string, unknown> }[]> {
+    try {
+      return (await readFile(capture, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+  }
+
+  it("is a due no-op, then accepts without verifying, verifies explicitly, and replays without provider I/O", async () => {
+    await prepareDue();
+    now = initialNow;
+    const beforeDue = await service.submit({ input: operation(1), context: context("before-due") });
+    expect(beforeDue).toMatchObject({ status: "pending", attempts: [], version: 1 });
+    expect(await calls()).toEqual([]);
+
+    now = future;
+    const submitCommand = { input: operation(1), context: context("accepted-submit") };
+    const submitted = await service.submit(submitCommand);
+    expect(submitted).toMatchObject({
+      status: "submitted",
+      attempts: [{ attempt: 1, outcome: "submitted" }],
+      receipts: [{ kind: "submit", provider: "mcp" }],
+      verification: null,
+      delivery: null,
+    });
+    expect(submitted.status).not.toBe("verified");
+    expect((await calls()).map((call) => call.tool)).toEqual(["submit"]);
+    expect((await calls())[0]?.input.artifactBase64).toBe(Buffer.from("exact approved artifact").toString("base64"));
+    expect(await service.submit(submitCommand)).toEqual(submitted);
+    expect(await calls()).toHaveLength(1);
+
+    const verified = await service.verify({ input: operation(submitted.version), context: context("accepted-verify") });
+    expect(verified).toMatchObject({
+      status: "verified",
+      delivery: { method: "provider", externalPublicationId: expect.stringMatching(/^fixture-/) },
+      verification: { method: "provider", verifiedAt: future },
+    });
+    expect((await calls()).map((call) => call.tool)).toEqual(["submit", "verify"]);
+    expect(await service.retry({ input: operation(verified.version), context: context("verified-terminal") })).toEqual(verified);
+    expect(await service.verify({ input: operation(verified.version), context: context("verified-verify") })).toEqual(verified);
+    expect(await calls()).toHaveLength(2);
+    expect(await service.get({ id: verified.id, workspaceId })).toEqual(verified);
+  });
+
+  it("records a definite provider failure without claiming verification", async () => {
+    await prepareDue();
+    mode = "submit-failed";
+    service = createService();
+    const failed = await service.submit({ input: operation(1), context: context("definite-failure") });
+    expect(failed).toMatchObject({
+      status: "failed",
+      attempts: [{ attempt: 1, outcome: "failed" }],
+      failure: { code: "fixture_rejected", retryable: true },
+      verification: null,
+      delivery: null,
+    });
+  });
+
+  it.each(["accepted-timeout", "accepted-process-loss", "malformed", "oversized-receipt"] as const)(
+    "records %s after a possible side effect as unknown",
+    async (fixtureMode) => {
+      await prepareDue();
+      mode = fixtureMode;
+      service = createService(store, realProvider({ timeoutMs: fixtureMode === "accepted-timeout" ? 100 : 5_000 }));
+      const result = await service.submit({ input: operation(1), context: context(`unknown-${fixtureMode}`) });
+      expect(result).toMatchObject({
+        status: "unknown",
+        attempts: [{ attempt: 1, outcome: "unknown" }],
+        verification: null,
+        delivery: null,
+      });
+      expect(result.failure?.retryable).toBe(true);
+    },
+    10_000,
+  );
+
+  it("retries unknown and submitting states verify-first and never resubmits a pending verification", async () => {
+    await prepareDue();
+    mode = "accepted-process-loss";
+    service = createService();
+    const unknown = await service.submit({ input: operation(1), context: context("verify-first-unknown") });
+    expect(unknown.status).toBe("unknown");
+    mode = "verify-pending";
+    service = createService();
+    const pending = await service.retry({ input: operation(unknown.version), context: context("verify-pending-retry") });
+    expect(pending).toMatchObject({ status: "submitted", attempts: unknown.attempts });
+    expect((await calls()).map((call) => call.tool)).toEqual(["submit", "verify"]);
+
+    await store.transaction(async (repos) => {
+      const current = (await repos.publications.get(pending.id, workspaceId))!;
+      await repos.publications.update({ ...current, status: "submitting" }, current.version);
+    });
+    const submitting = (await store.transaction((repos) => repos.publications.get(pending.id, workspaceId)))!;
+    const stillPending = await service.retry({ input: operation(submitting.version), context: context("submitting-recovery") });
+    expect(stillPending.status).toBe("submitted");
+    expect((await calls()).map((call) => call.tool)).toEqual(["submit", "verify", "verify"]);
+  });
+
+  it("resubmits only after explicit not_found and preserves the operation identity", async () => {
+    await prepareDue();
+    const submitted = await service.submit({ input: operation(1), context: context("not-found-submit") });
+    mode = "verify-not-found";
+    service = createService();
+    const retried = await service.retry({ input: operation(submitted.version), context: context("not-found-retry") });
+    expect(retried.status).toBe("submitted");
+    expect(retried.operationKey).toBe(submitted.operationKey);
+    expect(retried.attempts).toHaveLength(2);
+    const providerCalls = await calls();
+    expect(providerCalls.map((call) => call.tool)).toEqual(["submit", "verify", "submit"]);
+    expect(providerCalls[0]?.input.operationKey).toBe(providerCalls[2]?.input.operationKey);
+    expect(providerCalls[0]?.input.artifactHash).toBe(providerCalls[2]?.input.artifactHash);
+  });
+
+  it("recovers an accepted-before-outcome restart from the committed claim without a second submit or success response", async () => {
+    await prepareDue();
+    const delegate = realProvider();
+    let closeAfterAccept = true;
+    const crashingProvider: PublishingProvider = {
+      isConfigured: (channel, accountId) => delegate.isConfigured(channel, accountId),
+      verify: (request) => delegate.verify(request),
+      submit: async (request): Promise<PublishingProviderResult> => {
+        const result = await delegate.submit(request);
+        if (closeAfterAccept) {
+          closeAfterAccept = false;
+          store.close();
+        }
+        return result;
+      },
+    };
+    service = createService(store, crashingProvider);
+    const crashCommand = { input: operation(1), context: context("accepted-crash") };
+    await expect(service.submit(crashCommand)).rejects.toThrow("Store is closed");
+    store = openStore(storePath);
+    const claimed = await store.transaction((repos) => repos.publications.get("publication-1", workspaceId));
+    expect(claimed).toMatchObject({ status: "submitting", attempts: [{ outcome: "submitting", completedAt: null }] });
+    expect(await store.transaction((repos) => repos.idempotency.get(workspaceId, crashCommand.context.idempotencyKey))).toBeUndefined();
+
+    service = createService();
+    const recovered = await service.retry({ input: operation(claimed!.version), context: context("accepted-recovery") });
+    expect(recovered.status).toBe("verified");
+    expect((await calls()).map((call) => call.tool)).toEqual(["submit", "verify"]);
+  });
+
+  it("keeps request hashes and operation keys stable across outer request IDs without duplicate submission", async () => {
+    await prepareDue();
+    const first = await service.submit({ input: operation(1), context: context("stable-first") });
+    await expect(service.submit({ input: operation(first.version), context: context("stable-first") }))
+      .rejects.toMatchObject<DomainError>({ code: "IDEMPOTENCY_CONFLICT" });
+    const replayed = await service.submit({ input: operation(first.version), context: context("stable-other-outer") });
+    expect(replayed).toEqual(first);
+    const providerCalls = await calls();
+    expect(providerCalls).toHaveLength(1);
+    expect(providerCalls[0]?.input.operationKey).toBe(first.operationKey);
+    expect(providerCalls[0]?.input.artifactHash).toBe(stored.contentHash);
+    expect(await store.transaction((repos) => repos.publications.getByScheduleId("schedule-1", workspaceId)))
+      .toMatchObject({ id: first.id, operationKey: first.operationKey });
+  });
+
+  it("enforces five submit attempts and never crosses the bound with another provider call", async () => {
+    await prepareDue();
+    mode = "submit-failed";
+    service = createService();
+    let current = await service.submit({ input: operation(1), context: context("attempt-1") });
+    for (let attempt = 2; attempt <= 5; attempt += 1) {
+      current = await service.retry({ input: operation(current.version), context: context(`attempt-${attempt}`) });
+      expect(current.attempts).toHaveLength(attempt);
+    }
+    await expect(service.retry({ input: operation(current.version), context: context("attempt-6") }))
+      .rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    expect(await calls()).toHaveLength(5);
+  });
+
+  it("revalidates locked bytes and exact schedule identity before any provider side effect", async () => {
+    await prepareDue();
+    await writeFile(join(artifactRoot, stored.contentHash), Buffer.from("tampered after scheduling"));
+    await expect(service.submit({ input: operation(1), context: context("tampered-submit") }))
+      .rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    expect(await calls()).toEqual([]);
+    expect(await store.transaction((repos) => repos.publications.get("publication-1", workspaceId)))
+      .toMatchObject({ status: "pending", version: 1 });
+
+    await writeFile(join(artifactRoot, stored.contentHash), Buffer.from("exact approved artifact"));
+    await store.transaction(async (repos) => {
+      const schedule = (await repos.schedules.get("schedule-1", workspaceId))!;
+      await repos.schedules.update({ ...schedule, accountId: "account-other" }, schedule.version);
+    });
+    await expect(service.submit({ input: operation(1), context: context("changed-account-submit") }))
+      .rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    expect(await calls()).toEqual([]);
+    expect(await store.transaction((repos) => repos.publications.get("publication-1", workspaceId)))
+      .toMatchObject({ status: "pending", version: 1 });
   });
 });
 

@@ -25,6 +25,11 @@ export interface AppConfig {
     args: string[];
     envAllowlist: string[];
   };
+  publishingMcp?: {
+    command: string;
+    args: string[];
+    envAllowlist: string[];
+  };
   ffprobeCommand?: string;
   logLevel: "error" | "warn" | "info";
 }
@@ -59,6 +64,10 @@ export function parseBenchmarkMcpArguments(value: string | undefined): string[] 
 
 export function parseMediaMcpArguments(value: string | undefined): string[] {
   return parseMcpArguments(value, "MARKETING_MEDIA_MCP_ARGS");
+}
+
+export function parsePublishingMcpArguments(value: string | undefined): string[] {
+  return parseMcpArguments(value, "MARKETING_PUBLISHING_MCP_ARGS");
 }
 
 export function parseCommaSeparatedList(value: string | undefined): string[] {
@@ -143,6 +152,17 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (mediaEnvAllowlist.some((name) => !/^[A-Z_][A-Z0-9_]*$/i.test(name))) {
     throw new Error("MARKETING_MEDIA_MCP_ENV_ALLOWLIST must contain environment variable names only");
   }
+  const publishingMcpCommand = env.MARKETING_PUBLISHING_MCP_COMMAND;
+  if (!publishingMcpCommand && (env.MARKETING_PUBLISHING_MCP_ARGS || env.MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST)) {
+    throw new Error("MARKETING_PUBLISHING_MCP_COMMAND is required when publishing MCP settings are configured");
+  }
+  if (publishingMcpCommand !== undefined && publishingMcpCommand.trim().length === 0) {
+    throw new Error("MARKETING_PUBLISHING_MCP_COMMAND must not be empty");
+  }
+  const publishingEnvAllowlist = parseCommaSeparatedList(env.MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST);
+  if (publishingEnvAllowlist.some((name) => !/^[A-Z_][A-Z0-9_]*$/i.test(name))) {
+    throw new Error("MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST must contain environment variable names only");
+  }
   const ffprobeCommand = env.MARKETING_FFPROBE_COMMAND;
   if (ffprobeCommand !== undefined && !isAbsolute(ffprobeCommand)) {
     throw new Error("MARKETING_FFPROBE_COMMAND must be an absolute executable path");
@@ -177,6 +197,13 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
         command: mediaMcpCommand,
         args: parseMediaMcpArguments(env.MARKETING_MEDIA_MCP_ARGS),
         envAllowlist: mediaEnvAllowlist,
+      },
+    } : {}),
+    ...(publishingMcpCommand ? {
+      publishingMcp: {
+        command: publishingMcpCommand,
+        args: parsePublishingMcpArguments(env.MARKETING_PUBLISHING_MCP_ARGS),
+        envAllowlist: publishingEnvAllowlist,
       },
     } : {}),
     ...(ffprobeCommand ? { ffprobeCommand } : {}),
