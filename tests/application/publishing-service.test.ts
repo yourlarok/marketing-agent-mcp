@@ -542,6 +542,46 @@ describe("PublishingService verified publication state machine", () => {
     }
   }
 
+  function deferredNotFoundProvider(delegate: PublishingProvider) {
+    let releaseGate!: () => void;
+    let markStarted!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let submitCalls = 0;
+    let verifyCalls = 0;
+    const provider: PublishingProvider = {
+      isConfigured: (channel, accountId) => delegate.isConfigured(channel, accountId),
+      submit: async (request) => {
+        submitCalls += 1;
+        markStarted();
+        await gate;
+        return delegate.submit(request);
+      },
+      verify: async (request): Promise<PublishingProviderResult> => {
+        verifyCalls += 1;
+        return {
+          status: "not_found",
+          inputHash: request.inputHash,
+          operationKey: request.operationKey,
+          channel: request.channel,
+          accountId: request.accountId,
+          receipt: null,
+          externalPublicationId: null,
+          publishedAt: null,
+          failure: null,
+          toolVersion: "deferred-fixture",
+        };
+      },
+    };
+    return {
+      provider,
+      started,
+      release: () => releaseGate(),
+      submitCalls: () => submitCalls,
+      verifyCalls: () => verifyCalls,
+    };
+  }
+
   it("is a due no-op, then accepts without verifying, verifies explicitly, and replays without provider I/O", async () => {
     await prepareDue();
     now = initialNow;
@@ -578,6 +618,19 @@ describe("PublishingService verified publication state machine", () => {
     expect(await service.get({ id: verified.id, workspaceId })).toEqual(verified);
   });
 
+  it("rejects a stale expectedVersion on verified retry without a no-op success record", async () => {
+    await prepareDue();
+    const submitted = await service.submit({ input: operation(1), context: context("stale-verified-submit") });
+    const verified = await service.verify({ input: operation(submitted.version), context: context("stale-verified-verify") });
+    const audits = await store.transaction((repos) => repos.audit.listForEntity(workspaceId, "publication", verified.id));
+    const staleContext = context("stale-verified-retry");
+    await expect(service.retry({ input: operation(1), context: staleContext }))
+      .rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    expect(await store.transaction((repos) => repos.idempotency.get(workspaceId, staleContext.idempotencyKey))).toBeUndefined();
+    expect(await store.transaction((repos) => repos.audit.listForEntity(workspaceId, "publication", verified.id)))
+      .toEqual(audits);
+  });
+
   it("records a definite provider failure without claiming verification", async () => {
     await prepareDue();
     mode = "submit-failed";
@@ -610,6 +663,28 @@ describe("PublishingService verified publication state machine", () => {
     10_000,
   );
 
+  it("commits invalid post-side-effect delivery data as unknown with outcome audit and replay", async () => {
+    await prepareDue();
+    const submitted = await service.submit({ input: operation(1), context: context("invalid-delivery-submit") });
+    mode = "verify-invalid-published-at";
+    service = createService();
+    const verifyCommand = { input: operation(submitted.version), context: context("invalid-delivery-verify") };
+    const unknown = await service.verify(verifyCommand);
+    expect(unknown).toMatchObject({
+      status: "unknown",
+      failure: { code: "mcp_invalid_response", retryable: true },
+      verification: null,
+      delivery: null,
+    });
+    expect(await store.transaction((repos) => repos.idempotency.get(workspaceId, verifyCommand.context.idempotencyKey)))
+      .toMatchObject({ response: unknown });
+    expect(await store.transaction((repos) => repos.audit.listForEntity(workspaceId, "publication", unknown.id)))
+      .toMatchObject([{ action: "publication.submit.claim" }, { action: "publication.submit" },
+        { action: "publication.verify.claim" }, { action: "publication.verify" }]);
+    expect(await service.verify(verifyCommand)).toEqual(unknown);
+    expect((await calls()).map((call) => call.tool)).toEqual(["submit", "verify"]);
+  });
+
   it("retries unknown and submitting states verify-first and never resubmits a pending verification", async () => {
     await prepareDue();
     mode = "accepted-process-loss";
@@ -627,6 +702,7 @@ describe("PublishingService verified publication state machine", () => {
       await repos.publications.update({ ...current, status: "submitting" }, current.version);
     });
     const submitting = (await store.transaction((repos) => repos.publications.get(pending.id, workspaceId)))!;
+    now = "2026-10-30T10:00:31.000Z";
     const stillPending = await service.retry({ input: operation(submitting.version), context: context("submitting-recovery") });
     expect(stillPending.status).toBe("submitted");
     expect((await calls()).map((call) => call.tool)).toEqual(["submit", "verify", "verify"]);
@@ -645,6 +721,43 @@ describe("PublishingService verified publication state machine", () => {
     expect(providerCalls.map((call) => call.tool)).toEqual(["submit", "verify", "submit"]);
     expect(providerCalls[0]?.input.operationKey).toBe(providerCalls[2]?.input.operationKey);
     expect(providerCalls[0]?.input.artifactHash).toBe(providerCalls[2]?.input.artifactHash);
+  });
+
+  it("serializes overlapping retry with an active submission and completes the original without conflict", async () => {
+    await prepareDue();
+    const deferred = deferredNotFoundProvider(realProvider());
+    service = createService(store, deferred.provider);
+    const originalPromise = service.submit({ input: operation(1), context: context("overlap-original") });
+    await deferred.started;
+    const claimed = (await store.transaction((repos) => repos.publications.get("publication-1", workspaceId)))!;
+    const retryPromise = service.retry({ input: operation(claimed.version), context: context("overlap-retry") });
+    const outcomes = Promise.all([originalPromise, retryPromise]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    deferred.release();
+    const [original, retried] = await outcomes;
+    expect(original).toMatchObject({ status: "submitted", attempts: [{ outcome: "submitted" }] });
+    expect(retried).toEqual(original);
+    expect(deferred.submitCalls()).toBe(1);
+    expect(deferred.verifyCalls()).toBe(0);
+  });
+
+  it("fences a fresh submitting claim across service instances without blocking stale recovery", async () => {
+    await prepareDue();
+    const deferred = deferredNotFoundProvider(realProvider());
+    const originalService = createService(store, deferred.provider);
+    const otherService = createService(store, deferred.provider);
+    const originalPromise = originalService.submit({ input: operation(1), context: context("fenced-original") });
+    await deferred.started;
+    const claimed = (await store.transaction((repos) => repos.publications.get("publication-1", workspaceId)))!;
+    const retryPromise = otherService.retry({ input: operation(claimed.version), context: context("fenced-retry") });
+    const outcomes = Promise.allSettled([originalPromise, retryPromise]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    deferred.release();
+    const [original, retried] = await outcomes;
+    expect(original).toMatchObject({ status: "fulfilled", value: { status: "submitted" } });
+    expect(retried).toMatchObject({ status: "rejected", reason: { code: "CONFLICT", retryable: true } });
+    expect(deferred.submitCalls()).toBe(1);
+    expect(deferred.verifyCalls()).toBe(0);
   });
 
   it("recovers an accepted-before-outcome restart from the committed claim without a second submit or success response", async () => {
@@ -671,6 +784,7 @@ describe("PublishingService verified publication state machine", () => {
     expect(claimed).toMatchObject({ status: "submitting", attempts: [{ outcome: "submitting", completedAt: null }] });
     expect(await store.transaction((repos) => repos.idempotency.get(workspaceId, crashCommand.context.idempotencyKey))).toBeUndefined();
 
+    now = "2026-10-30T10:00:31.000Z";
     service = createService();
     const recovered = await service.retry({ input: operation(claimed!.version), context: context("accepted-recovery") });
     expect(recovered.status).toBe("verified");

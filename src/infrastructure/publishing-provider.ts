@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ContentChannel } from "../domain/content-production-model.js";
+import { assertEntityReferenceId, assertUtcInstant } from "../domain/contract-validation.js";
 import { DomainError } from "../domain/errors.js";
 import { ControlledMcpClient } from "./controlled-mcp-client.js";
 import { canonicalJson } from "./sqlite.js";
@@ -15,7 +16,22 @@ export const PUBLISHING_PROVIDER_LIMITS = {
 const CONFIGURATION_ACTION =
   "Configure MARKETING_PUBLISHING_MCP_COMMAND and MARKETING_PUBLISHING_MCP_ARGS in the trusted deployment environment";
 const hashSchema = z.string().regex(/^[0-9a-f]{64}$/);
-const idSchema = z.string().trim().min(1).max(256);
+const idSchema = z.string().min(1).max(256).refine((value) => {
+  try {
+    assertEntityReferenceId(value, "Trusted publishing identifier");
+    return true;
+  } catch {
+    return false;
+  }
+});
+const utcInstantSchema = z.string().refine((value) => {
+  try {
+    assertUtcInstant(value, "Trusted publishing publishedAt");
+    return true;
+  } catch {
+    return false;
+  }
+});
 const operationKeySchema = z.string().regex(/^publish:v1:[0-9a-f]{64}$/);
 const channelSchema = z.enum(["xhs", "channels"]);
 
@@ -114,7 +130,7 @@ const responseSchema = z.strictObject({
     contentBase64: z.string().min(4),
   }).nullable(),
   externalPublicationId: idSchema.nullable(),
-  publishedAt: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/).nullable(),
+  publishedAt: utcInstantSchema.nullable(),
   failure: z.strictObject({
     code: idSchema,
     message: z.string().trim().min(1).max(4096),

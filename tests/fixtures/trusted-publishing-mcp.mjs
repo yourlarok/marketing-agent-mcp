@@ -197,8 +197,8 @@ server.registerTool("verify", {
   return { structuredContent: {
     ...baseResult(input, input.inputHash, "verified"),
     receipt: receiptFor(input.operationKey, "verified"),
-    externalPublicationId: existing.externalPublicationId,
-    publishedAt: "2026-10-29T12:00:00.000Z",
+    externalPublicationId: mode === "verify-invalid-external-id" ? ` ${existing.externalPublicationId}` : existing.externalPublicationId,
+    publishedAt: mode === "verify-invalid-published-at" ? "2026-02-30T12:00:00.000Z" : "2026-10-29T12:00:00.000Z",
   } };
 });
 

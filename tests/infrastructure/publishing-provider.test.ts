@@ -175,6 +175,21 @@ describe("trusted publishing stdio MCP provider", () => {
     await expectGap(provider().submit(request()), reason);
   }, 10_000);
 
+  it.each(["verify-invalid-published-at", "verify-invalid-external-id"] as const)(
+    "rejects invalid verified delivery data from real MCP: %s",
+    async (fixtureMode) => {
+      const accepted = await currentProvider.submit(request());
+      mode = fixtureMode;
+      await expectGap(provider().verify({
+        operationKey: accepted.operationKey,
+        inputHash: accepted.inputHash,
+        channel: accepted.channel,
+        accountId: accepted.accountId,
+      }), "mcp_invalid_response");
+    },
+    10_000,
+  );
+
   it("bounds decoded receipt bytes and raw response envelopes", async () => {
     mode = "oversized-receipt";
     await expectGap(provider().submit(request()), "mcp_response_too_large");

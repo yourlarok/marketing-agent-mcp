@@ -44,6 +44,7 @@ import type {
 } from "./publishing-commands.js";
 
 const VALIDATION_TIME = "1970-01-01T00:00:00.000Z";
+const SUBMISSION_LEASE_MS = 30_000;
 const RECORD_APPROVAL_KEYS = [
   "id", "workspaceId", "assetVersionId", "expectedAssetVersion", "decision", "comment",
 ] as const;
@@ -290,6 +291,7 @@ export function publicationOperationKey(identity: PublicationOperationIdentity):
 
 export class PublishingService {
   private readonly commands: CommandPipeline;
+  private readonly activeSubmissions = new Map<string, Promise<Publication>>();
 
   constructor(
     private readonly store: Store,
@@ -485,7 +487,7 @@ export class PublishingService {
 
   async submit(command: Command<PublicationOperation>): Promise<Publication> {
     validatePublicationOperation(command.input, command.context);
-    return this.performSubmit(command, "publication.submit");
+    return this.startSubmission(command, "publication.submit");
   }
 
   async verify(command: Command<PublicationOperation>): Promise<Publication> {
@@ -498,18 +500,30 @@ export class PublishingService {
     const action = "publication.retry";
     const replay = await this.replay(command, action);
     if (replay) return replay;
-    const current = await this.store.transaction(async (repos) => {
-      const publication = await repos.publications.get(command.input.id, command.input.workspaceId);
-      if (!publication) notFound("Publication not found in workspace", { id: command.input.id, workspaceId: command.input.workspaceId });
-      return publication;
-    });
+    const active = this.activeSubmissions.get(this.publicationKey(command.input));
+    if (active) {
+      await active;
+      const current = await this.get({ id: command.input.id, workspaceId: command.input.workspaceId });
+      if (current.status === "submitted" || current.status === "verified") {
+        return this.completeNoop(command, action, current.version, ["submitted", "verified"]);
+      }
+      return this.performRetry({ ...command, input: { ...command.input, expectedVersion: current.version } });
+    }
+    return this.performRetry(command);
+  }
+
+  private async performRetry(command: Command<PublicationOperation>): Promise<Publication> {
+    const action = "publication.retry";
+    const replay = await this.replay(command, action);
+    if (replay) return replay;
+    const current = await this.get({ id: command.input.id, workspaceId: command.input.workspaceId });
     if (current.status === "verified") {
-      return this.completeNoop(command, action, current.version, ["verified"]);
+      return this.completeNoop(command, action, command.input.expectedVersion, ["verified"]);
     }
     if (["submitting", "submitted", "unknown"].includes(current.status)) {
       const checked = await this.performVerify(command, action, true);
       if (checked.status === "failed" && checked.failure?.code === "not_found") {
-        return this.performSubmit(command, action, checked.version);
+        return this.startSubmission(command, action, checked.version);
       }
       return this.store.transaction(async (repos) => {
         const previous = await this.replayInTransaction(repos, command, action);
@@ -518,7 +532,7 @@ export class PublishingService {
         return checked;
       });
     }
-    return this.performSubmit(command, action);
+    return this.startSubmission(command, action);
   }
 
   async get(query: GetPublication): Promise<Publication> {
@@ -564,6 +578,30 @@ export class PublishingService {
     return this.completeProviderOperation(command, action, "submit", claim, result, providerError);
   }
 
+  private async startSubmission(
+    command: Command<PublicationOperation>,
+    action: string,
+    expectedVersion = command.input.expectedVersion,
+  ): Promise<Publication> {
+    const key = this.publicationKey(command.input);
+    const active = this.activeSubmissions.get(key);
+    if (active) {
+      await active;
+      const current = await this.get({ id: command.input.id, workspaceId: command.input.workspaceId });
+      return this.startSubmission(command, action, current.version);
+    }
+    const submission = this.performSubmit(command, action, expectedVersion);
+    const tracked = submission.finally(() => {
+      if (this.activeSubmissions.get(key) === tracked) this.activeSubmissions.delete(key);
+    });
+    this.activeSubmissions.set(key, tracked);
+    return tracked;
+  }
+
+  private publicationKey(input: Pick<PublicationOperation, "id" | "workspaceId">): string {
+    return canonicalJson({ workspaceId: input.workspaceId, id: input.id });
+  }
+
   private async performVerify(
     command: Command<PublicationOperation>,
     action: string,
@@ -579,6 +617,7 @@ export class PublishingService {
     if (!["submitting", "submitted", "unknown"].includes(snapshot.publication.status)) {
       conflict("Only a submitted or uncertain Publication can be verified");
     }
+    this.assertSubmissionLeaseExpired(snapshot.publication);
     this.assertDueAndConfigured(snapshot);
     const content = await this.readActualArtifact(snapshot.asset);
     const prepared = this.preparePublication(snapshot, content);
@@ -683,6 +722,7 @@ export class PublishingService {
         if (!["submitting", "submitted", "unknown"].includes(current.publication.status)) {
           conflict("Only a submitted or uncertain Publication can be verified");
         }
+        this.assertSubmissionLeaseExpired(current.publication);
         claimed = await repos.publications.update({
           ...current.publication,
           updatedAt: timestamp,
@@ -922,6 +962,19 @@ export class PublishingService {
         "Trusted publishing provider is not configured for the exact channel and account",
         false,
         { channel: snapshot.publication.channel, accountId: snapshot.publication.accountId },
+      );
+    }
+  }
+
+  private assertSubmissionLeaseExpired(publication: Publication): void {
+    if (publication.status !== "submitting") return;
+    const elapsed = Date.parse(this.clock.now()) - Date.parse(publication.updatedAt);
+    if (elapsed < SUBMISSION_LEASE_MS) {
+      throw new DomainError(
+        "CONFLICT",
+        "A publication submission is still active; retry after its lease expires",
+        true,
+        { id: publication.id, leaseMs: SUBMISSION_LEASE_MS },
       );
     }
   }
