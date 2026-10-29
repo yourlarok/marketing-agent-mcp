@@ -19,6 +19,7 @@ import type {
   GetMetricSnapshot,
   ImportMetricSnapshot,
 } from "./effect-commands.js";
+import { resolveLineage } from "./marketing-service.js";
 import type { Clock, IdGenerator, Repositories, Store } from "./ports.js";
 
 const VALIDATION_TIME = "1970-01-01T00:00:00.000Z";
@@ -139,18 +140,26 @@ async function requireSnapshot(
   return snapshot;
 }
 
-function total(snapshots: MetricSnapshot[], name: EffectMetricName): number | null {
+interface MetricTotal {
+  value: number | null;
+  missingSnapshots: number;
+}
+
+function total(snapshots: MetricSnapshot[], name: EffectMetricName): MetricTotal {
   let found = false;
   let value = 0;
+  let missingSnapshots = 0;
   for (const snapshot of snapshots) {
-    for (const observation of snapshot.observations) {
-      if (observation.metric !== name) continue;
-      found = true;
-      value += observation.value;
-      if (!Number.isSafeInteger(value)) conflict("Metric aggregate exceeds the safe integer bound");
+    const observation = snapshot.observations.find((candidate) => candidate.metric === name);
+    if (!observation) {
+      missingSnapshots += 1;
+      continue;
     }
+    found = true;
+    value += observation.value;
+    if (!Number.isSafeInteger(value)) conflict("Metric aggregate exceeds the safe integer bound");
   }
-  return found ? value : null;
+  return { value: found ? value : null, missingSnapshots };
 }
 
 function rate(
@@ -159,18 +168,22 @@ function rate(
   numeratorMetric: EffectMetricName,
   denominatorMetric: EffectMetricName,
 ): EffectReviewMetric {
-  const numerator = total(snapshots, numeratorMetric);
-  const denominator = total(snapshots, denominatorMetric);
-  if (denominator === null) {
-    return { name, value: null, status: "unknown", reason: "missing_denominator", numerator, denominator };
+  const numeratorTotal = total(snapshots, numeratorMetric);
+  const denominatorTotal = total(snapshots, denominatorMetric);
+  const numerator = numeratorTotal.value;
+  const denominator = denominatorTotal.value;
+  if (denominatorTotal.missingSnapshots > 0) {
+    const reason = denominator === null ? "missing_denominator" : "incomplete_denominator_coverage";
+    return { name, value: null, status: "unknown", reason, numerator, denominator };
   }
-  if (numerator === null) {
-    return { name, value: null, status: "unknown", reason: "missing_numerator", numerator, denominator };
+  if (numeratorTotal.missingSnapshots > 0) {
+    const reason = numerator === null ? "missing_numerator" : "incomplete_numerator_coverage";
+    return { name, value: null, status: "unknown", reason, numerator, denominator };
   }
   if (denominator === 0) {
     return { name, value: null, status: "unknown", reason: "zero_denominator", numerator, denominator };
   }
-  const value = numerator / denominator;
+  const value = numerator! / denominator!;
   if (!Number.isFinite(value)) conflict("Effect rate must remain finite");
   return { name, value, status: "ok", reason: null, numerator, denominator };
 }
@@ -271,45 +284,50 @@ function automationMetrics(publications: Publication[]): EffectReviewMetric[] {
   const automaticVerified = publications.filter((publication) =>
     publication.deliveryMode === "automatic" && publication.verification?.method === "provider"
   ).length;
-  const covered = publications.every((publication) =>
-    publication.deliveryMode === "automatic" &&
-    publication.verification?.method === "provider" &&
-    publication.receipts.some((receipt) => receipt.kind === "verify")
-  );
+  let covered = true;
+  let incomparable = false;
+  const duplicateKeys: string[] = [];
+  for (const publication of publications) {
+    const verifyReceipts = publication.receipts.filter((receipt) => receipt.kind === "verify");
+    if (publication.deliveryMode !== "automatic" || publication.verification?.method !== "provider" ||
+        verifyReceipts.length === 0) {
+      covered = false;
+      continue;
+    }
+    const providers = new Set(verifyReceipts.map((receipt) => receipt.provider));
+    const externalPublicationId = publication.verification.externalPublicationId;
+    if (providers.size !== 1 || !externalPublicationId ||
+        publication.delivery?.externalPublicationId !== externalPublicationId) {
+      incomparable = true;
+      continue;
+    }
+    duplicateKeys.push(JSON.stringify([
+      verifyReceipts[0]!.provider,
+      publication.channel,
+      publication.accountId,
+      externalPublicationId,
+    ]));
+  }
   let duplicateEvents: EffectReviewMetric;
-  if (!covered) {
+  if (!covered || incomparable) {
     duplicateEvents = {
       name: "duplicateEvents",
       value: null,
       status: "unknown",
-      reason: "verification_coverage_unavailable",
+      reason: covered ? "verification_scope_incomparable" : "verification_coverage_unavailable",
       numerator: null,
       denominator: publications.length,
     };
   } else {
-    const externalIds = publications.map((publication) =>
-      publication.verification?.externalPublicationId ?? publication.delivery?.externalPublicationId ?? null
-    );
-    if (externalIds.some((id) => id === null)) {
-      duplicateEvents = {
-        name: "duplicateEvents",
-        value: null,
-        status: "unknown",
-        reason: "verification_coverage_unavailable",
-        numerator: null,
-        denominator: publications.length,
-      };
-    } else {
-      const duplicates = externalIds.length - new Set(externalIds).size;
-      duplicateEvents = {
-        name: "duplicateEvents",
-        value: duplicates,
-        status: "ok",
-        reason: null,
-        numerator: duplicates,
-        denominator: publications.length,
-      };
-    }
+    const duplicates = duplicateKeys.length - new Set(duplicateKeys).size;
+    duplicateEvents = {
+      name: "duplicateEvents",
+      value: duplicates,
+      status: "ok",
+      reason: null,
+      numerator: duplicates,
+      denominator: publications.length,
+    };
   }
   return [{
     name: "automaticVerifiedRate",
@@ -375,6 +393,11 @@ export class EffectService {
             if (!expectedClassification || evidence.classification !== expectedClassification) {
               conflict(`${observation.metric} requires ${expectedClassification ?? "supported"} Evidence`);
             }
+            const evidenceObservedAt = Date.parse(evidence.observedAt);
+            if (!Number.isFinite(evidenceObservedAt) || evidenceObservedAt < Date.parse(publishedAt) ||
+                evidenceObservedAt > Date.parse(input.observedAt)) {
+              conflict("Metric Evidence observedAt must be between publication and snapshot observedAt");
+            }
           }
         }
         return repos.metricSnapshots.insert(createMetricSnapshot({
@@ -420,7 +443,7 @@ export class EffectService {
         const benchmarkNotes = (input.benchmarkEvidenceIds ?? []).length > 0
           ? ["Benchmark Evidence is retained as lineage only; no numeric benchmark value is inferred."]
           : [];
-        return repos.effectReviews.insert(createEffectReview({
+        const review = await repos.effectReviews.insert(createEffectReview({
           id: input.id,
           workspaceId: input.workspaceId,
           createdAt: timestamp,
@@ -472,6 +495,12 @@ export class EffectService {
             causality: "not_established",
           },
         }));
+        await resolveLineage(repos, {
+          workspaceId: input.workspaceId,
+          entityType: "effect_review",
+          id: review.id,
+        });
+        return review;
       },
     });
   }
@@ -494,6 +523,7 @@ export class EffectService {
       sourceVersions.push({ entityType: "publication", id: publication.id, version: publication.version });
     }
     const selectedByPublication = new Map(publications.map((publication) => [publication.id, publication]));
+    const coveredPublications = new Set<string>();
     const snapshots: MetricSnapshot[] = [];
     for (const id of input.metricSnapshotIds) {
       const snapshot = await requireSnapshot(repos, input.workspaceId, id);
@@ -501,30 +531,45 @@ export class EffectService {
       if (!publication || snapshot.publicationVersion !== publication.version) {
         conflict("Selected MetricSnapshot must match an explicit versioned Publication ref");
       }
+      if (coveredPublications.has(snapshot.publicationId)) {
+        conflict("Each selected Publication must have exactly one selected MetricSnapshot");
+      }
+      coveredPublications.add(snapshot.publicationId);
       snapshots.push(snapshot);
       sourceVersions.push({ entityType: "metric_snapshot", id: snapshot.id, version: snapshot.version });
     }
+    if (coveredPublications.size !== publications.length) {
+      conflict("Every selected Publication must have exactly one selected MetricSnapshot");
+    }
     const baselines: MetricSnapshot[] = [];
+    const baselinePublications: Publication[] = [];
+    const baselinePublicationIds = new Set<string>();
     for (const id of input.baselineMetricSnapshotIds ?? []) {
       const snapshot = await requireSnapshot(repos, input.workspaceId, id);
-      await requirePublication(repos, input.workspaceId, snapshot.publicationId, snapshot.publicationVersion);
+      const publication = await requirePublication(
+        repos,
+        input.workspaceId,
+        snapshot.publicationId,
+        snapshot.publicationVersion,
+      );
+      if (baselinePublicationIds.has(publication.id)) {
+        conflict("Each baseline Publication must have at most one baseline MetricSnapshot");
+      }
+      baselinePublicationIds.add(publication.id);
+      baselinePublications.push(publication);
       baselines.push(snapshot);
       sourceVersions.push({ entityType: "metric_snapshot", id: snapshot.id, version: snapshot.version });
     }
-    if (baselines.length > 0) {
+    if (publications.length > 1 || baselines.length > 0) {
       const first = snapshots[0]!;
       const channel = publications.find((publication) => publication.id === first.publicationId)!.channel;
       for (const snapshot of [...snapshots, ...baselines]) {
         if (snapshot.windowStart !== first.windowStart || snapshot.windowEnd !== first.windowEnd) {
-          conflict("Baseline comparison requires exactly equal metric windows");
+          conflict("Aggregation requires exactly equal metric windows");
         }
       }
-      for (const publication of publications) {
-        if (publication.channel !== channel) conflict("Selected Publication channels are not exactly comparable");
-      }
-      for (const snapshot of baselines) {
-        const publication = await requirePublication(repos, input.workspaceId, snapshot.publicationId);
-        if (publication.channel !== channel) conflict("Baseline comparison requires exactly equal channels");
+      for (const publication of [...publications, ...baselinePublications]) {
+        if (publication.channel !== channel) conflict("Aggregation requires exactly equal channels");
       }
     }
     for (const id of input.benchmarkEvidenceIds ?? []) {

@@ -418,6 +418,362 @@ describe("EffectService evidence-bound snapshots and reviews", () => {
     ]));
   });
 
+  it("returns unknown when any selected snapshot lacks numerator or denominator coverage", async () => {
+    const second = await insertPublication(store, { id: "publication-second" });
+    await importSnapshot({
+      observations: [
+        { metric: "impressions", evidenceIds: ["evidence-operating"], value: 1_000 },
+        { metric: "interactions", evidenceIds: ["evidence-operating"], value: 100 },
+      ],
+    });
+    await importSnapshot({
+      id: "snapshot-second",
+      publicationId: second.id,
+      expectedPublicationVersion: second.version,
+      observations: [{ metric: "impressions", evidenceIds: ["evidence-operating"], value: 1_000 }],
+    }, "partial-second");
+    const review = await service.createReview({
+      input: reviewInput({
+        publicationRefs: [
+          { id: publication.id, version: publication.version },
+          { id: second.id, version: second.version },
+        ],
+        metricSnapshotIds: ["snapshot-1", "snapshot-second"],
+      }),
+      context: context("partial-current-coverage"),
+    });
+    expect(metric(review.content, "interactionRate")).toMatchObject({
+      value: null,
+      status: "unknown",
+      reason: "incomplete_numerator_coverage",
+      numerator: 100,
+      denominator: 2_000,
+    });
+  });
+
+  it("applies per-snapshot coverage requirements to baseline aggregates and deltas", async () => {
+    await importSnapshot();
+    const baselineOne = await insertPublication(store, { id: "publication-baseline-one" });
+    const baselineTwo = await insertPublication(store, { id: "publication-baseline-two" });
+    await importSnapshot({
+      id: "snapshot-baseline-one",
+      publicationId: baselineOne.id,
+      expectedPublicationVersion: baselineOne.version,
+      observations: [
+        { metric: "impressions", evidenceIds: ["evidence-operating"], value: 1_000 },
+        { metric: "interactions", evidenceIds: ["evidence-operating"], value: 50 },
+      ],
+    }, "partial-baseline-one");
+    await importSnapshot({
+      id: "snapshot-baseline-two",
+      publicationId: baselineTwo.id,
+      expectedPublicationVersion: baselineTwo.version,
+      observations: [{ metric: "impressions", evidenceIds: ["evidence-operating"], value: 1_000 }],
+    }, "partial-baseline-two");
+    const review = await service.createReview({
+      input: reviewInput({ baselineMetricSnapshotIds: ["snapshot-baseline-one", "snapshot-baseline-two"] }),
+      context: context("partial-baseline-coverage"),
+    });
+    expect(metric(review.content, "interactionRateDelta")).toMatchObject({
+      value: null,
+      status: "unknown",
+      reason: "baseline_comparison_unknown",
+    });
+  });
+
+  it("requires exactly one selected snapshot for every selected Publication", async () => {
+    const second = await insertPublication(store, { id: "publication-second" });
+    await importSnapshot();
+    await expect(service.createReview({
+      input: reviewInput({
+        id: "review-missing-snapshot",
+        publicationRefs: [
+          { id: publication.id, version: publication.version },
+          { id: second.id, version: second.version },
+        ],
+      }),
+      context: context("missing-selected-snapshot"),
+    })).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+
+    await importSnapshot({ id: "snapshot-duplicate-publication" }, "duplicate-publication-snapshot");
+    await expect(service.createReview({
+      input: reviewInput({
+        id: "review-duplicate-snapshot-publication",
+        metricSnapshotIds: ["snapshot-1", "snapshot-duplicate-publication"],
+      }),
+      context: context("duplicate-selected-snapshot-publication"),
+    })).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+  });
+
+  it("requires identical windows and channels for multi-Publication aggregation without a baseline", async () => {
+    const otherWindow = await insertPublication(store, { id: "publication-other-window" });
+    await importSnapshot();
+    await importSnapshot({
+      id: "snapshot-other-window",
+      publicationId: otherWindow.id,
+      expectedPublicationVersion: otherWindow.version,
+      windowStart: "2026-10-29T12:05:00.000Z",
+      windowEnd: "2026-10-29T13:00:00.000Z",
+      observedAt: "2026-10-29T13:00:00.000Z",
+    }, "other-current-window");
+    await expect(service.createReview({
+      input: reviewInput({
+        id: "review-mixed-current-window",
+        publicationRefs: [
+          { id: publication.id, version: publication.version },
+          { id: otherWindow.id, version: otherWindow.version },
+        ],
+        metricSnapshotIds: ["snapshot-1", "snapshot-other-window"],
+      }),
+      context: context("mixed-current-window"),
+    })).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+
+    const otherChannel = await insertPublication(store, { id: "publication-other-channel", channel: "channels" });
+    await importSnapshot({
+      id: "snapshot-other-channel",
+      publicationId: otherChannel.id,
+      expectedPublicationVersion: otherChannel.version,
+    }, "other-current-channel");
+    await expect(service.createReview({
+      input: reviewInput({
+        id: "review-mixed-current-channel",
+        publicationRefs: [
+          { id: publication.id, version: publication.version },
+          { id: otherChannel.id, version: otherChannel.version },
+        ],
+        metricSnapshotIds: ["snapshot-1", "snapshot-other-channel"],
+      }),
+      context: context("mixed-current-channel"),
+    })).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+  });
+
+  it.each([
+    ["before-publication", "2026-10-29T10:04:59.999Z", windowEnd],
+    ["after-snapshot-observation", "2026-10-29T11:00:00.001Z", windowEnd],
+  ] as const)("rejects Evidence observed %s", async (suffix, evidenceObservedAt, observedAt) => {
+    await store.transaction((repos) => insertEvidence(
+      repos,
+      `evidence-${suffix}`,
+      "source-owned",
+      "owned_operating",
+      workspaceId,
+      evidenceObservedAt,
+    ));
+    const command = {
+      input: snapshotInput({
+        observedAt,
+        observations: [{ metric: "impressions", evidenceIds: [`evidence-${suffix}`], value: 1 }],
+      }),
+      context: context(`evidence-temporal-${suffix}`),
+    };
+    await expect(service.importMetricSnapshot(command)).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    await expectNoSnapshot("snapshot-1", command.context.idempotencyKey);
+  });
+
+  it("allows Evidence collected after the window when it is captured by snapshot observedAt", async () => {
+    await store.transaction((repos) => insertEvidence(
+      repos,
+      "evidence-late-collection",
+      "source-owned",
+      "owned_operating",
+      workspaceId,
+      "2026-10-29T11:30:00.000Z",
+    ));
+    const snapshot = await importSnapshot({
+      observedAt: now,
+      observations: [{ metric: "impressions", evidenceIds: ["evidence-late-collection"], value: 1 }],
+    }, "late-evidence-collection");
+    expect(snapshot.observedAt).toBe(now);
+  });
+
+  it("counts genuine duplicate events only within provider, channel, account, and external ID scope", async () => {
+    const duplicate = await insertPublication(store, {
+      id: "publication-duplicate",
+      externalPublicationId: "external-shared",
+    });
+    await store.transaction(async (repos) => {
+      const current = (await repos.publications.get(publication.id, workspaceId))!;
+      publication = await repos.publications.update({
+        ...current,
+        delivery: { ...current.delivery!, externalPublicationId: "external-shared" },
+        verification: { ...current.verification!, externalPublicationId: "external-shared" },
+      }, current.version);
+    });
+    await importSnapshot({ expectedPublicationVersion: publication.version });
+    await importSnapshot({
+      id: "snapshot-duplicate",
+      publicationId: duplicate.id,
+      expectedPublicationVersion: duplicate.version,
+    }, "same-scope-duplicate");
+    const review = await service.createReview({
+      input: reviewInput({
+        publicationRefs: [
+          { id: publication.id, version: publication.version },
+          { id: duplicate.id, version: duplicate.version },
+        ],
+        metricSnapshotIds: ["snapshot-1", "snapshot-duplicate"],
+      }),
+      context: context("same-scope-duplicate-review"),
+    });
+    expect(metric(review.automation, "duplicateEvents")).toMatchObject({ value: 1, status: "ok", numerator: 1 });
+  });
+
+  it("does not count the same external ID on different accounts as a duplicate", async () => {
+    const otherAccount = await insertPublication(store, {
+      id: "publication-other-account",
+      accountId: "account-2",
+      externalPublicationId: "external-shared",
+    });
+    await store.transaction(async (repos) => {
+      const current = (await repos.publications.get(publication.id, workspaceId))!;
+      publication = await repos.publications.update({
+        ...current,
+        delivery: { ...current.delivery!, externalPublicationId: "external-shared" },
+        verification: { ...current.verification!, externalPublicationId: "external-shared" },
+      }, current.version);
+    });
+    await importSnapshot({ expectedPublicationVersion: publication.version });
+    await importSnapshot({
+      id: "snapshot-other-account",
+      publicationId: otherAccount.id,
+      expectedPublicationVersion: otherAccount.version,
+    }, "other-account-snapshot");
+    const review = await service.createReview({
+      input: reviewInput({
+        publicationRefs: [
+          { id: publication.id, version: publication.version },
+          { id: otherAccount.id, version: otherAccount.version },
+        ],
+        metricSnapshotIds: ["snapshot-1", "snapshot-other-account"],
+      }),
+      context: context("different-account-duplicate-review"),
+    });
+    expect(metric(review.automation, "duplicateEvents")).toMatchObject({ value: 0, status: "ok", numerator: 0 });
+  });
+
+  it("returns duplicate events unknown when verification and delivery scopes disagree", async () => {
+    const inconsistent = await insertPublication(store, {
+      id: "publication-inconsistent-scope",
+      externalPublicationId: "external-verified",
+      deliveryExternalPublicationId: "external-delivered",
+    });
+    await importSnapshot({
+      publicationId: inconsistent.id,
+      expectedPublicationVersion: inconsistent.version,
+    });
+    const review = await service.createReview({
+      input: reviewInput({ publicationRefs: [{ id: inconsistent.id, version: inconsistent.version }] }),
+      context: context("inconsistent-duplicate-scope"),
+    });
+    expect(metric(review.automation, "duplicateEvents")).toMatchObject({
+      value: null,
+      status: "unknown",
+      reason: "verification_scope_incomparable",
+      numerator: null,
+    });
+  });
+
+  it("rejects references above conservative review bounds", async () => {
+    await importSnapshot();
+    const benchmarkEvidenceIds = ["evidence-public"];
+    await store.transaction(async (repos) => {
+      for (let index = 1; index <= 100; index += 1) {
+        const id = `evidence-over-bound-${index}`;
+        benchmarkEvidenceIds.push(id);
+        await insertEvidence(repos, id, "source-public", "external_observation", workspaceId);
+      }
+    });
+    await expect(service.createReview({
+      input: reviewInput({ benchmarkEvidenceIds }),
+      context: context("review-reference-bound"),
+    })).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+  });
+
+  it("rejects a review whose actual complete lineage would exceed 1000 nodes and rolls back", async () => {
+    const evidenceIds: string[] = [];
+    await store.transaction(async (repos) => {
+      for (let index = 0; index < 800; index += 1) {
+        const sourceId = `source-lineage-bound-${index}`;
+        const evidenceId = `evidence-lineage-bound-${index}`;
+        evidenceIds.push(evidenceId);
+        await repos.sources.insert({
+          id: sourceId,
+          workspaceId,
+          version: 1,
+          createdAt: now,
+          updatedAt: now,
+          name: sourceId,
+          type: "manual",
+          ownership: "owned",
+        });
+        const classification = index < 400 ? "owned_operating" : "owned_conversion";
+        await insertEvidence(repos, evidenceId, sourceId, classification, workspaceId);
+      }
+    });
+    await importSnapshot({
+      observations: ([
+        "impressions", "interactions", "followers_gained", "profile_visits",
+        "leads", "consultations", "trials", "purchases",
+      ] as const).map((observedMetric, index) => ({
+        metric: observedMetric,
+        evidenceIds: evidenceIds.slice(index * 100, index * 100 + 100),
+        value: 1,
+      })),
+    }, "over-lineage-snapshot");
+    const command = { input: reviewInput(), context: context("over-lineage-review") };
+    await expect(service.createReview(command)).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    expect(await store.transaction((repos) => repos.effectReviews.get("review-1", workspaceId))).toBeUndefined();
+    expect(await store.transaction((repos) => repos.idempotency.get(workspaceId, command.context.idempotencyKey)))
+      .toBeUndefined();
+  });
+
+  it("traverses a maximal-direct-reference review within the lineage and response bounds", async () => {
+    const publicationRefs = [{ id: publication.id, version: publication.version }];
+    const metricSnapshotIds = ["snapshot-1"];
+    await importSnapshot();
+    for (let index = 1; index < 10; index += 1) {
+      const current = await insertPublication(store, { id: `publication-current-${index}` });
+      publicationRefs.push({ id: current.id, version: current.version });
+      const snapshotId = `snapshot-current-${index}`;
+      metricSnapshotIds.push(snapshotId);
+      await importSnapshot({
+        id: snapshotId,
+        publicationId: current.id,
+        expectedPublicationVersion: current.version,
+      }, `max-current-${index}`);
+    }
+    const baselineMetricSnapshotIds: string[] = [];
+    for (let index = 0; index < 10; index += 1) {
+      const current = await insertPublication(store, { id: `publication-max-baseline-${index}` });
+      const snapshotId = `snapshot-max-baseline-${index}`;
+      baselineMetricSnapshotIds.push(snapshotId);
+      await importSnapshot({
+        id: snapshotId,
+        publicationId: current.id,
+        expectedPublicationVersion: current.version,
+      }, `max-baseline-${index}`);
+    }
+    const benchmarkEvidenceIds = ["evidence-public"];
+    await store.transaction(async (repos) => {
+      for (let index = 1; index < 100; index += 1) {
+        const id = `evidence-max-benchmark-${index}`;
+        benchmarkEvidenceIds.push(id);
+        await insertEvidence(repos, id, "source-public", "external_observation", workspaceId);
+      }
+    });
+    const review = await service.createReview({
+      input: reviewInput({ publicationRefs, metricSnapshotIds, baselineMetricSnapshotIds, benchmarkEvidenceIds }),
+      context: context("maximal-reference-review"),
+    });
+    expect(Buffer.byteLength(JSON.stringify(review), "utf8")).toBeLessThanOrEqual(64 * 1024);
+    const lineage = await new MarketingService(store, { now: () => now }, { next: () => `max-lineage-${++sequence}` })
+      .getLineage({ workspaceId, entityType: "effect_review", id: review.id });
+    expect(lineage.nodes.length).toBeLessThanOrEqual(1_000);
+    expect(lineage.nodes).toEqual(expect.arrayContaining(
+      benchmarkEvidenceIds.map((id) => expect.objectContaining({ entityType: "evidence", id })),
+    ));
+  });
+
   it("enforces strict command shapes and the 64 KiB response bound without residue", async () => {
     const extra = { ...snapshotInput(), unexpected: true } as ImportMetricSnapshot;
     await expect(service.importMetricSnapshot({ input: extra, context: context("strict-shape") }))
@@ -442,6 +798,10 @@ describe("EffectService evidence-bound snapshots and reviews", () => {
 interface PublicationFixture {
   id?: string;
   channel?: "xhs" | "channels";
+  accountId?: string;
+  provider?: string;
+  externalPublicationId?: string;
+  deliveryExternalPublicationId?: string;
   deliveryMode?: "automatic" | "manual_assisted";
   verificationMethod?: "provider" | "manual_evidence";
   evidenceIds?: string[];
@@ -452,6 +812,8 @@ async function insertPublication(store: Store, fixture: PublicationFixture = {})
   const id = fixture.id ?? "publication-1";
   const scheduleId = id.replace("publication", "schedule");
   const channel = fixture.channel ?? "xhs";
+  const accountId = fixture.accountId ?? "account-1";
+  const externalPublicationId = fixture.externalPublicationId ?? `external-${id}`;
   const deliveryMode = fixture.deliveryMode ?? "automatic";
   const verificationMethod = fixture.verificationMethod ?? "provider";
   const evidenceIds = fixture.evidenceIds ?? [];
@@ -463,7 +825,7 @@ async function insertPublication(store: Store, fixture: PublicationFixture = {})
     assetVersion: 1,
     approvalId: "approval-1",
     channel,
-    accountId: "account-1",
+    accountId,
     scheduledFor: publishedAt,
     timeZone: "UTC",
     deliveryMode,
@@ -481,13 +843,13 @@ async function insertPublication(store: Store, fixture: PublicationFixture = {})
     artifactHash: "a".repeat(64),
     operationKey: `publish:v1:${id.padEnd(64, "0").slice(0, 64).replace(/[^0-9a-f]/g, "0")}`,
     channel,
-    accountId: "account-1",
+    accountId,
     deliveryMode,
     status: "verified",
     attempts: [],
     receipts: fixture.receipts ?? [{
       kind: "verify",
-      provider: "fixture",
+      provider: fixture.provider ?? "fixture",
       receiptId: `receipt-${id}`,
       receivedAt: verifiedAt,
       contentHash: "b".repeat(64),
@@ -495,14 +857,14 @@ async function insertPublication(store: Store, fixture: PublicationFixture = {})
     failure: null,
     delivery: {
       method: verificationMethod,
-      externalPublicationId: `external-${id}`,
+      externalPublicationId: fixture.deliveryExternalPublicationId ?? externalPublicationId,
       publishedAt,
       evidenceIds,
     },
     verification: {
       method: verificationMethod,
       verifiedAt,
-      externalPublicationId: `external-${id}`,
+      externalPublicationId,
       evidenceIds,
     },
     version: 3,
@@ -624,6 +986,7 @@ async function insertEvidence(
   sourceId: string,
   classification: EvidenceClassification,
   workspace: string,
+  observedAt = windowEnd,
 ): Promise<void> {
   await repos.evidence.insert({
     id,
@@ -633,7 +996,7 @@ async function insertEvidence(
     updatedAt: "2026-10-29T09:00:00.000Z",
     sourceId,
     sourceLocator: "fixture",
-    observedAt: windowEnd,
+    observedAt,
     summary: id,
     contentHash: "e".repeat(64),
     classification,

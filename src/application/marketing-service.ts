@@ -472,6 +472,63 @@ async function assertWorkspaceDependencyGraph(
   assertTaskDependencyGraph(nodes.values());
 }
 
+export async function resolveLineage(
+  repos: Repositories,
+  query: EntityRef & { workspaceId: string },
+): Promise<Lineage> {
+  if (!Object.hasOwn(lineageEntityTypes, query.entityType)) {
+    throw new DomainError("INVALID_INPUT", "entityType must be a lineage entity type");
+  }
+  const nodes: LineageNode[] = [];
+  const edges: LineageEdge[] = [];
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  const visit = async (ref: EntityRef): Promise<void> => {
+    const key = `${ref.entityType}:${ref.id}`;
+    if (visited.has(key)) return;
+    if (visiting.has(key)) {
+      throw new DomainError("CONFLICT", "Lineage contains a reference cycle");
+    }
+    if (visited.size >= MAX_LINEAGE_ENTITIES) {
+      throw new DomainError("CONFLICT", "Lineage entity limit exceeded", false, {
+        limit: MAX_LINEAGE_ENTITIES,
+      });
+    }
+    visiting.add(key);
+    const repositoryName = lineageEntityTypes[ref.entityType];
+    const repository = repos[repositoryName] as EntityRepository;
+    const record = await repository.get(ref.id, query.workspaceId);
+    if (!record) {
+      throw new DomainError("NOT_FOUND", "Lineage entity not found in workspace", false, {
+        entityType: ref.entityType,
+        id: ref.id,
+        workspaceId: query.workspaceId,
+      });
+    }
+    for (const parent of lineageReferences(record, ref.entityType)) {
+      await visit(parent);
+      edges.push({ from: parent, to: ref });
+    }
+    const audits = await repos.audit.listForEntity(query.workspaceId, ref.entityType, ref.id);
+    nodes.push({
+      ...ref,
+      version: record.version,
+      auditRequestIds: audits.map((audit) => audit.requestId),
+    });
+    visiting.delete(key);
+    visited.add(key);
+  };
+
+  await visit({ entityType: query.entityType, id: query.id });
+  const order = new Map(nodes.map((node, index) => [`${node.entityType}:${node.id}`, index]));
+  const position = (ref: EntityRef): number => order.get(`${ref.entityType}:${ref.id}`)!;
+  edges.sort((left, right) =>
+    (position(left.from) - position(right.from)) ||
+    (position(left.to) - position(right.to))
+  );
+  return { workspaceId: query.workspaceId, nodes, edges };
+}
+
 export class MarketingService {
   private readonly commands: CommandPipeline;
 
@@ -990,68 +1047,7 @@ export class MarketingService {
   }
 
   getLineage(query: EntityRef & { workspaceId: string }): Promise<Lineage> {
-    return this.store.transaction(async (repos) => {
-      if (!Object.hasOwn(lineageEntityTypes, query.entityType)) {
-        throw new DomainError("INVALID_INPUT", "entityType must be a lineage entity type");
-      }
-      const nodes: LineageNode[] = [];
-      const edges: LineageEdge[] = [];
-      const visited = new Set<string>();
-      const visiting = new Set<string>();
-      const visit = async (ref: EntityRef): Promise<void> => {
-        const key = `${ref.entityType}:${ref.id}`;
-        if (visited.has(key)) {
-          return;
-        }
-        if (visiting.has(key)) {
-          throw new DomainError("CONFLICT", "Lineage contains a reference cycle");
-        }
-        if (visited.size >= MAX_LINEAGE_ENTITIES) {
-          throw new DomainError("CONFLICT", "Lineage entity limit exceeded", false, {
-            limit: MAX_LINEAGE_ENTITIES,
-          });
-        }
-        visiting.add(key);
-        const repositoryName = lineageEntityTypes[ref.entityType];
-        const repository = repos[repositoryName] as EntityRepository;
-        const record = await repository.get(ref.id, query.workspaceId);
-        if (!record) {
-          throw new DomainError("NOT_FOUND", "Lineage entity not found in workspace", false, {
-            entityType: ref.entityType,
-            id: ref.id,
-            workspaceId: query.workspaceId,
-          });
-        }
-        for (const parent of lineageReferences(record, ref.entityType)) {
-          await visit(parent);
-          edges.push({ from: parent, to: ref });
-        }
-        const audits = await repos.audit.listForEntity(
-          query.workspaceId,
-          ref.entityType,
-          ref.id,
-        );
-        nodes.push({
-          ...ref,
-          version: record.version,
-          auditRequestIds: audits.map((audit) => audit.requestId),
-        });
-        visiting.delete(key);
-        visited.add(key);
-      };
-
-      await visit({ entityType: query.entityType, id: query.id });
-      const order = new Map(
-        nodes.map((node, index) => [`${node.entityType}:${node.id}`, index]),
-      );
-      const position = (ref: EntityRef): number =>
-        order.get(`${ref.entityType}:${ref.id}`)!;
-      edges.sort((left, right) =>
-        (position(left.from) - position(right.from)) ||
-        (position(left.to) - position(right.to)),
-      );
-      return { workspaceId: query.workspaceId, nodes, edges };
-    });
+    return this.store.transaction((repos) => resolveLineage(repos, query));
   }
 
   transitionTask(command: Command<TransitionTask>): Promise<Task> {

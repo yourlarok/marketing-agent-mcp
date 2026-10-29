@@ -19,6 +19,10 @@ export const EFFECT_METRICS = [
   "purchases",
 ] as const;
 export const MAX_EFFECT_ENTITY_BYTES = 64 * 1024;
+export const MAX_EFFECT_REVIEW_PUBLICATIONS = 10;
+export const MAX_EFFECT_REVIEW_BASELINE_SNAPSHOTS = 10;
+export const MAX_EFFECT_REVIEW_BENCHMARK_EVIDENCE = 100;
+export const MAX_EFFECT_REVIEW_SOURCE_VERSIONS = 130;
 
 export type EffectMetricName = (typeof EFFECT_METRICS)[number];
 
@@ -230,7 +234,7 @@ function validateSection(section: EffectReviewSection, label: string): void {
 }
 
 function validateSourceVersions(review: EffectReview): void {
-  if (!Array.isArray(review.sourceVersions) || review.sourceVersions.length > 3_100) {
+  if (!Array.isArray(review.sourceVersions) || review.sourceVersions.length > MAX_EFFECT_REVIEW_SOURCE_VERSIONS) {
     invalid("EffectReview sourceVersions must be a bounded array");
   }
   const expected = new Map<string, number>();
@@ -258,7 +262,8 @@ function validateSourceVersions(review: EffectReview): void {
 export function validateEffectReview(review: EffectReview): void {
   assertRecord(review, "EffectReview", REVIEW_KEYS);
   assertImmutableEntity(review, "EffectReview");
-  if (!Array.isArray(review.publicationRefs) || review.publicationRefs.length === 0 || review.publicationRefs.length > 100) {
+  if (!Array.isArray(review.publicationRefs) || review.publicationRefs.length === 0 ||
+      review.publicationRefs.length > MAX_EFFECT_REVIEW_PUBLICATIONS) {
     invalid("EffectReview publicationRefs must be a non-empty bounded array");
   }
   const publicationIds = new Set<string>();
@@ -269,9 +274,16 @@ export function validateEffectReview(review: EffectReview): void {
     if (publicationIds.has(reference.id)) invalid("EffectReview publicationRefs must not contain duplicates");
     publicationIds.add(reference.id);
   }
-  assertReferenceIds(review.metricSnapshotIds, "EffectReview metricSnapshotIds", { nonEmpty: true });
-  assertReferenceIds(review.baselineMetricSnapshotIds, "EffectReview baselineMetricSnapshotIds");
-  assertReferenceIds(review.benchmarkEvidenceIds, "EffectReview benchmarkEvidenceIds");
+  assertReferenceIds(review.metricSnapshotIds, "EffectReview metricSnapshotIds", {
+    nonEmpty: true,
+    maximum: MAX_EFFECT_REVIEW_PUBLICATIONS,
+  });
+  assertReferenceIds(review.baselineMetricSnapshotIds, "EffectReview baselineMetricSnapshotIds", {
+    maximum: MAX_EFFECT_REVIEW_BASELINE_SNAPSHOTS,
+  });
+  assertReferenceIds(review.benchmarkEvidenceIds, "EffectReview benchmarkEvidenceIds", {
+    maximum: MAX_EFFECT_REVIEW_BENCHMARK_EVIDENCE,
+  });
   if (review.baselineMetricSnapshotIds.some((id) => review.metricSnapshotIds.includes(id))) {
     invalid("EffectReview baseline snapshots must be distinct from selected snapshots");
   }
