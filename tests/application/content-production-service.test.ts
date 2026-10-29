@@ -529,16 +529,18 @@ describe("ContentProductionService", () => {
     const brief = await createBrief();
     const stored = await artifacts.put(Buffer.from("independent production bytes"));
     await store.transaction(async (repos) => {
-      await repos.evidence.update({
-        ...(await repos.evidence.get("evidence-fact", workspaceId))!,
+      await repos.evidence.insert({
+        id: "evidence-production-independent", workspaceId, version: 1, createdAt: now, updatedAt: now,
+        sourceId: "source-owned", sourceLocator: "independent-production", observedAt: now,
+        summary: "Independent production media", contentHash: stored.contentHash, classification: "owned_operating",
         assets: [{ id: "owned-source", kind: "original", ...stored }],
-      }, 1);
+      });
     });
-    const input = { ...generationInput(brief.id), sourceMaterials: [{ evidenceId: "evidence-fact", assetId: "owned-source" }] };
+    const input = { ...generationInput(brief.id), sourceMaterials: [{ evidenceId: "evidence-production-independent", assetId: "owned-source" }] };
     const result = await service.generate({ input, context: context("owned-source") });
-    expect(result.sourceMaterials[0]).toMatchObject({ role: "source", ownership: "owned", source: { evidenceId: "evidence-fact", assetId: "owned-source" } });
+    expect(result.sourceMaterials[0]).toMatchObject({ role: "source", ownership: "owned", source: { evidenceId: "evidence-production-independent", assetId: "owned-source" } });
     expect(Buffer.from(provider.requests[0]!.sourceAssets![0]!.contentBase64, "base64").toString()).toBe("independent production bytes");
-    const missing = { ...input, id: "asset-missing-bytes", contentId: "content-missing-bytes", sourceMaterials: [{ evidenceId: "evidence-fact", assetId: "missing" }] };
+    const missing = { ...input, id: "asset-missing-bytes", contentId: "content-missing-bytes", sourceMaterials: [{ evidenceId: "evidence-production-independent", assetId: "missing" }] };
     await expect(service.generate({ input: missing, context: context("missing-source") })).rejects.toMatchObject<DomainError>({ code: "NOT_FOUND" });
     expect(provider.calls).toBe(1);
   });
@@ -561,6 +563,67 @@ describe("ContentProductionService", () => {
         briefId: secondBrief.id, expectedBriefVersion: 1, sourceMaterials: [], revisionInstructions: "Stale parent",
       }, context: context("stale-parent"),
     })).rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+  });
+
+  it("uses current generation refs and rejects overlapping material Evidence advanced beyond the immutable brief", async () => {
+    const currentBrief = await createBrief();
+    await store.transaction(async (repos) => {
+      const task = (await repos.tasks.get("task-1", workspaceId))!;
+      await repos.tasks.update({ ...task, state: "in_progress" }, 1);
+      const recommendation = (await repos.recommendations.get("recommendation-1", workspaceId))!;
+      await repos.recommendations.update({ ...recommendation, hypothesis: "Current recommendation" }, 1);
+    });
+    const currentAsset = await service.generate({ input: generationInput(currentBrief.id), context: context("current-generation-refs") });
+    expect(currentAsset.sourceVersions).toEqual(expect.arrayContaining([
+      { entityType: "task", id: "task-1", version: 2 },
+      { entityType: "recommendation", id: "recommendation-1", version: 2 },
+      { entityType: "finding", id: "finding-fact", version: 1 },
+      { entityType: "evidence", id: "evidence-fact", version: 1 },
+      { entityType: "source", id: "source-owned", version: 1 },
+    ]));
+
+    const overlapInput = {
+      ...briefInput(), id: "brief-overlap", expectedTaskVersion: 2, expectedRecommendationVersion: 2,
+    };
+    const overlapBrief = await service.createBrief({ input: overlapInput, context: context("brief-overlap") });
+    const stored = await artifacts.put(Buffer.from("advanced independent production bytes"));
+    await store.transaction(async (repos) => {
+      const evidence = (await repos.evidence.get("evidence-fact", workspaceId))!;
+      await repos.evidence.update({ ...evidence, assets: [{ id: "advanced-source", kind: "original", ...stored }] }, 1);
+    });
+    expect(await store.transaction((repos) => repos.evidence.get("evidence-fact", workspaceId))).toMatchObject({ version: 2 });
+    expect(overlapBrief.sourceVersions).toContainEqual({ entityType: "evidence", id: "evidence-fact", version: 1 });
+    const overlapping = {
+      ...generationInput(overlapBrief.id),
+      sourceMaterials: [{ evidenceId: "evidence-fact", assetId: "advanced-source" }],
+    };
+    await expect(service.generate({ input: overlapping, context: context("advanced-overlap") }))
+      .rejects.toMatchObject<DomainError>({ code: "CONFLICT" });
+    expect(provider.calls).toBe(1);
+    expect(await getAsset(overlapping.id)).toBeUndefined();
+  });
+
+  it("rejects an exact copied run split mid-token across adjacent segments", async () => {
+    const external = (await store.transaction((repos) => repos.evidence.get("evidence-benchmark", workspaceId))) as Evidence;
+    const copied = (await artifacts.read(external.assets![0]!.contentHash)).toString("utf8");
+    const points = Array.from(copied).slice(0, 40);
+    const input = briefInput();
+    input.copy.hook = creative("hook", points.slice(0, 20).join(""));
+    input.copy.body = [creative("body", points.slice(20).join(""))];
+    await expect(service.createBrief({ input, context: context("copy-mid-token") })).rejects.toThrow(/40 Unicode code points/);
+  });
+
+  it("accepts mixed Recommendation targets when the selected exact channel is included", async () => {
+    await store.transaction(async (repos) => {
+      const recommendation = (await repos.recommendations.get("recommendation-1", workspaceId))!;
+      await repos.recommendations.update({ ...recommendation, targetChannels: ["xhs", "email"] }, 1);
+    });
+    const brief = await service.createBrief({
+      input: { ...briefInput(), expectedRecommendationVersion: 2 }, context: context("mixed-targets"),
+    });
+    expect(brief.channel).toBe("xhs");
+    const asset = await service.generate({ input: generationInput(brief.id), context: context("mixed-target-asset") });
+    expect(asset.channel).toBe("xhs");
   });
 
   it("reads raw multi-chunk artifacts with stable total hash and workspace/range checks", async () => {

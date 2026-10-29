@@ -166,14 +166,19 @@ function publishableTexts(input: CreateContentBrief): string[] {
   const joinedFrames = input.frames.map((frame) =>
     [...frame.onScreenText, ...frame.narration].map((segment) => segment.text).join(" ")
   );
+  const concatenatedFrames = input.frames.map((frame) =>
+    [...frame.onScreenText, ...frame.narration].map((segment) => segment.text).join("")
+  );
   return [
     input.objective,
     input.audience,
     ...copy,
     copy.join(" "),
+    copy.join(""),
     ...input.frames.flatMap((frame) => [frame.purpose, frame.visualDirection]),
     ...frameText,
     ...joinedFrames,
+    ...concatenatedFrames,
     ...input.assetRequirements,
   ];
 }
@@ -284,10 +289,8 @@ function assertTaskAndChannel(task: Task, recommendation: Recommendation, channe
     conflict("Content production requires a ready or in_progress Task");
   }
   if (!(CONTENT_CHANNELS as readonly string[]).includes(channel) ||
-      !Array.isArray(recommendation.targetChannels) || recommendation.targetChannels.length === 0 ||
-      recommendation.targetChannels.some((target) => !(CONTENT_CHANNELS as readonly string[]).includes(target)) ||
-      !recommendation.targetChannels.includes(channel)) {
-    invalid("Recommendation targetChannels must contain only xhs/channels and include the brief channel");
+      !Array.isArray(recommendation.targetChannels) || !recommendation.targetChannels.includes(channel)) {
+    invalid("Recommendation targetChannels must include the selected brief channel");
   }
 }
 
@@ -307,6 +310,28 @@ async function loadBriefLineage(repos: Repositories, brief: ContentBrief): Promi
   ]);
   for (const sourceId of sourceIds) sources.push(await requireSource(repos, brief.workspaceId, sourceId));
   return { findings, evidence, sources };
+}
+
+function lineageVersionRefs(lineage: BriefLineage): ContentEntityVersionRef[] {
+  return [
+    ...lineage.findings.map((finding) => ({ entityType: "finding" as const, id: finding.id, version: finding.version })),
+    ...lineage.evidence.map((evidence) => ({ entityType: "evidence" as const, id: evidence.id, version: evidence.version })),
+    ...lineage.sources.map((source) => ({ entityType: "source" as const, id: source.id, version: source.version })),
+  ];
+}
+
+function assertBriefFactLineageCurrent(brief: ContentBrief, lineage: BriefLineage): void {
+  const current = new Map(lineageVersionRefs(lineage).map((reference) => [
+    canonicalJson([reference.entityType, reference.id]), reference.version,
+  ]));
+  for (const reference of brief.sourceVersions) {
+    if (reference.entityType !== "finding" && reference.entityType !== "evidence" && reference.entityType !== "source") {
+      continue;
+    }
+    if (current.get(canonicalJson([reference.entityType, reference.id])) !== reference.version) {
+      conflict("Content brief fact Finding, Evidence, or Source changed after brief creation");
+    }
+  }
 }
 
 async function loadBriefSnapshot(repos: Repositories, input: CreateContentBrief): Promise<BriefSnapshot> {
@@ -429,6 +454,7 @@ async function loadGenerationSnapshot(
   if (!task.recommendationIds.includes(recommendation.id)) invalid("Content brief Recommendation must belong to its Task");
   assertTaskAndChannel(task, recommendation, brief.channel);
   const lineage = await loadBriefLineage(repos, brief);
+  assertBriefFactLineageCurrent(brief, lineage);
   const latest = await repos.assetVersions.latest(input.contentId, input.workspaceId);
   let parent: AssetVersion | null = null;
   if (derivative) {
@@ -499,13 +525,20 @@ async function loadGenerationSnapshot(
 }
 
 function assetSourceVersions(snapshot: GenerationSnapshot): ContentEntityVersionRef[] {
+  const materialRefs = snapshot.materials.flatMap((material): ContentEntityVersionRef[] => [
+    { entityType: "evidence", id: material.evidence.id, version: material.evidence.version },
+    { entityType: "source", id: material.source.id, version: material.source.version },
+  ]);
+  const currentRefs: ContentEntityVersionRef[] = [
+    { entityType: "task", id: snapshot.task.id, version: snapshot.task.version },
+    { entityType: "recommendation", id: snapshot.recommendation.id, version: snapshot.recommendation.version },
+    { entityType: "benchmark_analysis", id: snapshot.benchmark.id, version: snapshot.benchmark.version },
+    ...lineageVersionRefs(snapshot.lineage),
+  ];
   const references: ContentEntityVersionRef[] = [
     { entityType: "content_brief", id: snapshot.brief.id, version: snapshot.brief.version },
-    ...snapshot.brief.sourceVersions,
-    ...snapshot.materials.flatMap((material): ContentEntityVersionRef[] => [
-      { entityType: "evidence", id: material.evidence.id, version: material.evidence.version },
-      { entityType: "source", id: material.source.id, version: material.source.version },
-    ]),
+    ...materialRefs,
+    ...currentRefs,
     ...(snapshot.parent ? [{ entityType: "asset_version" as const, id: snapshot.parent.id, version: snapshot.parent.version }] : []),
   ];
   return unique(references, (reference) => canonicalJson([reference.entityType, reference.id]));
