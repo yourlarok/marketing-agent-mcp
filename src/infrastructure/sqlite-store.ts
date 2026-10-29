@@ -103,6 +103,7 @@ interface EntityConfig {
   scalarReferences?: ScalarReference[];
   scalarColumns?: ScalarReference[];
   references?: ReferenceTable | ReferenceTable[];
+  immutableReferences?: boolean;
 }
 
 const entityConfigs: Record<string, EntityConfig> = {
@@ -342,6 +343,7 @@ const entityConfigs: Record<string, EntityConfig> = {
   },
   metricSnapshots: {
     table: "metric_snapshots",
+    immutableReferences: true,
     scalarReferences: [{ column: "publication_id", key: "publicationId" }],
     references: {
       table: "metric_snapshot_evidence",
@@ -352,6 +354,7 @@ const entityConfigs: Record<string, EntityConfig> = {
   },
   effectReviews: {
     table: "effect_reviews",
+    immutableReferences: true,
     references: [
       {
         table: "effect_review_publications",
@@ -429,12 +432,18 @@ class SqliteEntityRepository implements EntityRepository {
     values.push("1", record.createdAt, record.updatedAt, canonicalJson(record));
 
     try {
+      if (this.config.immutableReferences) {
+        this.database.exec("PRAGMA defer_foreign_keys = ON");
+        this.insertReferences(record);
+      }
       this.database
         .prepare(
           `INSERT INTO ${this.config.table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
         )
         .run(...values);
-      this.insertReferences(record);
+      if (!this.config.immutableReferences) {
+        this.insertReferences(record);
+      }
       return record;
     } catch (error) {
       if (hasMessage(error, "UNIQUE constraint failed")) {
@@ -658,6 +667,18 @@ class SqliteScheduleRepository extends SqliteEntityRepository implements Schedul
   }
 }
 
+const PUBLICATION_IDENTITY_FIELDS = [
+  "operationKey",
+  "scheduleId",
+  "scheduleVersion",
+  "assetVersionId",
+  "assetVersion",
+  "approvalId",
+  "artifactHash",
+  "channel",
+  "accountId",
+] as const;
+
 class SqlitePublicationRepository extends SqliteEntityRepository implements PublicationRepository {
   override async get(id: string, workspaceId: string): Promise<Publication | undefined> {
     return super.get(id, workspaceId) as Promise<Publication | undefined>;
@@ -669,7 +690,12 @@ class SqlitePublicationRepository extends SqliteEntityRepository implements Publ
   }
 
   override async update(record: EntityRecord, expectedVersion: number): Promise<Publication> {
-    validatePublication(record as unknown as Publication);
+    const candidate = record as unknown as Publication;
+    validatePublication(candidate);
+    const current = await this.get(record.id, record.workspaceId);
+    if (current && PUBLICATION_IDENTITY_FIELDS.some((field) => current[field] !== candidate[field])) {
+      throw conflict("Publication identity is immutable", record.id);
+    }
     return super.update(record, expectedVersion) as Promise<Publication>;
   }
 

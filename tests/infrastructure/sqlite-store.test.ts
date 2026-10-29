@@ -803,7 +803,7 @@ describe("transactional SQLite storage", () => {
 
     const migrated = new DatabaseSync(databasePath);
     try {
-      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 6 });
+      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 7 });
       expect(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'dashboards'").get()).toEqual({ name: "dashboards" });
     } finally {
       migrated.close();
@@ -1233,7 +1233,7 @@ describe("content production SQLite persistence", () => {
       for (const table of payloadTables) {
         expect(migrated.prepare(`SELECT id, payload FROM ${table} ORDER BY id`).all()).toEqual(oldPayloads[table]);
       }
-      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 6 });
+      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 7 });
     } finally {
       migrated.close();
     }
@@ -1430,6 +1430,90 @@ describe("publishing and effect SQLite persistence", () => {
     expect(await second.transaction((repos) => repos.effectReviews.get("review-1", "ws-1"))).toEqual(reviewRecord());
   });
 
+  it.each([
+    ["operationKey", `publish:v1:${"f".repeat(64)}`],
+    ["scheduleId", "schedule-other"],
+    ["scheduleVersion", 2],
+    ["assetVersionId", "asset-other"],
+    ["assetVersion", 2],
+    ["approvalId", "approval-other"],
+    ["artifactHash", "f".repeat(64)],
+    ["channel", "channels"],
+    ["accountId", "account-other"],
+  ] as const)("keeps Publication identity field %s immutable across optimistic updates", async (field, value) => {
+    const store = open();
+    await seedPublishing(store);
+    const changed = publicationRecord({ [field]: value });
+
+    await expect(store.transaction((repos) => repos.publications.update(
+      { ...changed, updatedAt: later },
+      1,
+    ))).rejects.toThrow(/identity|immutable/i);
+    expect(await store.transaction((repos) => repos.publications.get("publication-1", "ws-1"))).toEqual(publicationRecord());
+  });
+
+  it.each([
+    {
+      table: "metric_snapshot_evidence",
+      ownerColumn: "snapshot_id",
+      ownerId: "snapshot-1",
+      targetColumn: "evidence_id",
+      insertedTarget: "evidence-2",
+    },
+    {
+      table: "effect_review_publications",
+      ownerColumn: "review_id",
+      ownerId: "review-1",
+      targetColumn: "publication_id",
+      insertedTarget: "publication-2",
+    },
+    {
+      table: "effect_review_metric_snapshots",
+      ownerColumn: "review_id",
+      ownerId: "review-1",
+      targetColumn: "snapshot_id",
+      insertedTarget: "snapshot-2",
+    },
+    {
+      table: "effect_review_evidence",
+      ownerColumn: "review_id",
+      ownerId: "review-1",
+      targetColumn: "evidence_id",
+      insertedTarget: "evidence-2",
+    },
+  ] as const)("protects $table for the immutable parent lifetime", async ({ table, ownerColumn, ownerId, targetColumn, insertedTarget }) => {
+    const first = open();
+    await seedPublishing(first);
+    await first.transaction(async (repos) => {
+      await repos.evidence.insert({ ...entity("evidence-2", "ws-1"), sourceId: "source-1" });
+      await repos.schedules.insert(scheduleRecord({ id: "schedule-2" }));
+      await repos.publications.insert(publicationRecord({ id: "publication-2", scheduleId: "schedule-2", operationKey: `publish:v1:${"f".repeat(64)}` }));
+      await repos.metricSnapshots.insert(snapshotRecord());
+      await repos.metricSnapshots.insert(snapshotRecord({ id: "snapshot-2", publicationId: "publication-2" }));
+      await repos.effectReviews.insert(reviewRecord());
+    });
+    first.close();
+
+    const raw = new DatabaseSync(databasePath);
+    try {
+      expect(() => raw.prepare(
+        `INSERT INTO ${table} (workspace_id, ${ownerColumn}, ${targetColumn}, position) VALUES ('ws-1', ?, ?, 1)`,
+      ).run(ownerId, insertedTarget)).toThrow(/immutable/i);
+      expect(() => raw.prepare(`UPDATE ${table} SET position = 99 WHERE ${ownerColumn} = ?`).run(ownerId)).toThrow(/immutable/i);
+      expect(() => raw.prepare(`DELETE FROM ${table} WHERE ${ownerColumn} = ?`).run(ownerId)).toThrow(/immutable/i);
+      expect(raw.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${ownerColumn} = ?`).get(ownerId)).toEqual({ count: 1 });
+    } finally {
+      raw.close();
+    }
+
+    const reopened = open();
+    if (table === "metric_snapshot_evidence") {
+      expect(await reopened.transaction((repos) => repos.metricSnapshots.get("snapshot-1", "ws-1"))).toEqual(snapshotRecord());
+    } else {
+      expect(await reopened.transaction((repos) => repos.effectReviews.get("review-1", "ws-1"))).toEqual(reviewRecord());
+    }
+  });
+
   it("lists due schedules in timestamp/ID order and recovery candidates by update order", async () => {
     const store = open();
     await seedPublishing(store);
@@ -1505,7 +1589,7 @@ describe("publishing and effect SQLite persistence", () => {
     ]);
   });
 
-  it("upgrades populated v5 records byte-for-byte and repeats migration 006 without changes", async () => {
+  it("upgrades populated v5 records byte-for-byte and repeats migrations 006 and 007 without changes", async () => {
     const raw = new DatabaseSync(databasePath);
     const records: [string, EntityRecord, Record<string, string | null>][] = [
       ["workspaces", entity("ws-1"), {}],
@@ -1552,7 +1636,7 @@ describe("publishing and effect SQLite persistence", () => {
     const migrated = new DatabaseSync(databasePath);
     try {
       for (const table of tables) expect(migrated.prepare(`SELECT id, payload FROM ${table} ORDER BY id`).all()).toEqual(payloads[table]);
-      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 6 });
+      expect(migrated.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 7 });
       expect(migrated.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'schedules_due_idx'").get()).toEqual({
         sql: "CREATE INDEX schedules_due_idx ON schedules(status, scheduled_for)",
       });
