@@ -425,6 +425,24 @@ describe("benchmark and content production MCP contracts", () => {
     })).toMatchObject({ isError: true });
   });
 
+  it("rejects reserved stable IDs in segments and frames at the semantic MCP boundary", async () => {
+    await createBenchmark();
+    for (const [locationIndex, location] of ["segment", "frame"].entries()) {
+      for (const [reservedIndex, reserved] of ["__proto__", "prototype", "constructor"].entries()) {
+        const suffix = `reserved-${locationIndex}-${reservedIndex}`;
+        const arguments_ = briefArguments("xhs", suffix);
+        if (location === "segment") arguments_.copy.hook.id = reserved;
+        else arguments_.frames[0]!.id = reserved;
+        const response = await result("content_brief_create", arguments_);
+        expect(response, `${location}.${reserved}`).toMatchObject({ isError: true });
+        expect(JSON.stringify(response), `${location}.${reserved}`).toContain("Input validation error");
+        expect(await store.transaction((repos) => repos.contentBriefs.get(
+          arguments_.id, arguments_.workspaceId,
+        ))).toBeUndefined();
+      }
+    }
+  });
+
   it("rejects nested secrets, dynamic execution fields, and 65,537-byte input before writes", async () => {
     const secret = "synthetic-content-mcp-secret";
     for (const [name, arguments_] of [

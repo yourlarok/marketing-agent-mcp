@@ -781,7 +781,8 @@ export const strategyTaskListInputSchema = z.strictObject({
   }).optional(),
 });
 
-const contentStableIdSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,127}$/);
+const contentStableIdSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,127}$/)
+  .refine((id) => !["__proto__", "prototype", "constructor"].includes(id));
 const contentTextSchema = z.string().trim().min(1).max(8_192);
 const contentSegmentInputSchema = z.discriminatedUnion("kind", [
   z.strictObject({
