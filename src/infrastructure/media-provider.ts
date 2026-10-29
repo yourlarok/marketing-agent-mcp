@@ -8,6 +8,7 @@ import {
   type ContentBrief,
   type EvidenceAssetRef,
 } from "../domain/content-production-model.js";
+import { assertEntityReferenceId } from "../domain/contract-validation.js";
 import { DomainError } from "../domain/errors.js";
 import { ControlledMcpClient } from "./controlled-mcp-client.js";
 import { canonicalJson } from "./sqlite.js";
@@ -144,17 +145,24 @@ function exactKeys(value: unknown, keys: readonly string[], label: string): asse
   }
 }
 
-function decodeBase64(value: unknown, response: boolean): Buffer {
-  if (typeof value !== "string" || value.length === 0 || value.length % 4 !== 0 ||
-      !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+function decodeBase64(
+  value: unknown,
+  response: boolean,
+  maxBytes: number,
+  tooLarge: () => never,
+): Buffer {
+  const malformed = (): never => {
     if (response) invalidResponse("Professional media must use canonical base64");
     invalid("Production source media must use canonical base64");
-  }
+  };
+  if (typeof value !== "string") return malformed();
+  if (value.length === 0) return malformed();
+  if (value.length > Math.ceil(maxBytes / 3) * 4) tooLarge();
+  if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) malformed();
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  if ((value.length / 4) * 3 - padding > maxBytes) tooLarge();
   const content = Buffer.from(value, "base64");
-  if (content.toString("base64") !== value) {
-    if (response) invalidResponse("Professional media must use canonical base64");
-    invalid("Production source media must use canonical base64");
-  }
+  if (content.toString("base64") !== value) malformed();
   return content;
 }
 
@@ -190,6 +198,13 @@ function validateRequest(request: MediaRenderRequest): number {
   if (!Array.isArray(sources) || sources.length > MEDIA_PROVIDER_LIMITS.maxSourceAssets) {
     invalid(`Media source assets must contain at most ${MEDIA_PROVIDER_LIMITS.maxSourceAssets} entries`);
   }
+  const selectedRefs = request.benchmarkAnalysis.methods.flatMap((method) => method.evidenceAssetRefs);
+  const selectedHashes = new Set(selectedRefs.map((reference) => reference.contentHash));
+  const hasSelectedIdentity = (reference: EvidenceAssetRef): boolean =>
+    request.benchmarkAnalysis.evidenceIds.includes(reference.evidenceId) || selectedRefs.some((selected) =>
+      selected.evidenceId === reference.evidenceId ||
+      (selected.sourceId === reference.sourceId && selected.assetId === reference.assetId)
+    );
   let totalBytes = 0;
   for (const asset of sources) {
     exactKeys(asset, SOURCE_KEYS, "Production source asset");
@@ -197,12 +212,20 @@ function validateRequest(request: MediaRenderRequest): number {
       invalid("Production source bytes must be independently owned or authorized");
     }
     validateReference(asset.source);
-    if (request.benchmarkAnalysis.evidenceIds.includes(asset.source.evidenceId)) {
+    if (hasSelectedIdentity(asset.source)) {
+      invalid("BenchmarkAnalysis Evidence identities cannot be reused as production source media");
+    }
+    const content = decodeBase64(
+      asset.contentBase64,
+      false,
+      MEDIA_PROVIDER_LIMITS.maxTotalSourceBytes - totalBytes,
+      () => invalid("Production source and parent bytes exceed the total byte limit"),
+    );
+    const actualHash = createHash("sha256").update(content).digest("hex");
+    if (selectedHashes.has(actualHash)) {
       invalid("BenchmarkAnalysis Evidence bytes cannot be reused as production source media");
     }
-    const content = decodeBase64(asset.contentBase64, false);
-    if (content.length !== asset.source.byteLength ||
-        createHash("sha256").update(content).digest("hex") !== asset.source.contentHash) {
+    if (content.length !== asset.source.byteLength || actualHash !== asset.source.contentHash) {
       invalid("Production source bytes do not match their descriptor");
     }
     totalBytes += content.length;
@@ -211,13 +234,23 @@ function validateRequest(request: MediaRenderRequest): number {
     const parent = request.parent;
     exactKeys(parent, PARENT_KEYS, "Parent production asset");
     if (parent.role !== "parent" || parent.mediaType !== expectedProfile.mediaType ||
-        typeof parent.assetVersionId !== "string" || parent.assetVersionId.length === 0 ||
-        typeof parent.artifactId !== "string" || parent.artifactId.length === 0 ||
-        !/^[a-f0-9]{64}$/.test(parent.contentHash) || !Number.isSafeInteger(parent.byteLength) || parent.byteLength < 1) {
+        !/^[a-f0-9]{64}$/.test(parent.contentHash) || !Number.isSafeInteger(parent.byteLength) ||
+        parent.byteLength < 1 || parent.byteLength > MEDIA_PROVIDER_LIMITS.maxTotalSourceBytes) {
       invalid("Parent production asset descriptor is invalid");
     }
-    const content = decodeBase64(parent.contentBase64, false);
-    if (content.length !== parent.byteLength || createHash("sha256").update(content).digest("hex") !== parent.contentHash) {
+    assertEntityReferenceId(parent.assetVersionId, "Parent source assetVersionId");
+    assertEntityReferenceId(parent.artifactId, "Parent source artifactId");
+    const content = decodeBase64(
+      parent.contentBase64,
+      false,
+      MEDIA_PROVIDER_LIMITS.maxTotalSourceBytes - totalBytes,
+      () => invalid("Production source and parent bytes exceed the total byte limit"),
+    );
+    const actualHash = createHash("sha256").update(content).digest("hex");
+    if (selectedHashes.has(actualHash)) {
+      invalid("BenchmarkAnalysis Evidence bytes cannot be reused as parent production media");
+    }
+    if (content.length !== parent.byteLength || actualHash !== parent.contentHash) {
       invalid("Parent production bytes do not match their descriptor");
     }
     totalBytes += content.length;
@@ -283,11 +316,15 @@ export class McpMediaProvider implements MediaProvider {
       if (parsed.data.artifact.mediaType !== expectedMediaType) {
         throw mediaProviderCapabilityGap("mcp_result_mismatch", "Professional media MCP returned the wrong media type");
       }
-      const content = decodeBase64(parsed.data.artifact.contentBase64, true);
       const maxOutputBytes = request.operation === "render_xhs_png_v1" ? 4 * 1024 * 1024 : 16 * 1024 * 1024;
-      if (content.length > maxOutputBytes) {
-        throw mediaProviderCapabilityGap("mcp_response_too_large", "Professional media output exceeds the operation byte limit");
-      }
+      const content = decodeBase64(
+        parsed.data.artifact.contentBase64,
+        true,
+        maxOutputBytes,
+        () => {
+          throw mediaProviderCapabilityGap("mcp_response_too_large", "Professional media output exceeds the operation byte limit");
+        },
+      );
       const contentHash = createHash("sha256").update(content).digest("hex");
       if (content.length !== parsed.data.artifact.byteLength || contentHash !== parsed.data.artifact.contentHash) {
         throw mediaProviderCapabilityGap("mcp_result_mismatch", "Professional media bytes do not match their declared descriptor");

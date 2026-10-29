@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { DomainError } from "../../src/domain/errors.js";
 import { MediaValidator } from "../../src/infrastructure/media-validation.js";
@@ -161,4 +161,60 @@ describe("real Playwright and ffprobe media validators", () => {
       await removeTempDir(tempDir);
     }
   }, 30_000);
+
+  it("rejects a fractional duration above 60 seconds before millisecond rounding", async () => {
+    const tempDir = await createTempDir();
+    const probe = join(tempDir, "ffprobe-fractional-duration");
+    try {
+      writeFileSync(probe, `#!/bin/sh\nif [ "$1" = "-version" ]; then echo ffprobe-test-version; else echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1080,"height":1920},{"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"60.0004"}}'; fi\n`, { mode: 0o700 });
+      await expectGap(
+        new MediaValidator({ ffprobeCommand: probe }).validateChannelsMp4(mp4()),
+        "video_probe",
+        "media_duration_mismatch",
+      );
+    } finally {
+      await removeTempDir(tempDir);
+    }
+  }, 30_000);
+
+  it("kills a timed-out fake ffprobe and removes its temporary media file", async () => {
+    const tempDir = await createTempDir();
+    const probe = join(tempDir, "ffprobe-timeout");
+    const pidFile = join(tempDir, "probe-pid");
+    const mediaCapture = join(tempDir, "media-path");
+    try {
+      writeFileSync(probe, `#!/bin/sh\nif [ "$1" = "-version" ]; then echo ffprobe-test-version; exit 0; fi\nfor last in "$@"; do :; done\necho "$$" > "${pidFile}"\necho "$last" > "${mediaCapture}"\nwhile :; do :; done\n`, { mode: 0o700 });
+      await expectGap(
+        new MediaValidator({ ffprobeCommand: probe, ffprobeTimeoutMs: 1_000 }).validateChannelsMp4(mp4()),
+        "video_probe",
+        "ffprobe_timeout",
+      );
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(() => process.kill(pid, 0)).toThrowError(expect.objectContaining({ code: "ESRCH" }));
+      const mediaPath = readFileSync(mediaCapture, "utf8").trim();
+      expect(existsSync(mediaPath)).toBe(false);
+      expect(existsSync(dirname(mediaPath))).toBe(false);
+    } finally {
+      await removeTempDir(tempDir);
+    }
+  }, 5_000);
+
+  it("bounds fake ffprobe output at 64 KiB and removes temporary files", async () => {
+    const tempDir = await createTempDir();
+    const probe = join(tempDir, "ffprobe-output-overflow");
+    const mediaCapture = join(tempDir, "media-path");
+    try {
+      writeFileSync(probe, `#!/bin/sh\nif [ "$1" = "-version" ]; then echo ffprobe-test-version; exit 0; fi\nfor last in "$@"; do :; done\necho "$last" > "${mediaCapture}"\n/usr/bin/head -c 70000 /dev/zero\n`, { mode: 0o700 });
+      await expectGap(
+        new MediaValidator({ ffprobeCommand: probe }).validateChannelsMp4(mp4()),
+        "video_probe",
+        "ffprobe_output_too_large",
+      );
+      const mediaPath = readFileSync(mediaCapture, "utf8").trim();
+      expect(existsSync(mediaPath)).toBe(false);
+      expect(existsSync(dirname(mediaPath))).toBe(false);
+    } finally {
+      await removeTempDir(tempDir);
+    }
+  }, 5_000);
 });

@@ -21,6 +21,7 @@ const PROBE_CONFIGURATION_ACTION =
 export interface MediaValidatorOptions {
   ffprobeCommand?: string;
   chromiumExecutablePath?: string;
+  ffprobeTimeoutMs?: number;
 }
 
 const probeSchema = z.object({
@@ -49,7 +50,7 @@ interface ProbeOutput {
   stdout: string;
 }
 
-function runFfprobe(command: string, args: string[]): Promise<ProbeOutput> {
+function runFfprobe(command: string, args: string[], timeoutMs: number): Promise<ProbeOutput> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env: {} });
     const stdout: Buffer[] = [];
@@ -60,7 +61,7 @@ function runFfprobe(command: string, args: string[]): Promise<ProbeOutput> {
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
-    }, FFPROBE_TIMEOUT_MS);
+    }, timeoutMs);
     const collect = (chunk: Buffer): void => {
       if (outputExceeded) return;
       outputBytes += chunk.length;
@@ -111,6 +112,11 @@ export class MediaValidator {
   constructor(private readonly options: MediaValidatorOptions = {}) {
     if (options.ffprobeCommand !== undefined && !isAbsolute(options.ffprobeCommand)) {
       throw new DomainError("INVALID_INPUT", "ffprobe command must be an absolute executable path");
+    }
+    if (options.ffprobeTimeoutMs !== undefined &&
+        (!Number.isSafeInteger(options.ffprobeTimeoutMs) || options.ffprobeTimeoutMs < 1 ||
+          options.ffprobeTimeoutMs > FFPROBE_TIMEOUT_MS)) {
+      throw new DomainError("INVALID_INPUT", "ffprobe timeout override must be between 1 and 10000 ms");
     }
   }
 
@@ -184,7 +190,8 @@ export class MediaValidator {
     try {
       const mediaPath = join(directory, "candidate.mp4");
       await writeFile(mediaPath, bytes, { flag: "wx", mode: 0o600 });
-      const versionOutput = await runFfprobe(this.options.ffprobeCommand, ["-version"]);
+      const timeoutMs = this.options.ffprobeTimeoutMs ?? FFPROBE_TIMEOUT_MS;
+      const versionOutput = await runFfprobe(this.options.ffprobeCommand, ["-version"], timeoutMs);
       const provenance = probeVersion(versionOutput.stdout);
       const inspection = await runFfprobe(this.options.ffprobeCommand, [
         "-v", "error",
@@ -193,7 +200,7 @@ export class MediaValidator {
         "-show_format",
         "-of", "json",
         mediaPath,
-      ]);
+      ], timeoutMs);
       let decoded: unknown;
       try {
         decoded = JSON.parse(inspection.stdout);
@@ -214,9 +221,12 @@ export class MediaValidator {
         throw probeGap("media_duration_mismatch", "MP4 duration is not finite and positive");
       }
       const durationSeconds = Number(parsed.data.format.duration);
-      const durationMs = Math.round(durationSeconds * 1_000);
-      if (!Number.isFinite(durationSeconds) || !Number.isSafeInteger(durationMs) || durationMs < 1 || durationMs > 60_000) {
+      if (!Number.isFinite(durationSeconds) || durationSeconds <= 0 || durationSeconds > 60) {
         throw probeGap("media_duration_mismatch", "MP4 duration must be greater than zero and at most 60 seconds");
+      }
+      const durationMs = Math.round(durationSeconds * 1_000);
+      if (!Number.isSafeInteger(durationMs) || durationMs < 1 || durationMs > 60_000) {
+        throw probeGap("media_duration_mismatch", "MP4 duration cannot be represented by the internal millisecond descriptor");
       }
       return {
         status: "passed",

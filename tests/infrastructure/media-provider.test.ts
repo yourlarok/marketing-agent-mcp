@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { copyFile, mkdtemp, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CHANNEL_PROFILES,
   type BenchmarkAnalysis,
@@ -261,6 +261,97 @@ describe("controlled professional media stdio MCP provider", () => {
       ...request(),
       sourceAssets: [source(Buffer.alloc(MEDIA_PROVIDER_LIMITS.maxTotalSourceBytes + 1))],
     })).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+  });
+
+  it("rejects relabeled selected benchmark bytes and identities in both source and parent inputs before spawn", async () => {
+    const unavailable = new McpMediaProvider({ command: "/definitely/missing/media-provider" });
+    const selectedBytes = Buffer.from("selected-benchmark-evidence-bytes");
+    const contentHash = createHash("sha256").update(selectedBytes).digest("hex");
+    const selectedAnalysis: BenchmarkAnalysis = {
+      ...benchmarkAnalysis,
+      methods: benchmarkAnalysis.methods.map((method) => ({
+        ...method,
+        evidenceAssetRefs: method.evidenceAssetRefs.map((reference) => ({
+          ...reference,
+          contentHash,
+          byteLength: selectedBytes.length,
+        })),
+      })),
+    };
+    const selectedRequest: MediaRenderRequest = { ...request(), benchmarkAnalysis: selectedAnalysis };
+    await expect(unavailable.render({ ...selectedRequest, sourceAssets: [source(selectedBytes)] }))
+      .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    await expect(unavailable.render({
+      ...selectedRequest,
+      parent: {
+        role: "parent",
+        assetVersionId: "asset-version-1",
+        artifactId: "artifact-1",
+        mediaType: "image/png",
+        contentHash,
+        byteLength: selectedBytes.length,
+        contentBase64: selectedBytes.toString("base64"),
+      },
+    })).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    const relabeledIdentity = source(Buffer.from("different-independent-bytes"));
+    relabeledIdentity.source.sourceId = benchmarkRef.sourceId;
+    relabeledIdentity.source.assetId = benchmarkRef.assetId;
+    relabeledIdentity.source.evidenceId = "evidence-relabeled";
+    await expect(unavailable.render({ ...selectedRequest, sourceAssets: [relabeledIdentity] }))
+      .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+  });
+
+  it("bounds encoded source and parent lengths before base64 decoding or process spawn", async () => {
+    const unavailable = new McpMediaProvider({ command: "/definitely/missing/media-provider" });
+    const oversized = "A".repeat(4 * (Math.ceil(MEDIA_PROVIDER_LIMITS.maxTotalSourceBytes / 3) + 1));
+    const decode = vi.spyOn(Buffer, "from");
+    try {
+      const oversizedSource = source(Buffer.from("tiny"));
+      oversizedSource.contentBase64 = oversized;
+      await expect(unavailable.render({ ...request(), sourceAssets: [oversizedSource] }))
+        .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+      expect(decode.mock.calls.some(([value, encoding]) => value === oversized && encoding === "base64")).toBe(false);
+      decode.mockClear();
+      const parentBytes = Buffer.from("parent");
+      await expect(unavailable.render({
+        ...request(),
+        parent: {
+          role: "parent",
+          assetVersionId: "asset-version-1",
+          artifactId: "artifact-1",
+          mediaType: "image/png",
+          contentHash: createHash("sha256").update(parentBytes).digest("hex"),
+          byteLength: parentBytes.length,
+          contentBase64: oversized,
+        },
+      })).rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+      expect(decode.mock.calls.some(([value, encoding]) => value === oversized && encoding === "base64")).toBe(false);
+    } finally {
+      decode.mockRestore();
+    }
+  });
+
+  it("requires normalized bounded parent entity reference IDs before spawn", async () => {
+    const unavailable = new McpMediaProvider({ command: "/definitely/missing/media-provider" });
+    const parentBytes = Buffer.from("independent-parent");
+    const parent = {
+      role: "parent" as const,
+      assetVersionId: "asset-version-1",
+      artifactId: "artifact-1",
+      mediaType: "image/png" as const,
+      contentHash: createHash("sha256").update(parentBytes).digest("hex"),
+      byteLength: parentBytes.length,
+      contentBase64: parentBytes.toString("base64"),
+    };
+    for (const patch of [
+      { assetVersionId: "x".repeat(257) },
+      { artifactId: "x".repeat(257) },
+      { assetVersionId: " untrimmed" },
+      { artifactId: "untrimmed " },
+    ]) {
+      await expect(unavailable.render({ ...request(), parent: { ...parent, ...patch } }))
+        .rejects.toMatchObject<DomainError>({ code: "INVALID_INPUT" });
+    }
   });
 
   it("rejects public command, environment, code, path, and inexact profile overrides", async () => {
