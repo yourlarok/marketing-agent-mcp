@@ -77,16 +77,19 @@ function positiveVersion(value: unknown, field: string): asserts value is number
   }
 }
 
-function assertFutureTime(scheduledFor: string, timeZone: string, now: string): void {
+function assertScheduleTimeSyntax(scheduledFor: string, timeZone: string): void {
   assertUtcInstant(scheduledFor, "scheduledFor");
-  assertUtcInstant(now, "clock now");
-  if (Date.parse(scheduledFor) <= Date.parse(now)) {
-    invalid("scheduledFor must be in the future");
-  }
   try {
     new Intl.DateTimeFormat("en-US", { timeZone }).format();
   } catch {
     invalid("timeZone must be a bounded IANA time zone");
+  }
+}
+
+function assertFutureTime(scheduledFor: string, now: string): void {
+  assertUtcInstant(now, "clock now");
+  if (Date.parse(scheduledFor) <= Date.parse(now)) {
+    invalid("scheduledFor must be in the future");
   }
 }
 
@@ -107,7 +110,7 @@ function validateApprovalInput(input: RecordApproval): void {
   });
 }
 
-function validateCreateScheduleInput(input: CreateSchedule, now: string): void {
+function validateCreateScheduleInput(input: CreateSchedule): void {
   assertRecord(input, "CreateSchedule", CREATE_SCHEDULE_KEYS);
   positiveVersion(input.expectedAssetVersion, "expectedAssetVersion");
   createSchedule({
@@ -145,7 +148,7 @@ function validateCreateScheduleInput(input: CreateSchedule, now: string): void {
     delivery: null,
     verification: null,
   });
-  assertFutureTime(input.scheduledFor, input.timeZone, now);
+  assertScheduleTimeSyntax(input.scheduledFor, input.timeZone);
 }
 
 async function requireAsset(
@@ -215,7 +218,7 @@ export class PublishingService {
 
   constructor(
     private readonly store: Store,
-    private readonly clock: Clock,
+    clock: Clock,
     ids: IdGenerator,
     private readonly artifacts: ArtifactStore = new ArtifactStore(),
     private readonly providerConfiguration: PublishingProviderConfiguration = { isConfigured: () => false },
@@ -271,7 +274,7 @@ export class PublishingService {
   }
 
   async createSchedule(command: Command<CreateSchedule>): Promise<Schedule> {
-    validateCreateScheduleInput(command.input, this.clock.now());
+    validateCreateScheduleInput(command.input);
     let prepared: ScheduleSnapshot | undefined;
     const prepare = async (): Promise<void> => {
       prepared = undefined;
@@ -288,7 +291,7 @@ export class PublishingService {
       context: command.context,
       write: async (repos, input, timestamp) => {
         if (!prepared) throw new Error("Schedule preparation did not complete");
-        assertFutureTime(input.scheduledFor, input.timeZone, timestamp);
+        assertFutureTime(input.scheduledFor, timestamp);
         const current = await loadScheduleSnapshot(repos, input);
         this.assertProviderConfiguration(input);
         if (canonicalJson(current) !== canonicalJson(prepared)) {
@@ -347,7 +350,7 @@ export class PublishingService {
   reschedule(command: Command<Reschedule>): Promise<Schedule> {
     assertRecord(command.input, "Reschedule", RESCHEDULE_KEYS);
     positiveVersion(command.input.expectedVersion, "expectedVersion");
-    assertFutureTime(command.input.scheduledFor, command.input.timeZone, this.clock.now());
+    assertScheduleTimeSyntax(command.input.scheduledFor, command.input.timeZone);
     return this.commands.execute({
       workspaceId: command.input.workspaceId,
       action: "schedule.reschedule",
@@ -357,7 +360,7 @@ export class PublishingService {
       write: async (repos, input, timestamp) => {
         const current = await requireSchedule(repos, input);
         this.assertScheduledVersion(current, input.expectedVersion);
-        assertFutureTime(input.scheduledFor, input.timeZone, timestamp);
+        assertFutureTime(input.scheduledFor, timestamp);
         return repos.schedules.update({
           ...current,
           scheduledFor: input.scheduledFor,

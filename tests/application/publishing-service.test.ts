@@ -353,6 +353,39 @@ describe("PublishingService approval and schedule gates", () => {
       .toMatchObject([{ action: "schedule.create" }, { action: "schedule.reschedule" }, { action: "schedule.cancel" }]);
   });
 
+  it("replays schedule creation exactly after its target time passes without new audit or state", async () => {
+    await approve();
+    const command = { input: scheduleInput(), context: context("create-expired-replay") };
+    const created = await service.createSchedule(command);
+    const publication = await store.transaction((repos) => repos.publications.getByScheduleId(created.id, workspaceId));
+    now = "2026-10-31T10:00:00.000Z";
+
+    expect(await service.createSchedule(command)).toEqual(created);
+    expect(await store.transaction((repos) => repos.schedules.get(created.id, workspaceId))).toEqual(created);
+    expect(await store.transaction((repos) => repos.publications.getByScheduleId(created.id, workspaceId))).toEqual(publication);
+    expect(await store.transaction((repos) => repos.audit.listForEntity(workspaceId, "schedule", created.id))).toHaveLength(1);
+  });
+
+  it("replays reschedule exactly after its target time passes without new audit or state", async () => {
+    await approve();
+    const created = await service.createSchedule({ input: scheduleInput(), context: context("reschedule-expired-create") });
+    const command = {
+      input: {
+        id: created.id, workspaceId, expectedVersion: 1,
+        scheduledFor: "2026-11-01T12:00:00.000Z", timeZone: "Europe/London",
+      },
+      context: context("reschedule-expired-replay"),
+    };
+    const rescheduled = await service.reschedule(command);
+    const publication = await store.transaction((repos) => repos.publications.getByScheduleId(created.id, workspaceId));
+    now = "2026-11-02T12:00:00.000Z";
+
+    expect(await service.reschedule(command)).toEqual(rescheduled);
+    expect(await store.transaction((repos) => repos.schedules.get(created.id, workspaceId))).toEqual(rescheduled);
+    expect(await store.transaction((repos) => repos.publications.getByScheduleId(created.id, workspaceId))).toEqual(publication);
+    expect(await store.transaction((repos) => repos.audit.listForEntity(workspaceId, "schedule", created.id))).toHaveLength(2);
+  });
+
   it.each(["triggered", "completed", "cancelled"] as const)("does not reschedule or cancel a %s Schedule", async (status) => {
     await approve();
     const created = await service.createSchedule({ input: scheduleInput(), context: context(`status-${status}-create`) });
