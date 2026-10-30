@@ -205,6 +205,11 @@ describe("trusted publishing stdio MCP provider", () => {
     await expectGap(provider({ timeoutMs: 100 }).submit(request({ operationKey: `publish:v1:${"b".repeat(64)}` })), "mcp_timeout");
   }, 10_000);
 
+  it("times out an accepted submission with the production default and cleans up", async () => {
+    mode = "accepted-built-timeout";
+    await expectGap(provider().submit(request()), "mcp_timeout");
+  }, 25_000);
+
   it("escalates cleanup and leaves no successful hanging child", async () => {
     const fixtureDir = await mkdtemp(join(dirname(fixture), "publishing-timeout-"));
     const fixturePath = join(fixtureDir, "timeout-fixture.mjs");

@@ -137,6 +137,7 @@ server.registerTool("submit", {
     if (mode === "accepted-timeout-ignore-sigterm") process.on("SIGTERM", () => undefined);
     await delay(5_000);
   }
+  if (mode === "accepted-built-timeout") await delay(20_000);
   if (mode === "accepted-process-loss") process.exit(17);
   if (mode === "success-hang") setInterval(() => undefined, 1_000);
   let result = {
