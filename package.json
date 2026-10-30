@@ -1,18 +1,28 @@
 {
-  "name": "marketing-agent-mcp",
+  "name": "@yourlarok/marketing-agent-mcp",
   "version": "1.0.0",
   "description": "Marketing MCP server",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "marketing-agent-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=22.23.1"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/index.js', 0o755)\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "smoke": "vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/dashboard-strategy-stdio.test.ts tests/e2e/content-production-stdio.test.ts tests/e2e/publishing-effect-stdio.test.ts tests/e2e/data-analytics-documentation.test.ts"
+    "prepack": "npm run build",
+    "smoke": "vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/dashboard-strategy-stdio.test.ts tests/e2e/content-production-stdio.test.ts tests/e2e/publishing-effect-stdio.test.ts tests/e2e/npm-package.test.ts tests/e2e/data-analytics-documentation.test.ts"
   },
   "keywords": [],
   "author": "",

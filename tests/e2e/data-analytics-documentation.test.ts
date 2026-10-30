@@ -17,6 +17,7 @@ describe("data analytics smoke and documentation contracts", () => {
       "tests/e2e/public-data-analytics-stdio.test.ts",
       "tests/e2e/dashboard-strategy-stdio.test.ts",
       "tests/e2e/content-production-stdio.test.ts",
+      "tests/e2e/npm-package.test.ts",
       "tests/e2e/data-analytics-documentation.test.ts",
     ]) {
       expect(manifest.scripts.smoke).toContain(suite);
@@ -177,6 +178,8 @@ describe("data analytics smoke and documentation contracts", () => {
       "非秘密 `accountId`", "账户授权/权限", "可信 publishing provider/部署环境",
       "密码、token、cookie、命令或环境值", "provider 已配置不等于账户已授权或真实平台成功",
       "manual-assisted 交付始终是明确 fallback",
+      "@yourlarok/marketing-agent-mcp@1.0.0", "尚未发布", "无需克隆", "npm pack",
+      "本地 tarball", "Agent 部署提示", "专业工具和账户授权仍按需配置",
     ]) expect(readme, `README must disclose guided setup contract ${required}`).toContain(required);
   });
 });

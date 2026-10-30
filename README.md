@@ -19,7 +19,48 @@ mkdir -p /absolute/path/to/marketing-artifacts
 
 Linux 若缺少 Chromium 系统依赖，可按 Playwright 官方提示安装对应依赖。`npm run smoke` 会启动真 Chromium，不会用模拟浏览器替代；缺少浏览器时必须先执行上述安装命令。内容生产 smoke 还要求可信本地 ffmpeg/ffprobe：测试用 `MARKETING_TEST_FFMPEG` 和 `MARKETING_TEST_FFPROBE` 指定精确绝对路径（未设置时使用 `/opt/homebrew/bin/ffmpeg` 与 `/opt/homebrew/bin/ffprobe`）。ffmpeg 仅供独立测试 media fixture 生成真实 PNG/MP4；ffprobe 同时用于 server 验收和测试独立复核，不可跳过或用签名/描述符代替。
 
-启动、构建和测试均应在项目根目录执行。server 入口是构建后的 `dist/index.js`，不是源码或 `node_modules`。
+源码启动、构建和测试均应在项目根目录执行。server 入口是构建后的 `dist/index.js`，不是源码或 `node_modules`。
+
+## npm/npx 无需克隆部署
+
+包名为 `@yourlarok/marketing-agent-mcp`，版本为 `1.0.0`；它**尚未发布**到公共 npm registry，下面的发布版配置只有在维护者完成发布后才可使用，本地打包通过不代表包已公开可用。
+
+发布后，在任意工作目录创建自己的数据目录，再把以下配置合并到 MCP 客户端；路径必须替换为本机绝对路径，无需克隆仓库：
+
+```json
+{
+  "mcpServers": {
+    "marketing-agent": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package",
+        "@yourlarok/marketing-agent-mcp@1.0.0",
+        "marketing-agent-mcp"
+      ],
+      "env": {
+        "MARKETING_DATA_DIR": "/absolute/path/to/marketing-data",
+        "MARKETING_IMPORT_ROOT": "/absolute/path/to/marketing-imports",
+        "MARKETING_ARTIFACT_DIR": "/absolute/path/to/marketing-artifacts"
+      }
+    }
+  }
+}
+```
+
+基础 server 只要求 Node.js **22.23.1+** 和 npm；Chromium、ffprobe、专业工具和账户授权仍按需配置，不是 npx 启动前必须全部安装的前置条件。凭据、目标 allowlist 和专业 provider 的环境变量仍按后文说明加入同一 `env`。
+
+发布前可在源码 checkout 中验证本地 tarball，然后从任意空目录使用其绝对路径启动，不需要依赖该 checkout 的 `dist` 或 `node_modules`：
+
+```bash
+npm ci
+npm pack
+npx --yes --package /absolute/path/to/yourlarok-marketing-agent-mcp-1.0.0.tgz marketing-agent-mcp
+```
+
+`npm pack` 的 `prepack` 只执行构建，不运行完整 smoke。本地 tarball 命令仍需上表中的 `MARKETING_DATA_DIR` 等环境变量；它会按 npm 配置取得运行时依赖，但不会从公共 registry 获取这个尚未发布的本包。
+
+**Agent 部署提示（一句话）**：“在 Node.js 22.23.1+ 环境用 `@yourlarok/marketing-agent-mcp@1.0.0` 配置上述 npx stdio server 和我的三个绝对目录，不要克隆仓库，Chromium、ffprobe、专业工具与账户授权仅在实际能力需要时询问我。”
 
 ## Agent 引导式设置与授权边界
 
@@ -464,10 +505,10 @@ npm run smoke
 `npm run smoke` 等价于：
 
 ```bash
-vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/dashboard-strategy-stdio.test.ts tests/e2e/content-production-stdio.test.ts tests/e2e/publishing-effect-stdio.test.ts tests/e2e/data-analytics-documentation.test.ts
+vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/dashboard-strategy-stdio.test.ts tests/e2e/content-production-stdio.test.ts tests/e2e/publishing-effect-stdio.test.ts tests/e2e/npm-package.test.ts tests/e2e/data-analytics-documentation.test.ts
 ```
 
-运行 smoke 前必须构建最新代码。七套 stdio 验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client，另有 README/smoke 文档契约，共 **19 个 smoke cases**：
+运行 smoke 前必须构建最新代码。七套 stdio 验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client，另有 npm/npx 打包验收和 README/smoke 文档契约，共 **20 个 smoke cases**：
 
 - 原套件覆盖营销链、幂等、血缘、能力健康、输入边界、原始 malformed JSON、协议专用 stdout、启动失败和优雅关闭。
 - 数据研究套件启动本地 HTTP fixture 与真 Chromium，完成计划、CSV/XLSX 与质量资产、env-ref 认证临时 API、内容链接、研究权限与限域抓取、竞品确认/Diff、证据读取，并重启验证 plan/session/diff/artifact。loopback 仅在测试进程内显式 allowlist，测试凭据仅通过 env reference 使用。
@@ -476,6 +517,7 @@ vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e
 - 看板策略套件使用真实 CSV、外部分析 MCP、loopback Chromium 竞对和本地 Playwright Chromium 读取五 SVG，验证双 artifact 分块/hash、下钻、建议数学、任务控制、版本/幂等与重启恢复；不 mock provider、browser 或 artifact。
 - 内容生产套件使用显式 allowlist 的 loopback 合法公开页面、真 Chromium、独立 benchmark/media stdio fixture commands 和临时 roots，覆盖两种 brief、三个资产版本、父版本派生、stale conflict、精确幂等重放不增加 provider 调用、32 KiB 多块 SHA-256 读取、公开工具重启恢复以及移除 provider/ffprobe 后的结构化缺口与 NOT_FOUND。测试另用真实 Playwright 解码 1080×1440 PNG，用可信 ffprobe 复核 1080×1920 H.264/AAC MP4 和 2,000 ms 时长（格式解析允许 **50 ms** 容差）；每份 artifact 至少两块，不 mock provider/browser、不跳过 ffprobe、不访问商业服务，并检查 provider/server 进程退出、协议专用 stdout 和无 shutdown stderr。
 - 发布效果套件通过独立 trusted publishing provider fixture 验证审批、到期排期、提交与 verify-first 恢复，并以真实文件和人工证据核对效果公式、unknown、血缘及重启恢复；不访问商业平台，也不把 fixture 当作真实平台授权或成功证明。
+- npm 打包套件在仓库外临时目录执行真实 `npm pack`，检查 tarball 的 bin、shebang、可执行权限、迁移和文件白名单，再由官方 MCP stdio client 从空 cwd 启动 `npx --yes --package <tarball> marketing-agent-mcp`，验证 71 个工具、全部迁移、协议专用 stdout、优雅关闭和无遗留进程；不会调用公共 registry 查询或发布本包。
 
 `npm test` 也包含这些 e2e 文件，因此同样要求最新 `dist`、可用 Chromium 以及上述测试 ffmpeg/ffprobe。
 

@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { AnalysisService } from "./application/analysis-service.js";
