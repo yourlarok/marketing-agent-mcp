@@ -23,6 +23,19 @@ function packagedProcess(transport: StdioClientTransport): ChildProcess {
   return child as ChildProcess;
 }
 
+async function runtimeProcessPids(runtimeRoot: string): Promise<number[]> {
+  const { stdout } = await execFileAsync("ps", ["-eo", "pid=,args="], {
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return stdout.split("\n").flatMap((line) => {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    const pid = Number(match?.[1]);
+    return pid !== process.pid && match?.[2]?.includes(`${runtimeRoot}/`) ? [pid] : [];
+  });
+}
+
 describe("npm package and npx acceptance", () => {
   let tempDir: string | undefined;
   let client: Client | undefined;
@@ -158,6 +171,7 @@ describe("npm package and npx acceptance", () => {
     expect(childPid).not.toBeNull();
     const tools = await client.listTools();
     expect(tools.tools).toHaveLength(71);
+    expect(await runtimeProcessPids(tempDir)).not.toEqual([]);
     await client.close();
     client = undefined;
     await expect(exited).resolves.toEqual({ code: 0, signal: null });
@@ -167,7 +181,23 @@ describe("npm package and npx acceptance", () => {
     );
     expect(protocolMessages.length).toBeGreaterThan(0);
     expect(protocolMessages.every((message) => message.jsonrpc === "2.0")).toBe(true);
-    expect(() => process.kill(childPid as number, 0)).toThrow();
-    expect(await readFile(join(dataDir, "marketing.db"))).toBeDefined();
+    expect(() => process.kill(childPid as number, 0)).toThrowError(
+      expect.objectContaining({ code: "ESRCH" }),
+    );
+    await expect.poll(() => runtimeProcessPids(tempDir), {
+      timeout: 5_000,
+      interval: 100,
+    }).toEqual([]);
+
+    const { DatabaseSync } = await import("node:sqlite");
+    const database = new DatabaseSync(join(dataDir, "marketing.db"), { readOnly: true });
+    try {
+      const versions = database.prepare(
+        "SELECT version FROM schema_migrations ORDER BY version",
+      ).all() as Array<{ version: number }>;
+      expect(versions.map(({ version }) => version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    } finally {
+      database.close();
+    }
   }, 120_000);
 });
