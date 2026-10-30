@@ -231,6 +231,57 @@ describe("trusted publishing stdio MCP provider", () => {
     }
   }, 10_000);
 
+  it("coordinates concurrent real verifies and submit deduplication without lost persistent state", async () => {
+    const input = request();
+    await currentProvider.submit(input);
+    const verifyRequest = {
+      operationKey: input.operationKey,
+      inputHash: computePublishingSubmitInputHash(input),
+      channel: input.channel,
+      accountId: input.accountId,
+    };
+    const verified = await Promise.all(Array.from(
+      { length: 24 },
+      () => currentProvider.verify(verifyRequest),
+    ));
+    expect(verified).toHaveLength(24);
+    for (const result of verified) {
+      expect(result).toMatchObject({ status: "verified", operationKey: input.operationKey });
+    }
+
+    const concurrentInputs = Array.from({ length: 8 }, (_, index) => request({
+      operationKey: `publish:v1:${createHash("sha256").update(`concurrent-${index}`).digest("hex")}`,
+      publicationId: `publication-concurrent-${index}`,
+    }));
+    const accepted = await Promise.all(concurrentInputs.map((concurrentInput) =>
+      currentProvider.submit(concurrentInput)
+    ));
+    expect(accepted.map((result) => result.operationKey).sort())
+      .toEqual(concurrentInputs.map((concurrentInput) => concurrentInput.operationKey).sort());
+    const replayed = await Promise.all(concurrentInputs.map((concurrentInput) =>
+      currentProvider.submit(concurrentInput)
+    ));
+    expect(replayed.map((result) => result.externalPublicationId))
+      .toEqual(accepted.map((result) => result.externalPublicationId));
+
+    const persisted = JSON.parse(await readFile(state, "utf8")) as {
+      submissions: Record<string, { status: string; inputHash: string }>;
+    };
+    expect(Object.keys(persisted.submissions)).toHaveLength(concurrentInputs.length + 1);
+    expect(persisted.submissions[input.operationKey]).toMatchObject({ status: "verified" });
+    for (const concurrentInput of concurrentInputs) {
+      expect(persisted.submissions[concurrentInput.operationKey]).toMatchObject({
+        status: "accepted",
+        inputHash: computePublishingSubmitInputHash(concurrentInput),
+      });
+    }
+    const calls = (await readFile(capture, "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as { tool: string; input: { operationKey: string } });
+    expect(calls.filter((call) => call.tool === "verify" && call.input.operationKey === input.operationKey))
+      .toHaveLength(24);
+    expect(calls.filter((call) => call.tool === "submit")).toHaveLength(concurrentInputs.length * 2 + 1);
+  }, 25_000);
+
   it("maps only fixed safe publishing capability details", async () => {
     try {
       await new McpPublishingProvider({}).submit(request());

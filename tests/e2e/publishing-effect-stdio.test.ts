@@ -447,7 +447,9 @@ describe("built publishing and effect stdio acceptance", () => {
     expect((await publishingCalls()).map((entry) => entry.tool)).toEqual(["submit"]);
 
     let retried: Publication | undefined;
-    for (let attempt = 0; attempt < 5 && !retried; attempt += 1) {
+    let lastStatus = unknown.status;
+    const retryDeadline = Date.now() + 10_000;
+    for (let attempt = 0; attempt < 40 && !retried && Date.now() < retryDeadline; attempt += 1) {
       const current = await getPublication(client, unknown.id);
       const response = await client.callTool({
         name: "publication_retry",
@@ -458,11 +460,20 @@ describe("built publishing and effect stdio acceptance", () => {
       });
       if (response.isError) {
         expect(JSON.stringify(response)).toContain("Resource conflict");
-        continue;
+      } else {
+        const outcome = payload(response) as Publication;
+        lastStatus = outcome.status;
+        if (outcome.status === "verified") {
+          retried = outcome;
+        } else {
+          expect(["unknown", "submitted"], `Unexpected retry status: ${outcome.status}`)
+            .toContain(outcome.status);
+          await delay(50);
+        }
       }
-      retried = payload(response) as Publication;
+      expect((await publishingCalls()).filter((entry) => entry.tool === "submit")).toHaveLength(1);
     }
-    expect(retried).toBeDefined();
+    expect(retried, `Publication did not verify before retry timeout; last status: ${lastStatus}`).toBeDefined();
     const recovered = retried!;
     expect(recovered).toMatchObject({
       status: "verified", operationKey: unknown.operationKey,

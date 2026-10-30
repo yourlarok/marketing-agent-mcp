@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { appendFile, readFile, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -42,9 +42,79 @@ async function loadState() {
   }
 }
 
+const STATE_LOCK_STALE_MS = 30_000;
+const STATE_LOCK_TIMEOUT_MS = 10_000;
+
+async function acquireStateLock(statePath) {
+  const lockPath = `${statePath}.lock`;
+  const ownerPath = `${lockPath}/owner`;
+  const token = randomUUID();
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      await mkdir(lockPath);
+      try {
+        await writeFile(ownerPath, token, { flag: "wx" });
+      } catch (error) {
+        await rm(lockPath, { recursive: true, force: true });
+        throw error;
+      }
+      return async () => {
+        try {
+          if (await readFile(ownerPath, "utf8") !== token) return;
+          const releasePath = `${lockPath}.release.${process.pid}.${token}`;
+          await rename(lockPath, releasePath);
+          await rm(releasePath, { recursive: true, force: true });
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    if (Date.now() - startedAt > STATE_LOCK_TIMEOUT_MS) {
+      throw new Error("Timed out waiting for publishing fixture state lock");
+    }
+    try {
+      const lockStat = await stat(lockPath);
+      if (Date.now() - lockStat.mtimeMs > STATE_LOCK_STALE_MS) {
+        const stalePath = `${lockPath}.stale.${process.pid}.${randomUUID()}`;
+        try {
+          await rename(lockPath, stalePath);
+          await rm(stalePath, { recursive: true, force: true });
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    await delay(5);
+  }
+}
+
 async function saveState(state) {
-  if (process.env.PUBLISHING_FIXTURE_STATE) {
-    await writeFile(process.env.PUBLISHING_FIXTURE_STATE, JSON.stringify(canonical(state)), "utf8");
+  const statePath = process.env.PUBLISHING_FIXTURE_STATE;
+  const temporaryPath = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, JSON.stringify(canonical(state)), { flag: "wx" });
+    await rename(temporaryPath, statePath);
+  } finally {
+    await rm(temporaryPath, { force: true });
+  }
+}
+
+async function withState(mutator) {
+  const statePath = process.env.PUBLISHING_FIXTURE_STATE;
+  if (!statePath) return (await mutator(memoryState)).value;
+  const release = await acquireStateLock(statePath);
+  try {
+    const state = await loadState();
+    const outcome = await mutator(state);
+    if (outcome.changed) await saveState(state);
+    return outcome.value;
+  } finally {
+    await release();
   }
 }
 
@@ -97,42 +167,53 @@ server.registerTool("submit", {
 }, async (input) => {
   await capture("submit", input);
   const hash = inputHash(input);
-  const state = await loadState();
-  const existing = state.submissions[input.operationKey];
-  if (existing) {
-    if (existing.inputHash !== hash) {
-      return { structuredContent: {
-        ...baseResult(input, hash, "failed"),
-        failure: { code: "operation_conflict", message: "Operation key already has a different input hash", retryable: false },
-      } };
+  const outcome = await withState((state) => {
+    const existing = state.submissions[input.operationKey];
+    if (existing) {
+      return {
+        changed: false,
+        value: existing.inputHash === hash
+          ? { kind: "existing", externalPublicationId: existing.externalPublicationId }
+          : { kind: "conflict" },
+      };
     }
+    if (mode === "submit-failed") return { changed: false, value: { kind: "failed" } };
+    const bytes = Buffer.from(input.artifactBase64, "base64");
+    if (bytes.length !== input.artifactByteLength ||
+        createHash("sha256").update(bytes).digest("hex") !== input.artifactHash) {
+      throw new Error("Fixture artifact descriptor mismatch");
+    }
+    const externalPublicationId = `fixture-${createHash("sha256").update(input.operationKey).digest("hex").slice(0, 16)}`;
+    state.submissions[input.operationKey] = {
+      inputHash: hash,
+      channel: input.channel,
+      accountId: input.accountId,
+      externalPublicationId,
+      status: "accepted",
+    };
+    return { changed: true, value: { kind: "accepted", externalPublicationId } };
+  });
+  if (outcome.kind === "conflict") {
+    return { structuredContent: {
+      ...baseResult(input, hash, "failed"),
+      failure: { code: "operation_conflict", message: "Operation key already has a different input hash", retryable: false },
+    } };
+  }
+  if (outcome.kind === "existing") {
     return { structuredContent: {
       ...baseResult(input, hash, "accepted"),
       receipt: receiptFor(input.operationKey, "accepted"),
-      externalPublicationId: existing.externalPublicationId,
+      externalPublicationId: outcome.externalPublicationId,
     } };
   }
-  if (mode === "submit-failed") {
+  if (outcome.kind === "failed") {
     return { structuredContent: {
       ...baseResult(input, hash, "failed"),
       receipt: receiptFor(input.operationKey, "failed"),
       failure: { code: "fixture_rejected", message: "Independent fixture rejected the submission", retryable: true },
     } };
   }
-  const bytes = Buffer.from(input.artifactBase64, "base64");
-  if (bytes.length !== input.artifactByteLength ||
-      createHash("sha256").update(bytes).digest("hex") !== input.artifactHash) {
-    throw new Error("Fixture artifact descriptor mismatch");
-  }
-  const externalPublicationId = `fixture-${createHash("sha256").update(input.operationKey).digest("hex").slice(0, 16)}`;
-  state.submissions[input.operationKey] = {
-    inputHash: hash,
-    channel: input.channel,
-    accountId: input.accountId,
-    externalPublicationId,
-    status: "accepted",
-  };
-  await saveState(state);
+  const externalPublicationId = outcome.externalPublicationId;
   if (mode === "accepted-timeout" || mode === "accepted-timeout-ignore-sigterm") {
     if (mode === "accepted-timeout-ignore-sigterm") process.on("SIGTERM", () => undefined);
     await delay(5_000);
@@ -169,38 +250,39 @@ server.registerTool("verify", {
   },
 }, async (input) => {
   await capture("verify", input);
-  const state = await loadState();
-  const existing = state.submissions[input.operationKey];
-  if (!existing || mode === "verify-not-found") {
-    return { structuredContent: baseResult(input, input.inputHash, "not_found") };
-  }
-  if (existing.inputHash !== input.inputHash || existing.channel !== input.channel || existing.accountId !== input.accountId) {
-    return { structuredContent: {
-      ...baseResult(input, input.inputHash, "failed"),
-      failure: { code: "operation_conflict", message: "Verification identity does not match the submission", retryable: false },
-    } };
-  }
-  if (mode === "verify-pending") {
-    return { structuredContent: {
-      ...baseResult(input, input.inputHash, "pending"),
-      receipt: receiptFor(input.operationKey, "pending"),
-    } };
-  }
-  if (mode === "verify-failed") {
-    return { structuredContent: {
-      ...baseResult(input, input.inputHash, "failed"),
-      receipt: receiptFor(input.operationKey, "failed"),
-      failure: { code: "fixture_delivery_failed", message: "Independent fixture delivery failed", retryable: false },
-    } };
-  }
-  existing.status = "verified";
-  await saveState(state);
-  return { structuredContent: {
-    ...baseResult(input, input.inputHash, "verified"),
-    receipt: receiptFor(input.operationKey, "verified"),
-    externalPublicationId: mode === "verify-invalid-external-id" ? ` ${existing.externalPublicationId}` : existing.externalPublicationId,
-    publishedAt: mode === "verify-invalid-published-at" ? "2026-02-30T12:00:00.000Z" : "2026-10-29T12:00:00.000Z",
-  } };
+  return withState((state) => {
+    const existing = state.submissions[input.operationKey];
+    if (!existing || mode === "verify-not-found") {
+      return { changed: false, value: { structuredContent: baseResult(input, input.inputHash, "not_found") } };
+    }
+    if (existing.inputHash !== input.inputHash || existing.channel !== input.channel || existing.accountId !== input.accountId) {
+      return { changed: false, value: { structuredContent: {
+        ...baseResult(input, input.inputHash, "failed"),
+        failure: { code: "operation_conflict", message: "Verification identity does not match the submission", retryable: false },
+      } } };
+    }
+    if (mode === "verify-pending") {
+      return { changed: false, value: { structuredContent: {
+        ...baseResult(input, input.inputHash, "pending"),
+        receipt: receiptFor(input.operationKey, "pending"),
+      } } };
+    }
+    if (mode === "verify-failed") {
+      return { changed: false, value: { structuredContent: {
+        ...baseResult(input, input.inputHash, "failed"),
+        receipt: receiptFor(input.operationKey, "failed"),
+        failure: { code: "fixture_delivery_failed", message: "Independent fixture delivery failed", retryable: false },
+      } } };
+    }
+    const changed = existing.status !== "verified";
+    existing.status = "verified";
+    return { changed, value: { structuredContent: {
+      ...baseResult(input, input.inputHash, "verified"),
+      receipt: receiptFor(input.operationKey, "verified"),
+      externalPublicationId: mode === "verify-invalid-external-id" ? ` ${existing.externalPublicationId}` : existing.externalPublicationId,
+      publishedAt: mode === "verify-invalid-published-at" ? "2026-02-30T12:00:00.000Z" : "2026-10-29T12:00:00.000Z",
+    } } };
+  });
 });
 
 await server.connect(new StdioServerTransport());
