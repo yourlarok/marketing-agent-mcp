@@ -167,4 +167,16 @@ describe("data analytics smoke and documentation contracts", () => {
     expect(readme).not.toContain("当前没有内容审批、自动排期、发布或生成资产效果复盘工具");
     expect(readme).not.toContain("当前不提供内容审批执行、自动排期、发布或生成资产效果复盘");
   });
+
+  it("documents guided basic, on-demand professional, and authorized publishing setup", async () => {
+    const readme = await readFile(join(projectRoot, "README.md"), "utf8");
+    for (const required of [
+      "Node.js 22.23.1+", "项目依赖", "Playwright Chromium", "ffprobe 只在视频工作需要时",
+      "先调用 `marketing_capability_list`", "征得用户同意", "不要预先要求全部专业工具",
+      "不要自动安装未经用户审阅的工具", "小红书（`xhs`）还是视频号（`channels`）",
+      "非秘密 `accountId`", "账户授权/权限", "可信 publishing provider/部署环境",
+      "密码、token、cookie、命令或环境值", "provider 已配置不等于账户已授权或真实平台成功",
+      "manual-assisted 交付始终是明确 fallback",
+    ]) expect(readme, `README must disclose guided setup contract ${required}`).toContain(required);
+  });
 });

@@ -21,6 +21,14 @@ Linux 若缺少 Chromium 系统依赖，可按 Playwright 官方提示安装对�
 
 启动、构建和测试均应在项目根目录执行。server 入口是构建后的 `dist/index.js`，不是源码或 `node_modules`。
 
+## Agent 引导式设置与授权边界
+
+首次运行时，Agent 只问一个简明的基础环境准备问题：“Node.js 22.23.1+、项目依赖和 Playwright Chromium 是否就绪？”ffprobe 只在视频工作需要时引入，不作为首次通用检查项。
+
+进入任何依赖特定能力的分支前，先调用 `marketing_capability_list` 检查真实能力、配置、fallback 和限制。只有确实需要专业工具时，才在征得用户同意后给出该工具的精确可信部署配置；不要预先要求全部专业工具，不要自动安装未经用户审阅的工具。Agent 不应伪造环境检测，也不应把 capability 声明显示成安装或健康证明。
+
+排期前，Agent 必须询问目标是小红书（`xhs`）还是视频号（`channels`），取得非秘密 `accountId`，并要求账户授权/权限已在可信 publishing provider/部署环境中配置。不得通过公开 MCP 输入或普通日志请求密码、token、cookie、命令或环境值。排期本身不验证账户权限；provider 已配置不等于账户已授权或真实平台成功。无法使用或未配置可信 provider 时，manual-assisted 交付始终是明确 fallback，但它不是自动发布。
+
 ## 数据、导入与证据目录
 
 | 环境变量 | 用途与要求 |
@@ -456,10 +464,10 @@ npm run smoke
 `npm run smoke` 等价于：
 
 ```bash
-vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/dashboard-strategy-stdio.test.ts tests/e2e/content-production-stdio.test.ts tests/e2e/data-analytics-documentation.test.ts
+vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e2e/analysis-stdio.test.ts tests/e2e/public-data-analytics-stdio.test.ts tests/e2e/dashboard-strategy-stdio.test.ts tests/e2e/content-production-stdio.test.ts tests/e2e/publishing-effect-stdio.test.ts tests/e2e/data-analytics-documentation.test.ts
 ```
 
-运行 smoke 前必须构建最新代码。六套 stdio 验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client，另有 README/smoke 文档契约，共 **14 个 smoke cases**：
+运行 smoke 前必须构建最新代码。七套 stdio 验收都会 spawn 真正的 `dist/index.js` 并使用官方 MCP stdio client，另有 README/smoke 文档契约，共 **19 个 smoke cases**：
 
 - 原套件覆盖营销链、幂等、血缘、能力健康、输入边界、原始 malformed JSON、协议专用 stdout、启动失败和优雅关闭。
 - 数据研究套件启动本地 HTTP fixture 与真 Chromium，完成计划、CSV/XLSX 与质量资产、env-ref 认证临时 API、内容链接、研究权限与限域抓取、竞品确认/Diff、证据读取，并重启验证 plan/session/diff/artifact。loopback 仅在测试进程内显式 allowlist，测试凭据仅通过 env reference 使用。
@@ -467,6 +475,7 @@ vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e
 - SQLite/外部分析套件使用临时真实 SQLite 和独立分析 MCP fixture，核对 discover、结构化 snapshot/ingest、engagement/conversion 数值、Wilson 适用性与区间、trend/funnel/anomaly 实质结果、input hash/证据 provenance、fork、重启恢复以及未配置 capability gap；每例使用独立目录和子进程环境，并关闭 server/provider。
 - 看板策略套件使用真实 CSV、外部分析 MCP、loopback Chromium 竞对和本地 Playwright Chromium 读取五 SVG，验证双 artifact 分块/hash、下钻、建议数学、任务控制、版本/幂等与重启恢复；不 mock provider、browser 或 artifact。
 - 内容生产套件使用显式 allowlist 的 loopback 合法公开页面、真 Chromium、独立 benchmark/media stdio fixture commands 和临时 roots，覆盖两种 brief、三个资产版本、父版本派生、stale conflict、精确幂等重放不增加 provider 调用、32 KiB 多块 SHA-256 读取、公开工具重启恢复以及移除 provider/ffprobe 后的结构化缺口与 NOT_FOUND。测试另用真实 Playwright 解码 1080×1440 PNG，用可信 ffprobe 复核 1080×1920 H.264/AAC MP4 和 2,000 ms 时长（格式解析允许 **50 ms** 容差）；每份 artifact 至少两块，不 mock provider/browser、不跳过 ffprobe、不访问商业服务，并检查 provider/server 进程退出、协议专用 stdout 和无 shutdown stderr。
+- 发布效果套件通过独立 trusted publishing provider fixture 验证审批、到期排期、提交与 verify-first 恢复，并以真实文件和人工证据核对效果公式、unknown、血缘及重启恢复；不访问商业平台，也不把 fixture 当作真实平台授权或成功证明。
 
 `npm test` 也包含这些 e2e 文件，因此同样要求最新 `dist`、可用 Chromium 以及上述测试 ffmpeg/ffprobe。
 

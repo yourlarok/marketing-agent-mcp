@@ -428,6 +428,21 @@ describe("publishing and effect MCP contracts", () => {
       /submission.*not.*publication/i, /never claim.*unverified/i, /manual.*not.*automatic/i,
       /no causal/i,
     ]) expect(instructions).toMatch(pattern);
+    for (const pattern of [
+      /before scheduling/i, /Xiaohongshu \(xhs\) or Channels \(channels\)/i,
+      /non-secret accountId/i, /account authorization.*trusted publishing provider.*deployment environment/i,
+      /never request passwords, tokens, cookies, commands, or environment values.*public MCP input.*ordinary logs/i,
+      /provider configuration.*not proof.*account authorization.*real-platform success/i,
+      /manual-assisted delivery.*fallback/i,
+    ]) expect(instructions).toMatch(pattern);
+    for (const pattern of [
+      /xhs.*channels/i, /non-secret accountId/i, /account authorization/i,
+      /provider configuration.*not proof.*account authorization/i, /manual-assisted.*fallback/i,
+    ]) expect(publishingText).toMatch(pattern);
+
+    const schedule = (await client.listTools()).tools.find((tool) => tool.name === "schedule_create")!;
+    expect(schedule.description).toMatch(/non-secret accountId/i);
+    expect(schedule.description).toMatch(/does not (?:itself )?verify account permission/i);
   });
 
   it("fails closed on installed capability mismatches", () => {

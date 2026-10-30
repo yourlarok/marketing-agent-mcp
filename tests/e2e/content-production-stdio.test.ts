@@ -884,7 +884,7 @@ describe("built content production stdio acceptance", () => {
       });
     }
     expect(capabilities.find((capability) => capability.id === "content.reverse")).toMatchObject({
-      configuration: ["MARKETING_BENCHMARK_MCP_COMMAND and MARKETING_BENCHMARK_MCP_ARGS in the trusted deployment environment", expect.any(String), expect.any(String)],
+      configuration: [expect.stringMatching(/consent/i), "MARKETING_BENCHMARK_MCP_COMMAND and MARKETING_BENCHMARK_MCP_ARGS in the trusted deployment environment", expect.any(String), expect.any(String)],
     });
     expect(capabilities.find((capability) => capability.id === "media.professional")?.configuration).toContain(
       "MARKETING_MEDIA_MCP_COMMAND and MARKETING_MEDIA_MCP_ARGS in the trusted deployment environment",

@@ -74,7 +74,7 @@ export function registerPublishingTools(server: McpServer, publishing: Publishin
   server.registerTool(
     "schedule_create",
     {
-      description: "Create an exact-approval Schedule and pending Publication without submitting it",
+      description: "Create an exact-approval Schedule for xhs or channels with a non-secret accountId; scheduling does not itself verify account permission or submit the pending Publication",
       inputSchema: scheduleCreateToolSchema,
     },
     async (arguments_) => {

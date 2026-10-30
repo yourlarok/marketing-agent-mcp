@@ -76,6 +76,8 @@ export function createMcpServer(
       capabilities: { tools: {} },
       instructions: [
         "For marketing requests, understand the objective first. Your own business data is optional; analysis can start without data.",
+        "On first run, ask one concise basic-environment readiness question: \"Are Node.js 22.23.1+, project dependencies, and Playwright Chromium ready?\" Introduce ffprobe only for video work.",
+        "Check marketing_capability_list before each capability-dependent branch. Only when a professional tool is needed, ask for user consent before giving its exact trusted-deployment configuration; do not require all tools up front and never auto-install unreviewed tools.",
         "Without owned data, plan public research rather than demanding a CSV. With public links, use the links branch; with files or an authorized API, use the corresponding ingestion branch.",
         "Use connector_sqlite_discover before ingest_sqlite for an authorized configured SQLite database. Use professional_analytics_compute only for controlled trend, funnel, or anomaly operations on verified imported evidence.",
         ...(dashboard ? [
@@ -88,7 +90,7 @@ export function createMcpServer(
           "Benchmark and content work must use persisted evidence. Video reverse analysis requires real persisted video frames and ASR transcripts; never claim human viewing. Author original expression in the host user's original language, bind factual statements to Finding references, and keep benchmark evidence and owned or authorized production source material in separate channels. PNG output requires actual Chromium decode and MP4 output requires actual ffprobe inspection. Read content artifacts as bounded base64 chunks. Internal channel profiles are disclosed for internal validation only, not publishing or platform-delivery guarantees. Do not use invented metrics or report unavailable provider success. A validated asset is not approved, scheduled, or published.",
         ] : []),
         ...(publishing || effect ? [
-          "Submission is not publication: never claim unverified delivery or success. Verify uncertain outcomes before retrying. Manual-assisted delivery and manual_evidence completion are not automatic publication. Effect reviews are descriptive and make no causal claims.",
+          "Before scheduling, ask whether the destination is Xiaohongshu (xhs) or Channels (channels), obtain a non-secret accountId, and require account authorization/permission to be configured in the trusted publishing provider/deployment environment. Never request passwords, tokens, cookies, commands, or environment values through public MCP input or ordinary logs. Provider configuration is not proof of account authorization or real-platform success. Keep manual-assisted delivery as the explicit fallback. Submission is not publication: never claim unverified delivery or success. Verify uncertain outcomes before retrying. Manual-assisted delivery and manual_evidence completion are not automatic publication. Effect reviews are descriptive and make no causal claims.",
         ] : []),
         "Ask at most one high-impact question that would change the branch, and allow the user to continue with the stated default.",
         "Call the high-level marketing_analysis_start tool first. Use marketing_capability_list to inspect declared capabilities, configuration, fallbacks, and limitations.",

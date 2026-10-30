@@ -233,6 +233,17 @@ describe("analysis MCP tools and initialization", () => {
     expect(instructions).toMatch(/not installed|not available|do not claim/i);
   });
 
+  it("guides first-run readiness and consented on-demand professional setup", () => {
+    const instructions = client.getInstructions()!;
+    expect(instructions).toMatch(/first run/i);
+    expect(instructions).toMatch(/Node\.js 22\.23\.1\+.*project dependencies.*Playwright Chromium/i);
+    expect(instructions).toMatch(/ffprobe only (?:for|when).*video/i);
+    expect(instructions).toMatch(/marketing_capability_list.*before.*capability-dependent branch/i);
+    expect(instructions).toMatch(/professional tool.*consent.*exact.*trusted.*configuration/i);
+    expect(instructions).toMatch(/not (?:demand|require).*all tools.*up front/i);
+    expect(instructions).toMatch(/not auto-install|never auto-install/i);
+  });
+
   it("registers exactly the prior and public analysis tools with strict schemas", async () => {
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual(
