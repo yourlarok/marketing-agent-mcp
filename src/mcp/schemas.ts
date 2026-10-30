@@ -265,6 +265,11 @@ const lineageEntityTypeSchema = z.enum([
   "benchmark_analysis",
   "content_brief",
   "asset_version",
+  "approval",
+  "schedule",
+  "publication",
+  "metric_snapshot",
+  "effect_review",
 ]);
 export const lineageGetInputSchema = z.strictObject({
   entityType: lineageEntityTypeSchema,
@@ -940,6 +945,123 @@ export const contentArtifactGetInputSchema = z.strictObject({
   length: positiveIntegerSchema.max(32 * 1024).optional(),
 });
 
+const boundedTimeZoneSchema = z.string().trim().min(1).max(64);
+const deliveryModeSchema = z.enum(["automatic", "manual_assisted"]);
+const publicationOperationFields = {
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+};
+const publicationReferenceIdsSchema = z.array(idSchema).min(1).max(100)
+  .refine((ids) => new Set(ids).size === ids.length, {
+    message: "Evidence IDs must not contain duplicates",
+  });
+
+export const approvalRecordInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  assetVersionId: idSchema,
+  expectedAssetVersion: positiveIntegerSchema,
+  decision: z.enum(["approved", "rejected"]),
+  comment: z.string().trim().min(1).max(4_096),
+  ...commandContextInput,
+});
+export const approvalGetInputSchema = z.strictObject({ id: idSchema, workspaceId: idSchema });
+export const scheduleCreateInputSchema = z.strictObject({
+  id: idSchema,
+  publicationId: idSchema,
+  workspaceId: idSchema,
+  assetVersionId: idSchema,
+  expectedAssetVersion: positiveIntegerSchema,
+  approvalId: idSchema,
+  channel: z.enum(["xhs", "channels"]),
+  accountId: idSchema,
+  scheduledFor: utcTimestampSchema,
+  timeZone: boundedTimeZoneSchema,
+  deliveryMode: deliveryModeSchema,
+  ...commandContextInput,
+});
+export const scheduleRescheduleInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  scheduledFor: utcTimestampSchema,
+  timeZone: boundedTimeZoneSchema,
+  ...commandContextInput,
+});
+export const scheduleCancelInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  expectedVersion: positiveIntegerSchema,
+  ...commandContextInput,
+});
+export const scheduleGetInputSchema = z.strictObject({ id: idSchema, workspaceId: idSchema });
+export const publicationOperationInputSchema = z.strictObject({
+  ...publicationOperationFields,
+  ...commandContextInput,
+});
+export const publicationGetInputSchema = z.strictObject({ id: idSchema, workspaceId: idSchema });
+export const publicationManualCompleteInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  publicationId: idSchema,
+  expectedPublicationVersion: positiveIntegerSchema,
+  evidenceIds: publicationReferenceIdsSchema,
+  externalPublicationId: idSchema,
+  publishedAt: utcTimestampSchema,
+  ...commandContextInput,
+});
+export const deliveryPackageGetInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  offset: nonNegativeIntegerSchema.optional(),
+  length: positiveIntegerSchema.max(32_768).optional(),
+});
+
+const effectMetricSchema = z.enum([
+  "impressions", "interactions", "followers_gained", "profile_visits",
+  "leads", "consultations", "trials", "purchases",
+]);
+const metricObservationInputSchema = z.strictObject({
+  metric: effectMetricSchema,
+  evidenceIds: publicationReferenceIdsSchema,
+  value: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+});
+export const effectMetricSnapshotImportInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  publicationId: idSchema,
+  expectedPublicationVersion: positiveIntegerSchema,
+  windowStart: utcTimestampSchema,
+  windowEnd: utcTimestampSchema,
+  observedAt: utcTimestampSchema,
+  observations: z.array(metricObservationInputSchema).min(1).max(8)
+    .refine((observations) => new Set(observations.map((observation) => observation.metric)).size === observations.length, {
+      message: "Metric observations must not contain duplicates",
+    }),
+  ...commandContextInput,
+});
+export const effectMetricSnapshotGetInputSchema = z.strictObject({ id: idSchema, workspaceId: idSchema });
+const effectPublicationRefInputSchema = z.strictObject({ id: idSchema, version: positiveIntegerSchema });
+export const effectReviewCreateInputSchema = z.strictObject({
+  id: idSchema,
+  workspaceId: idSchema,
+  publicationRefs: z.array(effectPublicationRefInputSchema).min(1).max(10)
+    .refine((references) => new Set(references.map((reference) => reference.id)).size === references.length, {
+      message: "Publication references must not contain duplicates",
+    }),
+  metricSnapshotIds: z.array(idSchema).min(1).max(10)
+    .refine((ids) => new Set(ids).size === ids.length, { message: "Snapshot IDs must not contain duplicates" }),
+  baselineMetricSnapshotIds: z.array(idSchema).max(10)
+    .refine((ids) => new Set(ids).size === ids.length, { message: "Baseline IDs must not contain duplicates" })
+    .optional(),
+  benchmarkEvidenceIds: z.array(idSchema).max(100)
+    .refine((ids) => new Set(ids).size === ids.length, { message: "Benchmark IDs must not contain duplicates" })
+    .optional(),
+  ...commandContextInput,
+});
+export const effectReviewGetInputSchema = z.strictObject({ id: idSchema, workspaceId: idSchema });
+
 const rawStringSchema = z.string();
 const rawNumberSchema = z.number();
 const rawCommandContextInput = {
@@ -1587,3 +1709,94 @@ export const contentArtifactGetToolSchema = z.strictObject({
   offset: rawNumberSchema.optional(),
   length: rawNumberSchema.optional(),
 });
+
+export const approvalRecordToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  assetVersionId: rawStringSchema,
+  expectedAssetVersion: rawNumberSchema,
+  decision: rawStringSchema,
+  comment: rawStringSchema,
+  ...rawCommandContextInput,
+});
+export const approvalGetToolSchema = z.strictObject({ id: rawStringSchema, workspaceId: rawStringSchema });
+export const scheduleCreateToolSchema = z.strictObject({
+  id: rawStringSchema,
+  publicationId: rawStringSchema,
+  workspaceId: rawStringSchema,
+  assetVersionId: rawStringSchema,
+  expectedAssetVersion: rawNumberSchema,
+  approvalId: rawStringSchema,
+  channel: rawStringSchema,
+  accountId: rawStringSchema,
+  scheduledFor: rawStringSchema,
+  timeZone: rawStringSchema,
+  deliveryMode: rawStringSchema,
+  ...rawCommandContextInput,
+});
+export const scheduleRescheduleToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  scheduledFor: rawStringSchema,
+  timeZone: rawStringSchema,
+  ...rawCommandContextInput,
+});
+export const scheduleCancelToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  ...rawCommandContextInput,
+});
+export const scheduleGetToolSchema = z.strictObject({ id: rawStringSchema, workspaceId: rawStringSchema });
+export const publicationOperationToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  expectedVersion: rawNumberSchema,
+  ...rawCommandContextInput,
+});
+export const publicationGetToolSchema = z.strictObject({ id: rawStringSchema, workspaceId: rawStringSchema });
+export const publicationManualCompleteToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  publicationId: rawStringSchema,
+  expectedPublicationVersion: rawNumberSchema,
+  evidenceIds: z.array(rawStringSchema),
+  externalPublicationId: rawStringSchema,
+  publishedAt: rawStringSchema,
+  ...rawCommandContextInput,
+});
+export const deliveryPackageGetToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  offset: rawNumberSchema.optional(),
+  length: rawNumberSchema.optional(),
+});
+const rawMetricObservationSchema = z.strictObject({
+  metric: rawStringSchema,
+  evidenceIds: z.array(rawStringSchema),
+  value: rawNumberSchema,
+});
+export const effectMetricSnapshotImportToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  publicationId: rawStringSchema,
+  expectedPublicationVersion: rawNumberSchema,
+  windowStart: rawStringSchema,
+  windowEnd: rawStringSchema,
+  observedAt: rawStringSchema,
+  observations: z.array(rawMetricObservationSchema),
+  ...rawCommandContextInput,
+});
+export const effectMetricSnapshotGetToolSchema = z.strictObject({ id: rawStringSchema, workspaceId: rawStringSchema });
+const rawEffectPublicationRefSchema = z.strictObject({ id: rawStringSchema, version: rawNumberSchema });
+export const effectReviewCreateToolSchema = z.strictObject({
+  id: rawStringSchema,
+  workspaceId: rawStringSchema,
+  publicationRefs: z.array(rawEffectPublicationRefSchema),
+  metricSnapshotIds: z.array(rawStringSchema),
+  baselineMetricSnapshotIds: z.array(rawStringSchema).optional(),
+  benchmarkEvidenceIds: z.array(rawStringSchema).optional(),
+  ...rawCommandContextInput,
+});
+export const effectReviewGetToolSchema = z.strictObject({ id: rawStringSchema, workspaceId: rawStringSchema });

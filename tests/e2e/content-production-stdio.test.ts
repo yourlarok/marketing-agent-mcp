@@ -480,7 +480,11 @@ describe("built content production stdio acceptance", () => {
       "benchmark_reverse_create", "benchmark_reverse_get", "content_brief_create", "content_brief_get",
       "content_asset_generate", "content_asset_derive", "content_asset_get", "content_artifact_get",
     ]));
-    expect(tools.map((tool) => tool.name).filter((name) => /approve|approval|schedule|publish|effect.review/i.test(name))).toEqual([]);
+    expect(tools.map((tool) => tool.name).filter((name) => /approve|approval|schedule|publish|effect.review/i.test(name)))
+      .toEqual(expect.arrayContaining([
+        "approval_record", "approval_get", "schedule_create", "schedule_reschedule", "schedule_cancel",
+        "schedule_get", "effect_review_create", "effect_review_get",
+      ]));
 
     await call(client, "workspace_create", {
       id: workspaceId,

@@ -305,7 +305,10 @@ describe("built dashboard and strategy stdio acceptance", () => {
       "strategy_recommendation_generate", "strategy_task_supplement", "strategy_task_update",
       "strategy_task_reject", "strategy_task_reorder", "strategy_task_get", "strategy_task_list",
     ]));
-    expect(tools.map((tool) => tool.name).filter((name) => /approve|approval|schedule|publish|produce/i.test(name))).toEqual([]);
+    expect(tools.map((tool) => tool.name).filter((name) => /approve|approval|schedule|publish|produce/i.test(name)))
+      .toEqual(expect.arrayContaining([
+        "approval_record", "approval_get", "schedule_create", "schedule_reschedule", "schedule_cancel", "schedule_get",
+      ]));
 
     await call(client, "workspace_create", {
       id: workspaceId,

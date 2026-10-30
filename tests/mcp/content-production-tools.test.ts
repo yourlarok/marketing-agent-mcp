@@ -10,8 +10,10 @@ import type { CommandContext } from "../../src/application/commands.js";
 import { ContentProductionService } from "../../src/application/content-production-service.js";
 import { DashboardService } from "../../src/application/dashboard-service.js";
 import { DataResearchService } from "../../src/application/data-research-service.js";
+import { EffectService } from "../../src/application/effect-service.js";
 import { MarketingService } from "../../src/application/marketing-service.js";
 import type { Store } from "../../src/application/ports.js";
+import { PublishingService } from "../../src/application/publishing-service.js";
 import { StrategyService } from "../../src/application/strategy-service.js";
 import {
   CHANNEL_PROFILES,
@@ -65,6 +67,10 @@ const existingToolNames = [
   "research_session_run", "source_register", "strategy_recommendation_generate",
   "strategy_task_get", "strategy_task_list", "strategy_task_reject", "strategy_task_reorder",
   "strategy_task_supplement", "strategy_task_update", "task_create", "task_transition", "workspace_create",
+  "approval_record", "approval_get", "schedule_create", "schedule_reschedule", "schedule_cancel",
+  "schedule_get", "publication_submit", "publication_verify", "publication_retry", "publication_get",
+  "publication_manual_handoff", "publication_manual_complete", "delivery_package_get",
+  "effect_metric_snapshot_import", "effect_metric_snapshot_get", "effect_review_create", "effect_review_get",
 ];
 const writeToolNames = [
   "benchmark_reverse_create", "content_asset_derive", "content_asset_generate", "content_brief_create",
@@ -283,7 +289,10 @@ describe("benchmark and content production MCP contracts", () => {
         assetRequirements: [], acceptanceCriteria: ["A user reviews the draft"], state: "ready",
       });
     });
-    server = createMcpServer(marketing, dataResearch, analysis, {}, dashboard, strategy, benchmark, contentProduction);
+    server = createMcpServer(
+      marketing, dataResearch, analysis, {}, dashboard, strategy, benchmark, contentProduction,
+      new PublishingService(store, clock, ids, artifacts), new EffectService(store, clock, ids),
+    );
     client = new Client({ name: "content-test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
@@ -318,10 +327,10 @@ describe("benchmark and content production MCP contracts", () => {
     return call<ContentBrief>("content_brief_create", briefArguments(channel));
   }
 
-  it("registers exactly 54 tools with strict raw discovery schemas and four write contexts", async () => {
+  it("registers exactly 71 tools with strict raw discovery schemas and four write contexts", async () => {
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([...existingToolNames, ...newToolNames].sort());
-    expect(tools).toHaveLength(54);
+    expect(tools).toHaveLength(71);
     const visit = (schema: unknown): void => {
       if (schema === null || typeof schema !== "object" || Array.isArray(schema)) return;
       const record = schema as Record<string, unknown>;
@@ -593,13 +602,14 @@ describe("benchmark and content production MCP contracts", () => {
     const absentContent = new ContentProductionService(store, clock, ids, artifacts);
     const absentServer = createMcpServer(
       marketing, dataResearch, analysis, {}, dashboard, strategy, absentBenchmark, absentContent,
+      new PublishingService(store, clock, ids, artifacts), new EffectService(store, clock, ids),
     );
     const absentClient = new Client({ name: "absent-provider-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     try {
       await absentServer.connect(serverTransport);
       await absentClient.connect(clientTransport);
-      expect((await absentClient.listTools()).tools).toHaveLength(54);
+      expect((await absentClient.listTools()).tools).toHaveLength(71);
       const response = await absentClient.callTool({ name: "marketing_capability_list", arguments: {} });
       const capabilities = JSON.parse((response.content[0] as { text: string }).text) as AnalysisCapability[];
       for (const id of ["content.reverse", "media.professional", "media.video_probe"]) {

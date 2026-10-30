@@ -149,4 +149,22 @@ describe("data analytics smoke and documentation contracts", () => {
     }
     expect(readme).not.toContain("不提供内容生成、逆向制作");
   });
+
+  it("documents all 17 publishing and effect tools and the 71-tool operational contract", async () => {
+    const readme = await readFile(join(projectRoot, "README.md"), "utf8");
+    for (const required of [
+      "approval_record", "approval_get", "schedule_create", "schedule_reschedule", "schedule_cancel",
+      "schedule_get", "publication_submit", "publication_verify", "publication_retry", "publication_get",
+      "publication_manual_handoff", "publication_manual_complete", "delivery_package_get",
+      "effect_metric_snapshot_import", "effect_metric_snapshot_get", "effect_review_create", "effect_review_get",
+      "MARKETING_PUBLISHING_MCP_COMMAND", "MARKETING_PUBLISHING_MCP_ARGS",
+      "MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST", "publish:v1:", "operationKey", "not_found",
+      "startup", "overdue", "SIGINT", "SIGTERM", "manual_evidence", "manual_assisted",
+      "not_published", "owned_operating", "owned_conversion", "interactionRate", "profileVisitRate",
+      "leadRate", "purchaseRate", "automaticVerifiedRate", "zero_denominator", "not_established",
+      "32,768", "64 KiB", "71", "17 个发布与效果工具",
+    ]) expect(readme, `README must disclose publishing/effect contract ${required}`).toContain(required);
+    expect(readme).not.toContain("当前没有内容审批、自动排期、发布或生成资产效果复盘工具");
+    expect(readme).not.toContain("当前不提供内容审批执行、自动排期、发布或生成资产效果复盘");
+  });
 });

@@ -33,6 +33,8 @@ Linux 若缺少 Chromium 系统依赖，可按 Playwright 官方提示安装对�
 | `MARKETING_MEDIA_MCP_COMMAND` / `MARKETING_MEDIA_MCP_ARGS` | 可选但生成/派生必需；受信任 stdio media provider 的固定 executable 与 JSON 字符串数组参数。 |
 | `MARKETING_MEDIA_MCP_ENV_ALLOWLIST` | 可选；媒体 provider 可接收的部署环境变量名逗号列表，不能由工具调用覆盖。 |
 | `MARKETING_FFPROBE_COMMAND` | Channels 验收必需；独立可信 ffprobe 的绝对 executable path。 |
+| `MARKETING_PUBLISHING_MCP_COMMAND` / `MARKETING_PUBLISHING_MCP_ARGS` | 可选但 automatic 发布必需；受信任 stdio publishing provider 的固定 executable 与 JSON 字符串数组参数。 |
+| `MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST` | 可选；publishing provider 可接收的部署环境变量名逗号列表，不能由工具调用覆盖。 |
 
 仅使用血缘工具时不需要 import/artifact root。import root 中的输入文件和 artifact root 中的证据应分别授权；不要因为导入目录可读就把证据目录暴露给其他用户。
 
@@ -341,7 +343,46 @@ server 根据 persisted brief 选择下列固定 profile。它们是内部输入
 
 `content_artifact_get` 的 `offset` / `length` 以原始字节计，`length` 默认且最大 **32 KiB（32,768 bytes）**，响应为当前块的 base64、`totalBytes` 和完整资产 `contentHash`。调用方逐块拼回后必须独立计算 SHA-256；不得把单块 hash 当作整文件 hash。使用同一 data/artifact roots 重启后，只需 `benchmark_reverse_get`、`content_brief_get`、`content_asset_get`、`lineage_get` 和 `content_artifact_get` 即可恢复分析、brief、全部资产版本、Task/Recommendation/Finding/Evidence/parent 血缘与每个 artifact，无需 SQL 或路径。
 
-provider 未配置、真实媒体缺失、decode/probe 失败或 hash 不符时返回结构化 capability gap；失败命令**不留下成功的 BenchmarkAnalysis/AssetVersion 版本、成功审计或幂等结果**，后续 get 为 NOT_FOUND。已通过内部验收也不等于人工审核、法律放行、平台官方验证、排期、发布或效果复盘；当前没有内容审批、自动排期、发布或生成资产效果复盘工具。
+provider 未配置、真实媒体缺失、decode/probe 失败或 hash 不符时返回结构化 capability gap；失败命令**不留下成功的 BenchmarkAnalysis/AssetVersion 版本、成功审计或幂等结果**，后续 get 为 NOT_FOUND。已通过内部验收不等于人工审核、法律放行、平台官方验证、排期、发布或效果复盘；这些后续步骤必须使用下列独立公开工具并取得相应验证。
+
+## 审批、排期、发布与效果复盘
+
+### 17 个发布与效果工具
+
+- `approval_record` / `approval_get`：记录和读取人工声明的审批。Approval 锁定精确 AssetVersion、版本和实际 artifact hash；派生版本必须重新审批，旧 Approval 不转移。
+- `schedule_create` / `schedule_reschedule` / `schedule_cancel` / `schedule_get`：创建、调整、取消和读取排期。创建同时产生 pending Publication；只有 scheduled 状态可用当前 `expectedVersion` 修改或取消。
+- `publication_submit` / `publication_verify` / `publication_retry` / `publication_get`：提交、验证、恢复重试和读取 Publication。**submitted 不是 published**；submitting/submitted/unknown 必须先 verify，只有 provider 明确返回 `not_found` 才允许重新 submit，不能宣称未验证成功。
+- `publication_manual_handoff` / `publication_manual_complete` / `delivery_package_get`：人工辅助交接、用 persisted Evidence 完成验证、分块读取交接包。`manual_assisted` 和 `manual_evidence` 始终与 automatic/provider verification 分开，不计为自动发布。
+- `effect_metric_snapshot_import` / `effect_metric_snapshot_get` / `effect_review_create` / `effect_review_get`：导入、读取指标快照并创建、读取效率/内容/转化/自动化四段 EffectReview。
+
+所有写工具仍需要 `actor`、`requestId`、`idempotencyKey`；公开参数只接受有界 ID、引用、UTC 时间、指标和状态，不接受 secret、path、command、code、env 或 raw media。完整 MCP 输入和每个响应均受 **64 KiB** 限制。`delivery_package_get` 每次最多返回 **32,768 bytes** 原始 JSON，经 adapter 转为 base64；包内含 locked brief/asset/artifact hash、channel/account、Schedule、Approval 和 operation key，明确标记 `not_published`，真实媒体仍只通过 `content_artifact_get` 读取。
+
+### trusted provider、operation key 与恢复
+
+自动排期和提交要求部署方显式配置 trusted stdio publishing provider，并在每次副作用前核对精确 channel/account、Approval、AssetVersion、artifact 和 due Schedule：
+
+- `MARKETING_PUBLISHING_MCP_COMMAND` 与 JSON 字符串数组 `MARKETING_PUBLISHING_MCP_ARGS`：固定受信任 executable/args，不是调用方可注入的命令。
+- `MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST`：可选的 provider 环境变量名逗号 allowlist；默认不转发业务环境或凭据。
+
+未配置 provider 时全部 17 个工具仍注册，审批、排期、读取和 manual-assisted 路径可用，`publishing.automatic` 在 `marketing_capability_list` 中为 unavailable。仓库测试 fixture 只是独立 trusted provider 协议，不是小红书、视频号或任何商业平台官方集成，也不证明真实平台自动化。
+
+`operationKey` 固定为 `publish:v1:<sha256>`，哈希输入是 canonical workspace/Schedule/AssetVersion/version/artifact hash/channel/account；重试、重启和外层 idempotency key 改变都不会改变它。provider 必须对同 key 不同 input hash  fail closed。接受提交后的超时或进程丢失记为 unknown，启动恢复先 verify，不重复提交。
+
+scheduler 只存在于 server **process lifetime**：`startup` 会 catch up **overdue** Schedule 并恢复 submitting/submitted/unknown，single-flight tick 防止并发重复 claim。transport close、`SIGINT`、`SIGTERM` 使用同一关闭路径，先停止 scheduler 并等待 in-flight 工作，再关闭 MCP/SQLite。手动交接包可在重启后按 ID/hash 恢复。
+
+### 人工证据与效果公式
+
+`publication_manual_complete` 只接受当前工作区 owned/authorized Source 下的 persisted `owned_operating` Evidence，并记录 external Publication ID、publishedAt 和 `manual_evidence`；这不是 automatic publication，也不能用 manual 路径绕过 unknown/submitting 的 verify-first 要求。
+
+指标快照只能引用 verified Publication 的精确版本和发布后的窗口。impressions/interactions/followers_gained/profile_visits 需要 `owned_operating` Evidence；leads/consultations/trials/purchases 需要 `owned_conversion` Evidence。EffectReview 公式固定为：
+
+- `interactionRate = interactions / impressions`
+- `profileVisitRate = profile_visits / impressions`
+- `leadRate = leads / profile_visits`
+- `purchaseRate = purchases / leads`
+- `automaticVerifiedRate = automatic provider-verified Publications / selected Publications`
+
+缺失指标、覆盖不完整或 `zero_denominator` 都返回 `value=null`、`status=unknown` 并保留已观察分子/分母，绝不把未知当 0。baseline delta 只是相同窗口/channel 的描述性算术；所有 section 都为 `causality=not_established`，小样本和前后对比不建立因果提升。`lineage_get` 额外支持 `approval`、`schedule`、`publication`、`metric_snapshot`、`effect_review` 五种类型，不新增血缘工具。
 
 ## 上限、部分失败与隐私
 
@@ -382,7 +423,7 @@ provider 未配置、真实媒体缺失、decode/probe 失败或 hash 不符时�
 
 ## 持久化与关闭
 
-每次内容采集结束会关闭 Chromium、目标固定代理和专业内容 MCP client；每次外部分析、benchmark reverse 和 media render 结束也会清理各自独立 provider/client 进程。server 响应 `SIGINT` / `SIGTERM`，关闭 MCP transport 和 SQLite 后退出；关闭 MCP client 也会触发 transport 清理。不要在写入或关闭过程中直接删除数据库或证据目录。
+每次内容采集结束会关闭 Chromium、目标固定代理和专业内容 MCP client；每次外部分析、benchmark reverse、media render 和 publishing submit/verify 结束也会清理各自独立 provider/client 进程。server 响应 `SIGINT` / `SIGTERM`，先停止 publication scheduler 并等待 in-flight 工作，再关闭 MCP transport 和 SQLite；关闭 MCP client 也走同一清理路径。不要在写入或关闭过程中直接删除数据库或证据目录。
 
 ## 工具总览
 
@@ -396,6 +437,10 @@ provider 未配置、真实媒体缺失、decode/probe 失败或 hash 不符时�
 | 分析网络 | `marketing_analysis_start`、`marketing_capability_list`、`analysis_graph_get`、`analysis_graph_expand`、`analysis_graph_fork`、`metric_compute`、`professional_analytics_compute`、`metric_scenario_create`、`metric_monitor_compare` |
 | 受控看板与策略 | `dashboard_render`、`dashboard_get`、`dashboard_artifact_get`、`dashboard_drilldown_get`、`strategy_recommendation_generate`、`strategy_task_supplement`、`strategy_task_update`、`strategy_task_reject`、`strategy_task_reorder`、`strategy_task_get`、`strategy_task_list` |
 | 逆向与内容生产 | `benchmark_reverse_create`、`benchmark_reverse_get`、`content_brief_create`、`content_brief_get`、`content_asset_generate`、`content_asset_derive`、`content_asset_get`、`content_artifact_get` |
+| 审批、排期与发布 | `approval_record`、`approval_get`、`schedule_create`、`schedule_reschedule`、`schedule_cancel`、`schedule_get`、`publication_submit`、`publication_verify`、`publication_retry`、`publication_get`、`publication_manual_handoff`、`publication_manual_complete`、`delivery_package_get` |
+| 效果复盘 | `effect_metric_snapshot_import`、`effect_metric_snapshot_get`、`effect_review_create`、`effect_review_get` |
+
+完整生产 server 共 **71 个公开工具**（原 54 + 新增 17）。
 
 `capability_health_record` 只有在关联证据包含完全匹配的 `toolHealth` 时才能把能力置为 `verified`。健康检查必须由调用方实际完成；能力注册不等于安装、授权、执行或健康验证。`marketing_capability_list` 同样只是声明与路由目录，不会把未安装的 connector 变成可用能力。
 
@@ -428,7 +473,7 @@ vitest run tests/e2e/stdio.test.ts tests/e2e/data-research-stdio.test.ts tests/e
 ## 当前不支持
 
 - 不做自动因果推断、保证性提升或商业结果承诺；条件情景、Wilson 区间和前后对比不能替代实验或因果分析。
-- 看板仅为上述受控 HTML/SVG，不是 Power BI 或专业 BI。内容逆向和生成必须显式配置真实 provider；当前不提供内容审批执行、自动排期、发布或生成资产效果复盘，策略任务不自动执行这些操作。
+- 看板仅为上述受控 HTML/SVG，不是 Power BI 或专业 BI。内容逆向、生成和 automatic publishing 必须显式配置真实 trusted provider；策略任务仍不自动执行审批、排期、发布或效果复盘。
 - 不提供 PostgreSQL、MySQL、GA4 connector，不安装或声明外部营销平台的 OAuth、账户同步、live connector，也不提供定时/自动调度监控；文件、临时授权 API、SQLite 和公开链接快照不等于持续平台集成。
 - 不声明内置任何特定专业内容、逆向、媒体或分析 MCP 供应商集成；这些能力必须显式配置真实依赖，未配置时没有本地 reverse/generate/analytics fallback。
 - SQLite connector 不支持视图、BLOB、WAL、任意 SQL、实时同步或没有兼容 POSIX `/dev/fd` 的平台。

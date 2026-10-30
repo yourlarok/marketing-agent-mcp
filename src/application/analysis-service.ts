@@ -1385,6 +1385,9 @@ export interface AnalysisCapabilityConfiguration {
   professionalMediaConfigured?: boolean;
   ffprobeConfigured?: boolean;
   contentProductionConfigured?: boolean;
+  publishingConfigured?: boolean;
+  publishingProviderConfigured?: boolean;
+  effectConfigured?: boolean;
 }
 
 export class AnalysisCapabilityService {
@@ -1710,6 +1713,72 @@ export class AnalysisCapabilityService {
         },
         fallback: [],
         limitations: ["Internal profile validation is not human review, legal clearance, publishing approval, scheduling, publication, or a distribution guarantee."],
+      }),
+      capability({
+        id: "publishing.delivery",
+        operation: "approval_record / approval_get / schedule_create / schedule_reschedule / schedule_cancel / schedule_get / publication_get / publication_manual_handoff / publication_manual_complete / delivery_package_get",
+        description: "Lock human approval to exact asset bytes, manage due Schedules, and perform explicitly non-automatic manual-assisted delivery.",
+        requiredInputs: ["Approved exact AssetVersion and actual artifact hash", "Workspace-scoped IDs and expected versions", "actor, requestId, and idempotencyKey for every write"],
+        configuration: [
+          "Approval locks one exact AssetVersion plus actual artifact hash; a derivative requires a new Approval",
+          "The scheduler runs only for the server process lifetime, performs startup catch-up for overdue work, recovers uncertain outcomes verify-first, and stops before SQLite closes",
+          "manual_assisted handoff emits a canonical not_published package; manual_complete requires persisted owned or authorized owned_operating Evidence and records manual_evidence",
+          "Delivery package decoded chunks are at most 32,768 bytes and every serialized response is below 64 KiB",
+        ],
+        availability: this.configuration.publishingConfigured ? {
+          state: "available",
+          detail: "Approval, Schedule, read, and manual-assisted workflows are installed even when no publishing provider is configured.",
+        } : {
+          state: "unavailable",
+          detail: "PublishingService is not installed.",
+        },
+        fallback: ["manual_assisted remains available without a trusted provider; it is not automatic publication"],
+        limitations: [
+          "manual_evidence is not automatic provider verification and a handoff is not published",
+          "No built-in official Xiaohongshu, Channels, OAuth, or account connector is claimed",
+        ],
+      }),
+      capability({
+        id: "publishing.automatic",
+        operation: "publication_submit / publication_verify / publication_retry",
+        description: "Submit and verify automatic delivery through a trusted provider for the exact channel and account.",
+        requiredInputs: ["Due automatic Schedule", "Exact approved AssetVersion, artifact, channel, and account", "Expected Publication version and write context"],
+        configuration: [
+          "MARKETING_PUBLISHING_MCP_COMMAND and JSON string-array MARKETING_PUBLISHING_MCP_ARGS in the trusted deployment environment",
+          "MARKETING_PUBLISHING_MCP_ENV_ALLOWLIST limits optional provider environment names; callers cannot supply commands, paths, code, environment, credentials, or raw media",
+          "A stable publish:v1 operationKey is derived from the workspace, Schedule, exact asset/version/hash, channel, and account",
+          "submitted is not verified or published; submitting, submitted, and unknown outcomes verify before retry, and only explicit provider not_found permits resubmission",
+        ],
+        availability: this.configuration.publishingProviderConfigured ? {
+          state: "available",
+          detail: "A trusted publishing provider is declared for automatic workflows; exact channel and account configuration is still checked before every side effect.",
+        } : {
+          state: "unavailable",
+          detail: "No trusted publishing provider is configured; manual-assisted tools remain registered and automatic submission is unavailable.",
+        },
+        fallback: ["publication_manual_handoff after a due pending or definitely failed Publication, never to bypass an uncertain outcome"],
+        limitations: ["Provider acceptance is not delivery verification", "No unverified success or real-platform automation is claimed"],
+      }),
+      capability({
+        id: "effect.review",
+        operation: "effect_metric_snapshot_import / effect_metric_snapshot_get / effect_review_create / effect_review_get",
+        description: "Bind post-publication metrics to Evidence and calculate descriptive four-part EffectReviews.",
+        requiredInputs: ["Verified exact Publication version", "Post-publication windows and nonnegative safe-integer observations", "Versioned publication and snapshot references"],
+        configuration: [
+          "Content metrics require owned or authorized owned_operating Evidence; conversion metrics require owned_conversion Evidence",
+          "interactionRate=interactions/impressions; profileVisitRate=profile_visits/impressions; leadRate=leads/profile_visits; purchaseRate=purchases/leads",
+          "automaticVerifiedRate=automatic provider-verified Publications/selected Publications; manual_evidence is not automatic",
+          "Missing or zero denominator coverage returns value=null and status=unknown while preserving observed numerator and denominator",
+        ],
+        availability: this.configuration.effectConfigured ? {
+          state: "available",
+          detail: "EffectService is installed with immutable snapshots, sourceVersions, and efficiency/content/conversion/automation sections.",
+        } : {
+          state: "unavailable",
+          detail: "EffectService is not installed.",
+        },
+        fallback: ["Read the persisted Publication or MetricSnapshot when a comparison is not comparable"],
+        limitations: ["All sections have causality=not_established; baseline deltas are descriptive and no causal uplift is inferred"],
       }),
       capability({
         id: "connectors.live",

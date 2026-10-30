@@ -10,7 +10,9 @@ import type { CommandContext } from "../../src/application/commands.js";
 import { ContentProductionService } from "../../src/application/content-production-service.js";
 import { DashboardService } from "../../src/application/dashboard-service.js";
 import { DataResearchService } from "../../src/application/data-research-service.js";
+import { EffectService } from "../../src/application/effect-service.js";
 import { MarketingService } from "../../src/application/marketing-service.js";
+import { PublishingService } from "../../src/application/publishing-service.js";
 import { StrategyService } from "../../src/application/strategy-service.js";
 import type { Store } from "../../src/application/ports.js";
 import type { AnalysisGraph } from "../../src/domain/analysis-model.js";
@@ -85,6 +87,23 @@ const analysisToolNames = [
   "strategy_task_reorder",
   "strategy_task_supplement",
   "strategy_task_update",
+  "approval_record",
+  "approval_get",
+  "schedule_create",
+  "schedule_reschedule",
+  "schedule_cancel",
+  "schedule_get",
+  "publication_submit",
+  "publication_verify",
+  "publication_retry",
+  "publication_get",
+  "publication_manual_handoff",
+  "publication_manual_complete",
+  "delivery_package_get",
+  "effect_metric_snapshot_import",
+  "effect_metric_snapshot_get",
+  "effect_review_create",
+  "effect_review_get",
 ];
 const writeToolNames = [
   "analysis_graph_expand",
@@ -169,6 +188,7 @@ describe("analysis MCP tools and initialization", () => {
     });
     server = createMcpServer(
       marketing, dataResearch, analysis, {}, dashboard, strategy, benchmark, contentProduction,
+      new PublishingService(store, clock, ids, artifacts), new EffectService(store, clock, ids),
     );
     client = new Client({ name: "test-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -218,7 +238,7 @@ describe("analysis MCP tools and initialization", () => {
     expect(tools.map((tool) => tool.name).sort()).toEqual(
       [...priorToolNames, ...analysisToolNames].sort(),
     );
-    expect(tools).toHaveLength(54);
+    expect(tools).toHaveLength(71);
     for (const tool of tools) {
       expect(tool.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
     }

@@ -5,6 +5,7 @@ import { BenchmarkService } from "./application/benchmark-service.js";
 import { ContentProductionService } from "./application/content-production-service.js";
 import { DashboardService } from "./application/dashboard-service.js";
 import { DataResearchService } from "./application/data-research-service.js";
+import { EffectService } from "./application/effect-service.js";
 import { MarketingService } from "./application/marketing-service.js";
 import { PublicationScheduler } from "./application/publication-scheduler.js";
 import { PublishingService } from "./application/publishing-service.js";
@@ -93,6 +94,7 @@ async function run(): Promise<void> {
       publishingProvider,
       publishingProvider,
     );
+    const effect = new EffectService(store, clock, ids);
     scheduler = new PublicationScheduler(store, publishing, clock, {
       onError: (error) => console.error(
         `Publication scheduler failed: ${error instanceof Error ? error.message : "unknown error"}`,
@@ -107,6 +109,9 @@ async function run(): Promise<void> {
       strategy,
       benchmark,
       contentProduction,
+      publishing,
+      effect,
+      config.publishingMcp !== undefined,
     );
     await scheduler.start();
     const transport = new StdioServerTransport();

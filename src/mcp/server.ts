@@ -8,13 +8,17 @@ import type { BenchmarkService } from "../application/benchmark-service.js";
 import type { ContentProductionService } from "../application/content-production-service.js";
 import type { DashboardService } from "../application/dashboard-service.js";
 import type { DataResearchService } from "../application/data-research-service.js";
+import type { EffectService } from "../application/effect-service.js";
 import type { MarketingService } from "../application/marketing-service.js";
+import type { PublishingService } from "../application/publishing-service.js";
 import type { StrategyService } from "../application/strategy-service.js";
 import { DomainError } from "../domain/errors.js";
 import { registerAnalysisTools } from "./register-analysis-tools.js";
 import { registerContentProductionTools } from "./register-content-production-tools.js";
 import { registerDashboardStrategyTools } from "./register-dashboard-strategy-tools.js";
 import { registerDataResearchTools } from "./register-data-research-tools.js";
+import { registerEffectTools } from "./register-effect-tools.js";
+import { registerPublishingTools } from "./register-publishing-tools.js";
 import { registerTools } from "./register-tools.js";
 
 export { toMcpError } from "./error-mapper.js";
@@ -38,6 +42,9 @@ export function createMcpServer(
   strategy?: StrategyService,
   benchmark?: BenchmarkService,
   contentProduction?: ContentProductionService,
+  publishing?: PublishingService,
+  effect?: EffectService,
+  publishingProviderConfigured = false,
 ): McpServer {
   const installed: Required<AnalysisCapabilityConfiguration> = {
     sqliteConfigured: dataResearch?.hasConfiguredSqliteConnector() ?? false,
@@ -48,6 +55,9 @@ export function createMcpServer(
     professionalMediaConfigured: contentProduction?.hasProfessionalMediaProvider() ?? false,
     ffprobeConfigured: contentProduction?.hasConfiguredVideoProbe() ?? false,
     contentProductionConfigured: contentProduction !== undefined,
+    publishingConfigured: publishing !== undefined,
+    publishingProviderConfigured: publishing !== undefined && publishingProviderConfigured,
+    effectConfigured: effect !== undefined,
   };
   for (const key of Object.keys(installed) as (keyof typeof installed)[]) {
     if (options[key] !== undefined && options[key] !== installed[key]) {
@@ -77,10 +87,13 @@ export function createMcpServer(
         ...(benchmark || contentProduction ? [
           "Benchmark and content work must use persisted evidence. Video reverse analysis requires real persisted video frames and ASR transcripts; never claim human viewing. Author original expression in the host user's original language, bind factual statements to Finding references, and keep benchmark evidence and owned or authorized production source material in separate channels. PNG output requires actual Chromium decode and MP4 output requires actual ffprobe inspection. Read content artifacts as bounded base64 chunks. Internal channel profiles are disclosed for internal validation only, not publishing or platform-delivery guarantees. Do not use invented metrics or report unavailable provider success. A validated asset is not approved, scheduled, or published.",
         ] : []),
+        ...(publishing || effect ? [
+          "Submission is not publication: never claim unverified delivery or success. Verify uncertain outcomes before retrying. Manual-assisted delivery and manual_evidence completion are not automatic publication. Effect reviews are descriptive and make no causal claims.",
+        ] : []),
         "Ask at most one high-impact question that would change the branch, and allow the user to continue with the stated default.",
         "Call the high-level marketing_analysis_start tool first. Use marketing_capability_list to inspect declared capabilities, configuration, fallbacks, and limitations.",
         "Keep facts, inferences, and unknowns separate. Public engagement must not be inferred as CTR or conversion, and observations or scenarios must not be presented as causal effects or guaranteed outcomes.",
-        "Do not claim unavailable or not installed capabilities, including PostgreSQL, MySQL, GA4, OAuth account access, other live connectors, general web search by this server, publishing, or scheduled monitoring. Host-provided search is optional and must actually be available before use.",
+        "Do not claim unavailable or not installed capabilities, including PostgreSQL, MySQL, GA4, OAuth account access, other live connectors, general web search by this server, or scheduled monitoring. Host-provided search is optional and must actually be available before use.",
       ].join(" "),
     },
   );
@@ -97,5 +110,7 @@ export function createMcpServer(
     registerDashboardStrategyTools(server, dashboard, strategy);
   }
   registerContentProductionTools(server, benchmark, contentProduction);
+  if (publishing) registerPublishingTools(server, publishing);
+  if (effect) registerEffectTools(server, effect);
   return server;
 }

@@ -71,6 +71,8 @@ describe("built stdio server acceptance", () => {
       "analysis_graph_expand",
       "analysis_graph_fork",
       "analysis_graph_get",
+      "approval_get",
+      "approval_record",
       "benchmark_reverse_create",
       "benchmark_reverse_get",
       "capability_health_record",
@@ -93,6 +95,11 @@ describe("built stdio server acceptance", () => {
       "data_request_plan",
       "data_research_get",
       "dataset_register",
+      "delivery_package_get",
+      "effect_metric_snapshot_get",
+      "effect_metric_snapshot_import",
+      "effect_review_create",
+      "effect_review_get",
       "evidence_asset_get",
       "evidence_record",
       "finding_record",
@@ -107,10 +114,20 @@ describe("built stdio server acceptance", () => {
       "metric_monitor_compare",
       "metric_scenario_create",
       "professional_analytics_compute",
+      "publication_get",
+      "publication_manual_complete",
+      "publication_manual_handoff",
+      "publication_retry",
+      "publication_submit",
+      "publication_verify",
       "recommendation_create",
       "research_permission_set",
       "research_session_create",
       "research_session_run",
+      "schedule_cancel",
+      "schedule_create",
+      "schedule_get",
+      "schedule_reschedule",
       "source_register",
       "strategy_recommendation_generate",
       "strategy_task_get",
@@ -393,7 +410,7 @@ describe("built stdio server acceptance", () => {
     expect(malformed).toMatchObject({ isError: true });
     expect(JSON.stringify(malformed)).toContain("Input validation error");
     expect(JSON.stringify(malformed)).not.toContain("stack");
-    expect((await client.listTools()).tools).toHaveLength(54);
+    expect((await client.listTools()).tools).toHaveLength(71);
 
     await firstProcess.client.close();
     clients.splice(clients.indexOf(firstProcess.client), 1);
